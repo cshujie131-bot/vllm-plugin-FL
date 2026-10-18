@@ -9,8 +9,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 import unittest
+import weakref
 from pathlib import Path
 from unittest.mock import patch
 
@@ -324,6 +326,75 @@ class PackagingTests(unittest.TestCase):
                 )
                 self.assertIs(type(namespace["backend"]), DSV4 if enabled else Generic)
 
+    def test_prewarm_return_contract(self):
+        tree = ast.parse((ROOT / "vllm_fl/dispatch/__init__.py").read_text())
+        fn = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "prewarm_cached_ops"
+        )
+
+        def fail_if_called():
+            raise AssertionError("DS should keep its explicit bindings")
+
+        namespace = {
+            "_dsv4_config": types.SimpleNamespace(is_enabled=lambda: True),
+            "get_default_manager": fail_if_called,
+        }
+        exec(
+            compile(ast.Module(body=[fn], type_ignores=[]), "<prewarm>", "exec"),
+            namespace,
+        )
+        self.assertEqual(namespace["prewarm_cached_ops"](), (0, 0))
+
+        class Available:
+            def prewarm(self, manager):
+                pass
+
+        class Unavailable:
+            def prewarm(self, manager):
+                raise RuntimeError("optional")
+
+        namespace.update(
+            _dsv4_config=types.SimpleNamespace(is_enabled=lambda: False),
+            get_default_manager=lambda: types.SimpleNamespace(
+                ensure_initialized=lambda: None
+            ),
+            _CACHED_OPS_LOCK=threading.RLock(),
+            _CACHED_OPS=[Available(), Unavailable()],
+        )
+        self.assertEqual(namespace["prewarm_cached_ops"](), (1, 1))
+
+    def test_cache_refresh_freezes_only_generic_path(self):
+        tree = ast.parse((ROOT / "vllm_fl/dispatch/__init__.py").read_text())
+        cls = next(
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "CachedOp"
+        )
+        manager = types.SimpleNamespace(
+            policy_epoch=3,
+            _resolve_impl=lambda name: types.SimpleNamespace(fn=lambda: name),
+            _record_first_use=lambda *args: None,
+        )
+        for enabled in (True, False):
+            namespace = {
+                "_CACHED_OPS": weakref.WeakSet(),
+                "_CACHED_OPS_LOCK": threading.RLock(),
+                "_dsv4_config": types.SimpleNamespace(
+                    is_enabled=lambda enabled=enabled: enabled
+                ),
+                "_OP_FAST_PATH_ENABLED": True,
+                "is_dump_enabled": lambda: False,
+                "get_policy_epoch": lambda: 4,
+            }
+            exec(
+                compile(ast.Module(body=[cls], type_ignores=[]), "<CachedOp>", "exec"),
+                namespace,
+            )
+            cached = namespace["CachedOp"]("mhc_pre")
+            cached._refresh_cache(manager, record_first_use=True)
+            self.assertEqual(cached._frozen, not enabled)
+            self.assertFalse(cached._first_use_pending)
+
     def test_bind_preserves_dispatch_epochs(self):
         tree = ast.parse((ROOT / "vllm_fl/dispatch/__init__.py").read_text())
         cls = next(
@@ -339,7 +410,9 @@ class PackagingTests(unittest.TestCase):
             "get_default_manager": lambda: manager,
             "get_policy": lambda: None,
             "get_policy_epoch": lambda: 7,
-            "_CACHED_OPS": [],
+            "_CACHED_OPS": weakref.WeakSet(),
+            "_CACHED_OPS_LOCK": threading.RLock(),
+            "_dsv4_config": types.SimpleNamespace(is_enabled=lambda: True),
         }
         exec(compile(ast.Module(body=[cls], type_ignores=[]), "<CachedOp>", "exec"), ns)
         op = ns["CachedOp"]("mhc_pre")
