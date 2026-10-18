@@ -20,16 +20,21 @@ repos:
     -   id: check-symlinks
     -   id: detect-private-key
     -   id: end-of-file-fixer
+        exclude: ^examples/deepseek_v4_metax/profile/
     -   id: trailing-whitespace
+        exclude: ^examples/deepseek_v4_metax/profile/
 - repo: https://github.com/astral-sh/ruff-pre-commit
   rev: v0.14.0
   hooks:
   - id: ruff-check
+    exclude: ^examples/deepseek_v4_metax/profile/
     args: ["--ignore=E731", --output-format, github, --fix]
     # E731 : Do not assign a lambda expression, use a def
   - id: ruff-format
+    exclude: ^examples/deepseek_v4_metax/profile/
 - repo: https://github.com/crate-ci/typos
   rev: v1.38.1
   hooks:
   - id: typos
+    exclude: ^examples/deepseek_v4_metax/profile/
     args: [--force-exclude]

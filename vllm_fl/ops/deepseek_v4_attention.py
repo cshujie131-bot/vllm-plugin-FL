@@ -6,6 +6,7 @@ DeepseekV4 MLA Attention Layer
 
 import os
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -23,6 +24,7 @@ from vllm_fl.ops.deepseek_v4_int8_indexer import (
 from vllm_fl.ops.deepseek_v4_int8_woa import fused_inv_rope_quant_int8
 from vllm.platforms import current_platform
 from vllm_fl.ops.sparse_attn_indexer import (
+    SparseAttnIndexer,
     SparseAttnIndexerFL,
 )
 from vllm_fl.ops.deepseek_compressor import (
@@ -60,10 +62,17 @@ from vllm.config import (
 )
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm_fl.ops.deepseek_compressor import DeepseekCompressor
-from vllm.model_executor.layers.layernorm import LayerNorm
+from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.input_quant_fp8 import (
+    QuantFP8,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape,
+)
 from vllm.utils.multi_stream_utils import (
     maybe_execute_in_parallel,
 )
@@ -103,11 +112,11 @@ def is_metax_w8a8(vllm_config: VllmConfig) -> bool:
         and quant_config.get("format") == "int-quantized"
         and bool(groups)
         and all(
-            (group.get("weights") or {}).get("num_bits") == 8
-            and (group.get("weights") or {}).get("strategy") == "channel"
-            and (group.get("input_activations") or {}).get("num_bits") == 8
-            and (group.get("input_activations") or {}).get("strategy") == "token"
-            and (group.get("input_activations") or {}).get("dynamic") is True
+            group["weights"]["num_bits"] == 8
+            and group["weights"]["strategy"] == "channel"
+            and group["input_activations"]["num_bits"] == 8
+            and group["input_activations"]["strategy"] == "token"
+            and group["input_activations"]["dynamic"] is True
             for group in groups.values()
         )
     )

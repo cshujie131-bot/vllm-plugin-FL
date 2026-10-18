@@ -151,6 +151,8 @@ exclude_lines = [
 
 [tool.ruff]
 exclude = [
+    # Frozen evaluated source; formatting changes invalidate its checksums.
+    "examples/deepseek_v4_metax/profile/**",
     "vllm_fl/**",
 
 ]

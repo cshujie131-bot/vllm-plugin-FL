@@ -1,0 +1,53 @@
+{
+  "release": "dsv4-clean-20261016-r2",
+  "source_fingerprint": "6625a385ffaa33b47d3380c8f812791ab47dc94379d9131cfb558f36960175c5",
+  "checks": {
+    "standalone_cases": 10,
+    "headpack_tokens": [
+      16,
+      17,
+      128
+    ],
+    "semantic_answers": [
+      12,
+      12
+    ],
+    "mixed_shape_requests": [
+      106,
+      106
+    ],
+    "long_input_requests": [
+      11,
+      11
+    ],
+    "decode_graph": "FULL_DECODE_ONLY"
+  },
+  "thinking": {
+    "mode": "high",
+    "context": 131072,
+    "concurrency": 32,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "gpqa_strict": [
+      170,
+      198
+    ],
+    "gpqa_final_answer_v1": [
+      171,
+      198
+    ],
+    "math500_native": [
+      477,
+      500
+    ],
+    "math500_posthoc_equivalence": [
+      498,
+      500
+    ],
+    "math500_posthoc_note": "21 equivalent expressions rejected by the native scorer; supplementary review only, not the native score.",
+    "all_698_responses_stop": true,
+    "truncated": 0,
+    "engine_restarts": 0
+  },
+  "scope": "GPU and serving tests were performed on this exact source profile. Publication checks separately reconstruct and hash-compare the profile; no claim that the entire upstream CI suite was run."
+}

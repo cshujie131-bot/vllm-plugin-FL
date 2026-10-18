@@ -1,145 +1,147 @@
 # DeepSeek V4 Flash W8A8 on MetaX C550
 
-This opt-in path targets **8 x C550, TP8**, symmetric dynamic-token W8A8,
-BF16 activations and FP8 KV cache on vLLM **0.20.2** (`release/0.2`).
-It uses FlagGems plus the MACA-compatible Triton/deep_gemm/MCTlass runtime.
-The archived build used FlagGems 5.0.2, Torch 2.8.0+metax3.7.0.7,
-Triton 3.0.0+metax3.7.0.7 / FlagTree 0.5.1+metax3.0, and
-MCTlassEx 0.1.1+metax3.7.0.7torch2.8.
-The optimized kernels are included in FL; no private FlagGems overlay,
-`sitecustomize`, `vllm_metax` Python import or machine-specific tuning map
-is required by this implementation.
+This opt-in profile contains the evaluated, cleaned-up DSV4 implementation for
+8 × C550 / TP8 and vLLM 0.20.2. It replaces the old private-kernel/environment
+switch path. The source stays in its owning packages instead of being
+rebased into a second, untested implementation.
 
-## Scope and entry points
+This is an **isolated source profile**, not a change to every model using FL.
+The builder copies verified dependencies into a new directory, adds the
+profile's sources, and checks all 2557 source/config hashes. It does not edit
+installed packages. The serving and thinking profiles reproduce the exact
+source fingerprints used for validation.
 
-Enable `VLLM_FL_DSV4_METAX_OPTIMIZATIONS=1` before starting workers.
-Default is off; other models and the upstream INT8 indexer-cache path are unchanged.
+## Code layout
 
-| Code under `vllm_fl/ops/deepseek_v4_metax/` | Change |
+| Under profile/src | Responsibility |
 |---|---|
-| `attention.py`, `decode.py` | HQ16 padding, split-top-k, one block-diagonal PV accumulator for the two V halves; reuse QK/KV loads |
-| `prefill.py`, `attention_staged.py` | Pairwise real-head packing; materialize chunk softmax state, replay PV halves in the same accumulation order |
-| `gather.py` | Preserve padded cache-block strides without a full-cache clone |
-| `indexer.py`, `paged_indexer_logits.py`, `tree_topk.py` | Direct paged logits, fused decode rows, valid-length early exits and exact top-512 |
-| `prefill_indexer_rowshard.py`, `indexer_m4.py`, `indexer_score.py` | M/2 fallback and M/4 complete-query-row sharding, KV-load hoisting and invalid-tile skipping |
-| `mhc.py`, `mhc_mm.py`, `mhc_split.py` | Small-M projection split-K; large-M RMS/coefficients/mix split; unchanged Sinkhorn iterations and casts |
-| `mctlass_moe.py` | MCTlass expert GEMMs for both phases; cache kernel-M metadata without query casts or pointer/storage aliases |
+| vllm_fl | DS model/quantization/router adaptation, headpack communication, M/4 complete-query-row sharding, explicit operator bindings |
+| flaggems_vllm | Local sparse MLA, migrated fused operators and MHC |
+| flag_gems | ATen plus retained fused implementations, stable Hash routing and scoped embedding mask |
+| dsv4_metax | MCTlass GEMM bindings; no vllm_metax import |
+| dsv4_runtime | One-shot initialization, effective-config checks and bounded compatibility hooks |
 
-M/4 ranks independently score **all historical KV for their assigned Q rows**.
-Each row uses the original top-k implementation before gathering indices.
-No KV-column partition, approximate selection or cross-rank top-k merge is used.
-The accepted groups are [0,1,2,3] and [4,5,6,7]; M/8 was rejected because actual
-model inputs differed between those groups and changed selected indices.
+MHC pre uses FlagGems-vllm #755 at
+3a6ae4695cb63c8fe0a39774bf470e580fbbcd10. That PR is not yet merged, so the tested
+source is pinned here. MHC post stays unchanged; the older split kernels are
+retained only as shape/layout fallback, not as the proposed active optimization.
 
-The groups passed the archived model tests, but replicated input equality is
-not a universal guarantee across builds or tuning configurations.
-`VLLM_FL_DSV4_METAX_VERIFY_M4=1` is therefore the default: compare full indices,
-ordering and padding against the M/2 reference on every eligible call.
-All eight ranks must agree. Set it to `0` **only after validating the new
-environment**, before timing. Verification has intentional extra compute,
-communication and CPU synchronization.
+Decode blockdiag, staged prefill/headpack, paged logits, tree top-k and M/4
+query-row sharding remain enabled. Each sharded Q row sees its complete valid
+KV history; ranks gather selected indices, not partial KV-column top-k sets.
+Real Q-head count is passed explicitly from FL to the local attention API.
 
-## Configuration
+## Configuration and compatibility
 
-Use the vendor-matched MACA/PyTorch/Triton build, not a stock NVIDIA torch wheel.
-Install the plugin from this branch and FlagGems using the project's normal
-MetaX setup. MCTlass and MetaX deep_gemm must be importable. A checkpoint is
-supplied separately; no weights or proprietary library binaries are included.
+The single configuration source for each build is config/production.json
+(or thinking.json for the evaluated thinking variant). Typed policies and
+dispatch bindings replace the old per-optimization environment switches.
+The actual ATen exclusions are checked at initialization:
+topk, masked_fill and masked_fill_.
 
-Set the native top-k exclusions before plugin/FlagGems initialization:
+The vLLM installation is not rewritten. Necessary runtime compatibility is
+explicit: version-checked serial multi-stream helpers and semantic-fingerprint
+RMS launch settings. Existing FL platform/SWA compatibility remains in place;
+this is not a claim of zero runtime hooks. There is no runtime source exec,
+function-default rewriting, or hybrid fake operator module.
 
-```bash
-export USE_FLAGGEMS=1
-export VLLM_PLUGINS=fl
-export VLLM_FL_DSV4_METAX_OPTIMIZATIONS=1
-export VLLM_FL_FLAGOS_BLACKLIST=topk,masked_fill,masked_fill_
-export VLLM_FL_DSV4_METAX_VERIFY_M4=1
+Use the validated vendor environment, not a stock NVIDIA Torch wheel:
 
-vllm serve "$MODEL_PATH" \
-  --tensor-parallel-size 8 --dtype bfloat16 \
-  --kv-cache-dtype fp8 --block-size 256 \
-  --max-model-len 66560 --max-num-seqs 64 \
-  --max-num-batched-tokens 4096 --gpu-memory-utilization 0.85 \
-  --disable-custom-all-reduce \
-  --attention-config '{"use_fp4_indexer_cache": false}' \
-  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4,8,16,32,64]}'
-```
+| Component | Evaluated version |
+|---|---|
+| vLLM | 0.20.2 |
+| Torch | 2.8.0+metax3.7.0.7 |
+| Triton distribution / FlagTree | 3.0.0+metax3.7.0.7 / 0.5.1+metax3.0 |
+| FlagGems | 5.0.2; source checksums are enforced |
+| FlagGems-vllm base | 5f4dc53cc31b99e83967a2b19195ab1a295aeef6 |
+| MCTlassEx | 0.1.1+metax3.7.0.7torch2.8 |
 
-This is an integration example, **not a claim that this rebased PR was
-service-tested**. TP/PP/DP/MTP and model dimensions are checked at initialization.
-The optimized path requires TP8/PP1/DP1, no EP or MTP, Flash H4096/HQ64/L43.
-It does not enable TLE/warp specialization.
+The dependency image is distributed separately. Its tested image ID is
+sha256:d9b55ee2982c8a9727fe9510167431ab3a083747ce8f3f7a47b3fd8fe27659c7;
+an image ID is not a registry pull address. The image supplies the vendor
+binaries, existing tuning seed and /opt/dsv4 model checks. This repository
+does not redistribute weights, closed binaries, benchmark timing databases
+or compiler caches. A different image/library revision requires separate
+validation; the launch helper rejects a mismatched image.
 
-**Keep prefill outside full graph replay.** The final source baseline uses
-FULL_DECODE_ONLY: an earlier FULL_AND_PIECEWISE deployment replayed dummy
-attention for short prefill requests. This is not the same as enforce-eager.
+## Build and run
 
-Use separate writable directories for `TORCHINDUCTOR_CACHE_DIR`,
-`TRITON_CACHE_DIR`, `VLLM_CACHE_ROOT`, `FLAGGEMS_CACHE_DIR` and
-`DG_JIT_CACHE_DIR` for each build/experiment. Do not reuse compiler caches
-from the previous deployment. C550 has a 64 KiB shared-memory limit.
-The old global dense-mm tile patch and generated-kernel/rank tuning maps are
-not copied here; compatible FlagGems launch configs still need verification
-on the target build.
+Obtain the pinned FlagGems-vllm checkout above and set FGV_SOURCE to its
+src/flaggems_vllm directory. On an offline server, copy that checkout first.
+DSV4_IMAGE is a local tag for the tested dependency image; DEPS, RUNTIME and
+CACHE should be separate directories outside this checkout.
 
-## Validation and historical results
+~~~sh
+python examples/deepseek_v4_metax/extract_sources.py \
+  --image "$DSV4_IMAGE" --output "$DEPS"
 
-Current PR preparation is **CPU-only**: contract tests, Python syntax,
-relative-import checks, lint and kernel-body comparison against the frozen
-source. GPU regression tests are provided, but were not executed during
-this port. Re-run TP8 model/graph correctness before treating it as deployable.
+python examples/deepseek_v4_metax/build_runtime.py \
+  --source vllm_fl="$DEPS/vllm_fl" \
+  --source flag_gems="$DEPS/flag_gems" \
+  --source dsv4_metax="$DEPS/dsv4_metax" \
+  --source flaggems_vllm="$FGV_SOURCE" \
+  --output "$RUNTIME"
 
-Archived evidence from the source deployment:
+# Prints the command. Add --execute only when the GPUs are available.
+python examples/deepseek_v4_metax/run_profile.py \
+  --runtime "$RUNTIME" --model "$MODEL_PATH" \
+  --cache "$CACHE" --image "$DSV4_IMAGE"
+~~~
 
-- Decode blockdiag: standalone and service smoke passed; P1K/O1K/C64 output
-  812.59 -> 898.60 tok/s (+10.58%); P4K/O1K/C64 536.53 -> 581.58 (+8.40%).
-  Candidate values are the mean of three formal rounds after one warmup;
-  the baseline was reused from an earlier date, not interleaved A/B.
-- MCTlass/km_cache: P1K/O128/C64 output 438.04 -> 447.17 (+2.08%);
-  warmup 1 + formal 2, report run3. The original test shared a writable
-  compiler cache and later hit a cache-contamination recovery failure.
-  This is a limitation of that experiment, not a recommended cache policy.
-- Staged prefill attention: eight ranks x 344 real-call bitwise comparisons
-  of output/max/LSE passed; P16K/O16/C64 total 5846.65 -> 7226.63 (+23.60%).
-- MHC split: eight ranks x 172 real-call bitwise comparisons passed;
-  P16K/O16/C64 total 7226.63 -> 7611.72 (+5.33%).
-- M/4: 5,376 real-model rank/call comparisons passed with exact top-k
-  indices, ordering and padding. M/8 was rejected, not tolerance-relaxed.
-- The final independent source release passed 11 cold-cache smoke cases,
-  including the 9-token greeting, short math/copy, 63/64/65/66-token
-  boundaries and a near-1K control. This is not a full GSM8K/C-Eval/MMLU score.
+The extractor creates a temporary container but never starts it. The builder
+does not import torch or initialize a GPU. New output and cache directories
+are required; nothing stops another workload.
 
-The prefill/MHC comparisons reuse historical controls; each candidate used
-warmup 1 + formal 2 and reports run3. They are short-output prefill-heavy
-results and must not be presented as isolated decode gains.
+Default serving: TP8, FP8 KV/block256, MBT4096, maxseq64, maxlen66560,
+gpu-memory-utilization 0.85, disable-custom-all-reduce.
+Keep FULL_DECODE_ONLY: prefill is outside CUDA Graph replay; decode uses FULL
+graphs and torch.compile remains enabled.
 
-The combined **earlier** configuration produced the following archived
-results (64 requests, concurrency 64, O1024, warmup 1 + formal 3, report run4):
+For the evaluated thinking configuration, add --thinking to build_runtime.py.
+It uses maxlen131072, maxseq32 and graph sizes through32. No numerical kernel
+changes are made. The longer window matters: completed evaluation responses
+exceeded the ordinary 66560-token serving window.
 
-| Prompt tokens | Output tok/s | Total tok/s | Mean TTFT ms | Mean TPOT ms |
-|---:|---:|---:|---:|---:|
-| 1024 | 946.18 | 1892.36 | 4483.62 | 62.99 |
-| 4096 | 687.18 | 3435.91 | 17021.88 | 75.20 |
-| 16384 | 330.72 | 5622.18 | 68472.94 | 121.02 |
-| 65536 | 100.31 | 6520.06 | 294978.15 | 301.15 |
+## Validation
 
-These predate the final independent-runtime/graph-policy change and are
-**not benchmarks of this PR**. Gains above are incremental measurements
-against different baselines and must not be added together.
+- Standalone parity: 10 cases; two-rank headpack at16/17/128 tokens.
+- TP8 graph/model smoke: 12/12 basic answers, 106/106 mixed-shape/concurrency
+  requests and11/11 long-input requests; decode FULL capture/replay passed.
+- Ordinary thinking/High: all198 GPQA and500 MATH responses completed with
+  stop and nonempty final answers; no truncation, timeout, engine restart,
+  illegal access or preemption.
 
-## Checks
+| Evaluation | Result |
+|---|---|
+| GPQA Diamond, native strict-match | 170/198, 85.86% |
+| GPQA Diamond, frozen final-answer-v1 | 171/198, 86.36% |
+| MATH-500, native exact_match | 477/500, 95.40% |
+| MATH-500, supplementary equivalence review | 498/500, 99.60% |
 
-```bash
-# CPU only; deliberately does not import torch/vLLM or touch a GPU.
-python3 tests/unit_tests/test_deepseek_v4_metax_contracts.py -v
+The supplementary MATH number restores21 clearly equivalent expressions
+rejected by the native string-oriented scorer (e.g. exponent braces, fraction
+versus decimal, root order and vector notation). It is a post-hoc review of
+the23 rejected cases, **not** the native score or a new frozen automatic
+metric. Original answers/results were not changed. GPQA's frozen metric is
+reported separately from native strict-match.
 
-# Only with an approved isolated GPU window and matching dependencies:
-DSV4_RUN_GPU_TESTS=1 pytest -q tests/unit_tests/ops/test_deepseek_v4_metax_kernels.py
-```
+Publication checks rebuild both profiles and compare every source/config
+hash with the evaluated artifacts. This does not claim that the entire
+upstream CI suite or additional APIs such as logprobs were tested.
 
-Before promoting the port: test the short-prompt boundaries, compare actual
-M/4 indices on 16K/64K, exercise decode graph capture/replay with changed
-inputs, then benchmark with verification disabled and isolated caches.
-Logprobs/prompt_logprobs had an unresolved FlagGems log_softmax issue in the
-source environment; unused KV slots containing NaNs are another known
-robustness limitation. Neither is claimed fixed here.
+~~~sh
+python tests/unit_tests/test_deepseek_v4_profile.py -v
+~~~
+
+Measured serving throughput:64 requests, concurrency64, O1024,
+one warmup + three formal rounds, last formal round:
+
+| Input tokens | Output tok/s | Total tok/s |
+|---:|---:|---:|
+| 1024 | 946.18 | 1892.36 |
+| 4096 | 687.18 | 3435.91 |
+| 16384 | 330.72 | 5622.18 |
+| 65536 | 100.31 | 6520.06 |
+
+These performance records are retained unchanged; this source-packaging
+update did not rerun a performance benchmark.
