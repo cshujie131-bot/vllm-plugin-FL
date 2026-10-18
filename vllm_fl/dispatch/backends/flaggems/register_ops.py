@@ -49,7 +49,13 @@ def register_builtins(registry) -> None:
     """
     from .flaggems import FlagGemsBackend
 
-    backend = FlagGemsBackend()
+    from vllm_fl import dsv4_config
+
+    if dsv4_config.is_enabled():
+        from .deepseek_v4_metax import DeepseekV4MetaXBackend
+        backend = DeepseekV4MetaXBackend()
+    else:
+        backend = FlagGemsBackend()
     is_avail = backend.is_available
 
     impls = [

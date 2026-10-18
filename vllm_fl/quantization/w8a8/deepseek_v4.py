@@ -1,16 +1,4 @@
 # Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
@@ -31,13 +19,15 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Int8,
 )
 
-from vllm_fl.dispatch.backends.vendor.metax.patches.scaled_mm import (
+from vllm_fl.dispatch.backends.vendor.metax.impl.dsv4.scaled_mm import (
     MctlassInt8ScaledMMLinearKernel,
 )
 from vllm_fl.quantization.w8a8.moe_experts import TritonW8A8Experts
 
+from vllm_fl.dispatch.backends.vendor.metax.impl.dsv4.moe import fused_experts_impl
 
-class MetaXTritonW8A8Experts(TritonW8A8Experts):
+
+class MetaXW8A8Experts(TritonW8A8Experts):
     def apply(
         self,
         output: torch.Tensor,
@@ -56,14 +46,13 @@ class MetaXTritonW8A8Experts(TritonW8A8Experts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ) -> None:
-        from vllm_fl.ops.fused_moe.fused_moe import fused_experts_impl
-
         result = fused_experts_impl(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
+            inplace=False,
             activation=activation.value,
             apply_router_weight_on_input=apply_router_weight_on_input,
             use_int8_w8a8=True,
@@ -117,5 +106,5 @@ class DeepseekV4W8A8Config(CompressedTensorsConfig):
                 scheme.input_symmetric,
             )
         elif isinstance(method, CompressedTensorsW8A8Int8MoEMethod):
-            method.experts_cls = MetaXTritonW8A8Experts
+            method.experts_cls = MetaXW8A8Experts
         return method

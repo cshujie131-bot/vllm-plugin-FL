@@ -255,8 +255,28 @@ class CachedOp:
             return result
 
 
+    def bind(self):
+        """Resolve before graph tracing; preserve normal cache invalidation semantics."""
+        mgr = get_default_manager()
+        mgr.ensure_initialized()
+        get_policy()
+        impl = mgr._resolve_impl(self._op_name)
+        mgr._record_first_use(self._op_name, impl)
+        self._impl = impl
+        self._use_manager_call = False
+        self._manager_id = id(mgr)
+        self._manager_epoch = mgr.policy_epoch
+        self._policy_epoch = get_policy_epoch()
+        return impl
+
+
 def prewarm_cached_ops() -> int:
     """Resolve loaded CachedOps before torch.compile graph capture."""
+    from vllm_fl import dsv4_config
+
+    if dsv4_config.is_enabled():
+        # DS binds before tracing; preserve the evaluated non-frozen call path.
+        return 0
     mgr = get_default_manager()
     manager_id = id(mgr)
     policy_epoch = get_policy_epoch()
