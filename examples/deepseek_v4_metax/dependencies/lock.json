@@ -1,0 +1,50 @@
+{
+  "flag_gems": {
+    "repository": "https://github.com/flagos-ai/FlagGems",
+    "commit": "3123859968915e361e8452dd796dc6b27c956324",
+    "source_sha256": "192327af13a3ed02b7d82fba58c40ed179dbc0178c266defcafb859e8da2b276",
+    "result_sha256": "b1631dc8e545c21534e34ecea1a62c01a7fef00635ee64d6e1c77dfebc3a1cf6",
+    "changed_files": [
+      "src/flag_gems/fused/mhc/hc_head_fused_kernel.py",
+      "src/flag_gems/fused/topk_softplus_sqrt.py",
+      "src/flag_gems/ops/dsv4_masked_fill.py",
+      "src/flag_gems/runtime/__init__.py",
+      "src/flag_gems/runtime/metax_launch_policy.py"
+    ],
+    "patches": [
+      "flag_gems.patch"
+    ]
+  },
+  "flaggems_vllm": {
+    "repository": "https://github.com/flagos-ai/FlagGems-vllm",
+    "commit": "5f4dc53cc31b99e83967a2b19195ab1a295aeef6",
+    "source_sha256": "c5b4d5f25acfa70f88ee1dda82adb2fe4ca442d4995c97cb4f6f14370357cdc4",
+    "result_sha256": "668f4d1f09e069b4ae5fd75dfcf790d7d2e9ce6d1c6910bd2d00a2eb0f65c5ef",
+    "changed_files": [
+      "src/flaggems_vllm/ops/attention_staged.py",
+      "src/flaggems_vllm/ops/deepseek_v4_attention_dequantize_and_gather_k_cache.py",
+      "src/flaggems_vllm/ops/dsv4_int8_quant.py",
+      "src/flaggems_vllm/ops/dsv4_launch.py",
+      "src/flaggems_vllm/ops/dsv4_moe_align.py",
+      "src/flaggems_vllm/ops/flash_mla_with_kvcache.py",
+      "src/flaggems_vllm/ops/flashmla_sparse.py",
+      "src/flaggems_vllm/ops/metax_tuning.py",
+      "src/flaggems_vllm/ops/mhc/__init__.py",
+      "src/flaggems_vllm/ops/mhc/metax_pr755.py",
+      "src/flaggems_vllm/ops/mhc/mhc_kernels.py",
+      "src/flaggems_vllm/ops/mhc/mhc_pre.py",
+      "src/flaggems_vllm/ops/mhc/mhc_pre_metax.py",
+      "src/flaggems_vllm/ops/mhc/mhc_pre_mm_op.py",
+      "src/flaggems_vllm/ops/mhc/mhc_prefill_split.py",
+      "src/flaggems_vllm/ops/silu_and_mul_with_clamp.py",
+      "src/flaggems_vllm/runtime/backend/_metax/fused/gdn_chunk.py",
+      "src/flaggems_vllm/utils/code_cache.py"
+    ],
+    "patches": [
+      "flaggems_vllm/01-sparse-mla.patch",
+      "flaggems_vllm/02-mhc-pr755.patch",
+      "flaggems_vllm/03-mhc-integration.patch",
+      "flaggems_vllm/04-fused-adapters.patch"
+    ]
+  }
+}
