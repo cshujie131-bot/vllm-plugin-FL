@@ -1,0 +1,5831 @@
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/mxfp4_kernels.py
+@@ -0,0 +1,92 @@
++"""BF16 reference/adaptation kernels that read original packed MXFP4 weights."""
++
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _e2m1(code):
++    magnitude = code & 7
++    exponent = magnitude >> 1
++    mantissa = magnitude & 1
++    value = tl.where(
++        exponent == 0,
++        mantissa.to(tl.float32) * 0.5,
++        tl.exp2((exponent - 1).to(tl.float32)) * (1.0 + mantissa.to(tl.float32) * 0.5),
++    )
++    return value
++
++
++@triton.jit
++def _signed_bf16(code, exponent):
++    value = _e2m1(code) * tl.exp2((exponent - 127).to(tl.float32))
++    # Bitwise sign insertion after scaling preserves the encoded negative zero.
++    bits = value.to(tl.int32, bitcast=True) | ((code & 8) << 28)
++    return bits.to(tl.float32, bitcast=True).to(tl.bfloat16)
++
++
++@triton.jit
++def _decode(W, S, O, N: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr):
++    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    row = offset // K
++    col = offset % K
++    packed = tl.load(W + row * (K // 2) + col // 2, row < N, other=0).to(tl.int32)
++    code = (packed >> ((col & 1) * 4)) & 15
++    exponent = tl.load(S + row * (K // 32) + col // 32, row < N, other=127).to(tl.int32)
++    value = _signed_bf16(code, exponent)
++    tl.store(O + offset, value.to(O.dtype.element_ty), row < N)
++
++
++@triton.jit
++def _fused_mm(
++    X,
++    W,
++    S,
++    O,
++    M: tl.constexpr,
++    N: tl.constexpr,
++    K: tl.constexpr,
++    BM: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++):
++    m = tl.program_id(0) * BM + tl.arange(0, BM)
++    n = tl.program_id(1) * BN + tl.arange(0, BN)
++    rk = tl.arange(0, BK)
++    acc = tl.zeros((BM, BN), tl.float32)
++    for start in range(tl.cdiv(K, BK)):
++        k = start * BK + rk
++        x = tl.load(
++            X + m[:, None] * K + k[None, :],
++            (m[:, None] < M) & (k[None, :] < K),
++            other=0,
++        )
++        packed = tl.load(
++            W + n[None, :] * (K // 2) + k[:, None] // 2,
++            (n[None, :] < N) & (k[:, None] < K),
++            other=0,
++        ).to(tl.int32)
++        code = (packed >> ((k[:, None] & 1) * 4)) & 15
++        exponent = tl.load(
++            S + n[None, :] * (K // 32) + k[:, None] // 32,
++            (n[None, :] < N) & (k[:, None] < K),
++            other=127,
++        ).to(tl.int32)
++        weight = _signed_bf16(code, exponent)
++        acc = tl.dot(x, weight, acc)
++    tl.store(O + m[:, None] * N + n[None, :], acc, (m[:, None] < M) & (n[None, :] < N))
++
++
++def decode_into(packed, scales, out):
++    n, k = out.shape
++    _decode[(triton.cdiv(n * k, 2048),)](packed, scales, out, n, k, 2048, num_warps=4)
++    return out
++
++
++def fused_mm_into(x, packed, scales, out):
++    m, k = x.shape
++    n = packed.shape[0]
++    _fused_mm[(triton.cdiv(m, 16), triton.cdiv(n, 32))](
++        x, packed, scales, out, m, n, k, 16, 32, 64, num_warps=4, num_stages=1
++    )
++    return out
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/prefill_kernel.py
+@@ -0,0 +1,108 @@
++"""FP32 diagnostic attention with independent QK and value dimensions."""
++
++import torch
++from flag_gems import runtime
++import triton
++import triton.language as tl
++from flaggems_vllm.ops.kimi_k3_metax import prefill_mma
++
++
++@triton.jit
++def _attention(
++    Q,
++    K,
++    V,
++    CQ,
++    CK,
++    O,
++    LSE,
++    H: tl.constexpr,
++    DQ: tl.constexpr,
++    DV: tl.constexpr,
++    SCALE: tl.constexpr,
++    CAUSAL: tl.constexpr,
++    BK: tl.constexpr,
++    BD: tl.constexpr,
++    BV: tl.constexpr,
++):
++    qi = tl.program_id(0)
++    head = tl.program_id(1)
++    batch = tl.program_id(2)
++    q0 = tl.load(CQ + batch)
++    q1 = tl.load(CQ + batch + 1)
++    k0 = tl.load(CK + batch)
++    k1 = tl.load(CK + batch + 1)
++    qlen = q1 - q0
++    klen = k1 - k0
++    if qi >= qlen:
++        return
++    d = tl.arange(0, BD)
++    dv = tl.arange(0, BV)
++    q = tl.load(Q + ((q0 + qi) * H + head) * DQ + d, d < DQ, other=0).to(tl.float32)
++    maximum = tl.full((), -float("inf"), tl.float32)
++    denom = tl.full((), 0.0, tl.float32)
++    acc = tl.zeros((BV,), tl.float32)
++    limit = tl.minimum(klen, klen - qlen + qi + 1) if CAUSAL else klen
++    for start in range(0, limit, BK):
++        n = start + tl.arange(0, BK)
++        keys = tl.load(
++            K + ((k0 + n[:, None]) * H + head) * DQ + d[None, :],
++            (n[:, None] < limit) & (d[None, :] < DQ),
++            other=0,
++        ).to(tl.float32)
++        scores = tl.sum(keys * q[None, :], axis=1) * SCALE
++        scores = tl.where(n < limit, scores, -float("inf"))
++        current = tl.maximum(maximum, tl.max(scores, 0))
++        alpha = tl.exp(maximum - current)
++        p = tl.exp(scores - current)
++        values = tl.load(
++            V + ((k0 + n[:, None]) * H + head) * DV + dv[None, :],
++            (n[:, None] < limit) & (dv[None, :] < DV),
++            other=0,
++        ).to(tl.float32)
++        acc = acc * alpha + tl.sum(p[:, None] * values, axis=0)
++        denom = denom * alpha + tl.sum(p, 0)
++        maximum = current
++    result = tl.where(denom > 0, acc / denom, 0.0)
++    tl.store(O + ((q0 + qi) * H + head) * DV + dv, result, dv < DV)
++    tl.store(
++        LSE + (q0 + qi) * H + head,
++        tl.where(denom > 0, maximum + tl.log(denom), -float("inf")),
++    )
++
++
++def attention(q, k, v, cq, ck, max_q, scale, causal=True):
++    if prefill_mma.can_use(q, k, v, cq, ck, max_q, scale):
++        return prefill_mma.run(q, k, v, cq, ck, max_q, scale, causal)
++    if q.shape[-1] != 192 or k.shape[-1] != 192 or v.shape[-1] != 128:
++        raise ValueError("This diagnostic targets K3 QK192/V128")
++    h = q.shape[1]
++    out = torch.empty((q.shape[0], h, 128), dtype=torch.float32, device=q.device)
++    lse = torch.empty((q.shape[0], h), dtype=torch.float32, device=q.device)
++    tuned = (
++        runtime.device.vendor_name == "metax"
++        and h == 3
++        and all(t.dtype == torch.bfloat16 and t.is_contiguous() for t in (q, k, v))
++        and cq.dtype == ck.dtype == torch.int32
++    )
++    _attention[(max_q, h, cq.numel() - 1)](
++        q,
++        k,
++        v,
++        cq,
++        ck,
++        out,
++        lse,
++        h,
++        192,
++        128,
++        scale,
++        causal,
++        32 if tuned else 16,
++        256,
++        128,
++        num_warps=2 if tuned else 4,
++        num_stages=1,
++        enable_fp_fusion=False,
++    )
++    return out, lse
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/normalization.py
+@@ -0,0 +1,27 @@
++"""Diagnostic precise L2 normalization for BF16 KDA input materialization."""
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _normalize(X, Y, D: tl.constexpr, BLOCK: tl.constexpr):
++    row = tl.program_id(0)
++    d = tl.arange(0, BLOCK)
++    x = tl.load(X + row * D + d, d < D, other=0).to(tl.float64)
++    denominator = tl.sqrt(tl.sum(x * x, 0) + tl.full((), 1e-6, tl.float64))
++    normalized = x / denominator
++    tl.store(Y + row * D + d, normalized.to(tl.float32).to(Y.dtype.element_ty), d < D)
++
++
++def l2norm(x):
++    if x.dtype != torch.bfloat16 or not x.is_contiguous() or x.shape[-1] != 128:
++        raise ValueError(
++            "This candidate requires contiguous BF16 KDA head dimension 128"
++        )
++    out = torch.empty_like(x)
++    _normalize[(x.numel() // 128,)](
++        x, out, 128, 128, num_warps=4, enable_fp_fusion=False
++    )
++    return out
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/kda.py
+@@ -0,0 +1,58 @@
++"""K3 prefill adapter preserving BF16 interfaces and FP32 recurrent state."""
++
++import torch
++from flaggems_vllm.ops.kimi_k3_metax.kda_kernels.chunk import (
++    chunk_kda_with_fused_gate_fwd,
++)
++from flaggems_vllm.ops.kimi_k3_metax.normalization import l2norm
++from flaggems_vllm.ops.kimi_k3_metax.kda_preprocess import can_prepare, prepare
++
++
++def chunk_kda_with_fused_gate(
++    q,
++    k,
++    v,
++    raw_g,
++    raw_beta,
++    A_log,
++    g_bias,
++    scale=None,
++    initial_state=None,
++    output_final_state=False,
++    lower_bound=None,
++    use_qk_l2norm_in_kernel=False,
++    cu_seqlens=None,
++):
++    if lower_bound != -5.0 or q.shape[-1] != 128:
++        raise ValueError(
++            "The verified K3 adapter requires head128 and gate lower bound -5"
++        )
++    if cu_seqlens is None or not output_final_state:
++        raise ValueError("K3 prefill requires sequence boundaries and final state")
++    if use_qk_l2norm_in_kernel and can_prepare(q, k, v):
++        q_fp32, k_fp32, v_fp32 = prepare(q, k, v)
++    else:
++        if use_qk_l2norm_in_kernel:
++            q, k = l2norm(q.contiguous()), l2norm(k.contiguous())
++        q_fp32, k_fp32, v_fp32 = q.float(), k.float(), v.float()
++    if initial_state is None:
++        initial_state = torch.zeros(
++            (cu_seqlens.numel() - 1, q.shape[2], v.shape[-1], k.shape[-1]),
++            device=q.device,
++            dtype=torch.float32,
++        )
++    output, state = chunk_kda_with_fused_gate_fwd(
++        q_fp32,
++        k_fp32,
++        v_fp32,
++        raw_g.contiguous(),
++        raw_beta,
++        A_log,
++        g_bias,
++        scale if scale is not None else 128**-0.5,
++        initial_state.contiguous(),
++        True,
++        lower_bound=lower_bound,
++        cu_seqlens=cu_seqlens,
++    )
++    return output.to(v.dtype), state
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/cache_gather.py
+@@ -0,0 +1,110 @@
++# SPDX-License-Identifier: Apache-2.0
++"""BF16-only port of vLLM gather_and_maybe_dequant_cache indexing semantics."""
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _gather(
++    SRC,
++    DST,
++    TABLE,
++    CU,
++    STARTS,
++    TOKENS: tl.constexpr,
++    REQUESTS: tl.constexpr,
++    WIDTH: tl.constexpr,
++    BS: tl.constexpr,
++    SRC_BLOCK,  # Runtime stride avoids the large-constant lowering fault on C550.
++    SRC_ENTRY: tl.constexpr,
++    DST_ENTRY: tl.constexpr,
++    TABLE_ROW: tl.constexpr,
++    TABLE_COLUMNS: tl.constexpr,
++    HAS_STARTS: tl.constexpr,
++    NR: tl.constexpr,
++    BD: tl.constexpr,
++):
++    token = tl.program_id(0) * 4 + tl.arange(0, 4)
++    requests = tl.arange(0, NR)
++    begins = tl.load(CU + requests, requests < REQUESTS, other=2147483647)
++    seq = (
++        tl.sum(
++            ((token[:, None] >= begins[None, :]) & (requests[None, :] < REQUESTS)).to(
++                tl.int32
++            ),
++            axis=1,
++        )
++        - 1
++    )
++    begin = tl.load(CU + seq, token < TOKENS, other=0)
++    start = tl.load(STARTS + seq, token < TOKENS, other=0) if HAS_STARTS else 0
++    position = token - begin + start
++    logical_block = position // BS
++    valid = (token < TOKENS) & (logical_block < TABLE_COLUMNS)
++    physical_block = tl.load(TABLE + seq * TABLE_ROW + logical_block, valid, other=0)
++    d = tl.arange(0, BD)
++    values = tl.load(
++        SRC
++        + physical_block[:, None].to(tl.int64) * SRC_BLOCK
++        + (position % BS)[:, None] * SRC_ENTRY
++        + d[None, :],
++        valid[:, None] & (d[None, :] < WIDTH),
++        other=0,
++    )
++    tl.store(
++        DST + token[:, None].to(tl.int64) * DST_ENTRY + d[None, :],
++        values,
++        valid[:, None] & (d[None, :] < WIDTH),
++    )
++
++
++def gather(
++    src_cache,
++    dst,
++    block_table,
++    cu_seq_lens,
++    token_to_seq,
++    num_tokens,
++    kv_cache_dtype,
++    scale,
++    seq_starts=None,
++):
++    # Like upstream's page kernel, derive request identity from cu_seq_lens.
++    if (
++        kv_cache_dtype not in ("auto", "bfloat16")
++        or src_cache.dtype != torch.bfloat16
++        or dst.dtype != torch.bfloat16
++    ):
++        raise NotImplementedError("The K3 gather adapter supports BF16 cache only")
++    if (
++        src_cache.shape[-1] != 576
++        or dst.shape[-1] != 576
++        or src_cache.stride(-1) != 1
++        or dst.stride(-1) != 1
++    ):
++        raise ValueError("Expected contiguous latent512+extra64 entries")
++    if num_tokens == 0:
++        return
++    requests = cu_seq_lens.numel() - 1
++    _gather[(triton.cdiv(num_tokens, 4),)](
++        src_cache,
++        dst,
++        block_table,
++        cu_seq_lens,
++        seq_starts,
++        num_tokens,
++        requests,
++        576,
++        src_cache.shape[1],
++        src_cache.stride(0),
++        src_cache.stride(1),
++        dst.stride(0),
++        block_table.stride(0),
++        block_table.shape[1],
++        seq_starts is not None,
++        triton.next_power_of_2(requests),
++        1024,
++        num_warps=4,
++    )
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/grouped_moe.py
+@@ -0,0 +1,323 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Graph-capturable MXFP4/BF16 grouped experts for Kimi K3.
++
++Reuse FlagGems-vllm's device-side routing alignment. Custom GEMMs consume
++checkpoint-native FP4/E8M0 tiles; no decoded expert-weight tensor is stored.
++The two BF16 GEMM boundaries and FP32 SiTU/router arithmetic are explicit.
++"""
++
++import torch
++import triton
++import triton.language as tl
++from flag_gems import runtime
++from flag_gems.utils import tl_extra_shim
++from flaggems_vllm.ops.moe_align_block_size import (
++    moe_align_block_size_no_tle,
++    moe_align_block_size_singleton,
++)
++
++from flaggems_vllm.ops.kimi_k3_metax.mxfp4_kernels import _signed_bf16
++from flaggems_vllm.ops.kimi_k3_metax.decode_bits import decode_bits
++from flaggems_vllm.ops.kimi_k3_metax.expert_tail_gemv import _packed_gemv
++
++_tanh = tl_extra_shim.tanh
++_exp2 = tl_extra_shim.exp2
++
++
++@triton.jit(do_not_specialize=["ROUTES"])
++def _grouped_mm(
++    X,
++    W,
++    S,
++    Y,
++    SORTED,
++    EXPERTS,
++    TOTAL,
++    ROUTES,
++    N: tl.constexpr,
++    K: tl.constexpr,
++    E: tl.constexpr,
++    INPUT_TOPK: tl.constexpr,
++    BM: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++    BIT_DECODE: tl.constexpr = False,
++):
++    """Every program owns an expert/token block and an output-column block."""
++    row_block = tl.program_id(0)
++    column_block = tl.program_id(1)
++    total = tl.load(TOTAL)
++    if row_block * BM >= total:
++        return
++    expert = tl.load(EXPERTS + row_block).to(tl.int64)
++    if expert < 0 or expert >= E:
++        return
++    route_offsets = row_block * BM + tl.arange(0, BM)
++    routes = tl.load(SORTED + route_offsets).to(tl.int64)
++    valid_route = routes < ROUTES
++    rows = routes // INPUT_TOPK
++    columns = column_block * BN + tl.arange(0, BN)
++    reduction = tl.arange(0, BK)
++    acc = tl.zeros((BM, BN), tl.float32)
++    for start in range(tl.cdiv(K, BK)):
++        k = start * BK + reduction
++        a = tl.load(
++            X + rows[:, None] * K + k[None, :],
++            valid_route[:, None] & (k[None, :] < K),
++            other=0,
++        )
++        packed = tl.load(
++            W + (expert * N + columns[None, :]) * (K // 2) + k[:, None] // 2,
++            (columns[None, :] < N) & (k[:, None] < K),
++            other=0,
++        ).to(tl.int32)
++        exponent = tl.load(
++            S + (expert * N + columns[None, :]) * (K // 32) + k[:, None] // 32,
++            (columns[None, :] < N) & (k[:, None] < K),
++            other=127,
++        ).to(tl.int32)
++        code = (packed >> ((k[:, None] & 1) * 4)) & 15
++        if BIT_DECODE:
++            b = decode_bits(code, exponent)
++        else:
++            b = _signed_bf16(code, exponent)
++        acc = tl.dot(a, b, acc)
++    tl.store(
++        Y + routes[:, None] * N + columns[None, :],
++        acc.to(tl.bfloat16),
++        valid_route[:, None] & (columns[None, :] < N),
++    )
++
++
++@triton.jit
++def _situ(
++    GATE_UP,
++    ACTIVATED,
++    ELEMENTS: tl.constexpr,
++    I: tl.constexpr,
++    BETA: tl.constexpr,
++    LINEAR_BETA: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    row = offsets // I
++    col = offsets % I
++    gate = tl.load(GATE_UP + row * (2 * I) + col, offsets < ELEMENTS, 0).to(tl.float32)
++    up = tl.load(GATE_UP + row * (2 * I) + I + col, offsets < ELEMENTS, 0).to(
++        tl.float32
++    )
++    # Separate expressions preserve the materialization order of the reference.
++    sigmoid = 1.0 / (1.0 + _exp2(-gate * 1.4426950408889634))
++    gate = BETA * _tanh(gate / BETA) * sigmoid
++    if LINEAR_BETA > 0:
++        up = LINEAR_BETA * _tanh(up / LINEAR_BETA)
++    # Match the registered FP32 multiply's exact-zero sign before the BF16
++    # boundary. The +0 FMA does not merge any earlier SiTU arithmetic stage.
++    result = tl.fma(gate, up, 0.0).to(tl.bfloat16)
++    tl.store(ACTIVATED + offsets, result, offsets < ELEMENTS)
++
++
++@triton.jit
++def _weighted_sum(
++    ROUTE_OUTPUT,
++    WEIGHTS,
++    OUTPUT,
++    H: tl.constexpr,
++    TOPK: tl.constexpr,
++    RT: tl.constexpr,
++    BLOCK: tl.constexpr,
++    ROUTE_H: tl.constexpr = 0,
++    OUTPUT_START: tl.constexpr = 0,
++):
++    RH: tl.constexpr = H if ROUTE_H == 0 else ROUTE_H
++    tl.static_assert(0 <= OUTPUT_START and OUTPUT_START + RH <= H)
++    token = tl.program_id(0)
++    columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    slots = tl.arange(0, RT)
++    values = tl.load(
++        ROUTE_OUTPUT + (token * TOPK + slots[:, None]) * RH + columns[None, :],
++        (slots[:, None] < TOPK) & (columns[None, :] < RH),
++        0,
++    ).to(tl.float32)
++    weights = tl.load(WEIGHTS + token * TOPK + slots, slots < TOPK, 0).to(tl.float32)
++    result = tl.sum(values * weights[:, None], axis=0)
++    tl.store(
++        OUTPUT + token * H + OUTPUT_START + columns,
++        result.to(tl.bfloat16),
++        columns < RH,
++    )
++
++
++def _alignment(ids, block_m, experts):
++    if ids.shape[0] == 1:
++        return moe_align_block_size_singleton(ids, block_m)
++    # Padding is for routing metadata only. It lets the existing vectorized
++    # prefix-scan run for E=896; no weight matrix or model expert is added.
++    metadata_experts = triton.next_power_of_2(experts)
++    return moe_align_block_size_no_tle(ids, block_m, metadata_experts)
++
++
++def grouped_experts(
++    x, w13, s13, w2, s2, topk_weights, topk_ids, *, beta=4.0, linear_beta=25.0
++):
++    """Run both expert GEMMs, SiTU and ordered top-k output combination on GPU.
++
++    Routing IDs must satisfy the router contract 0 <= id < E. All workspaces
++    depend on tensor metadata, not GPU values, so the call can be captured.
++    """
++    if x.ndim != 2 or x.dtype != torch.bfloat16:
++        raise ValueError("Expected a 2D BF16 activation")
++    experts, twice_intermediate, packed_hidden = w13.shape
++    tokens, hidden = x.shape
++    intermediate = twice_intermediate // 2
++    if hidden % 32 or intermediate % 32 or packed_hidden * 2 != hidden:
++        raise ValueError("Expected complete group32 MXFP4 tiles")
++    if tuple(w2.shape) != (experts, hidden, intermediate // 2):
++        raise ValueError("The expert matrix shapes do not form gate/up/down")
++    if tuple(s13.shape) != (experts, twice_intermediate, hidden // 32):
++        raise ValueError("Invalid gate/up scales")
++    if tuple(s2.shape) != (experts, hidden, intermediate // 32):
++        raise ValueError("Invalid down scales")
++    if (
++        topk_ids.ndim != 2
++        or topk_ids.shape[0] != tokens
++        or topk_weights.shape != topk_ids.shape
++    ):
++        raise ValueError("Expected matching [tokens, topk] routes and weights")
++    if topk_weights.dtype != torch.float32 or topk_ids.dtype not in (
++        torch.int32,
++        torch.int64,
++    ):
++        raise TypeError("Expected FP32 router weights and integer expert IDs")
++    if any(t.dtype != torch.uint8 for t in (w13, s13, w2, s2)):
++        raise TypeError("Weights and E8M0 scales remain checkpoint-native U8")
++    if not all(
++        t.is_contiguous() and t.device == x.device
++        for t in (x, w13, s13, w2, s2, topk_weights, topk_ids)
++    ):
++        raise ValueError("Grouped experts require contiguous tensors on one device")
++    if tokens == 0:
++        return torch.empty_like(x)
++    topk = topk_ids.shape[1]
++    if not 1 <= topk <= 16:
++        raise ValueError("This K3 candidate supports topk 1..16")
++    block_m = 16 if tokens < 256 else (32 if tokens < 2048 else 64)
++    block_n1 = block_k1 = block_n2 = block_k2 = 32
++    # Measured TP32 shapes only. Other batches, layouts and models keep B0.
++    if runtime.device.vendor_name == "metax" and (
++        hidden,
++        intermediate,
++        experts,
++        topk,
++    ) == (3584, 96, 896, 16):
++        if tokens == 1:
++            block_n1 = 16
++        elif tokens in (3553, 4096):
++            block_n1, block_k1, block_n2 = 64, 64, 64
++    # Fixed, independently validated decode bins only. Prefill retains old math.
++    decode_optimized = (
++        runtime.device.vendor_name == "metax"
++        and (hidden, intermediate, experts, topk) == (3584, 96, 896, 16)
++        and tokens in (1, 2, 4, 8, 16, 32, 64)
++    )
++    sorted_ids, expert_ids, padded = _alignment(topk_ids, block_m, experts)
++    routes = tokens * topk
++    # Gate/up is dead before stage 2 reuses its storage. No full BF16 weights
++    # and no FP32 [tokens, topk, hidden] contribution tensor are materialized.
++    scratch = torch.empty(
++        routes * max(hidden, twice_intermediate), device=x.device, dtype=torch.bfloat16
++    )
++    gate_up = scratch[: routes * twice_intermediate].view(routes, twice_intermediate)
++    route_output = scratch[: routes * hidden].view(routes, hidden)
++    activated = torch.empty(
++        (routes, intermediate), device=x.device, dtype=torch.bfloat16
++    )
++    output = torch.empty_like(x)
++    row_blocks = triton.cdiv(sorted_ids.numel(), block_m)
++    if decode_optimized:
++        active_cap = min(experts, routes)
++        row_blocks = min(row_blocks, active_cap + (routes - active_cap) // block_m)
++    if decode_optimized and tokens in (1, 2) and beta == 4.0 and linear_beta == 25.0:
++        # Tail-batch G1: BF16 values with FP32 vector products/reduction.
++        # G2 below retains the existing grouped BF16 MMA and materialization.
++        _packed_gemv[(routes, twice_intermediate)](
++            x,
++            w13,
++            s13,
++            gate_up,
++            topk_ids,
++            routes,
++            twice_intermediate,
++            hidden,
++            topk,
++            1,
++            1,
++            512,
++            num_warps=4,
++            num_stages=1,
++            enable_fp_fusion=False,
++        )
++    else:
++        _grouped_mm[(row_blocks, triton.cdiv(twice_intermediate, block_n1))](
++            x,
++            w13,
++            s13,
++            gate_up,
++            sorted_ids,
++            expert_ids,
++            padded,
++            routes,
++            twice_intermediate,
++            hidden,
++            experts,
++            topk,
++            block_m,
++            block_n1,
++            block_k1,
++            BIT_DECODE=decode_optimized,
++            num_warps=4,
++            num_stages=1,
++        )
++    _situ[(triton.cdiv(routes * intermediate, 256),)](
++        gate_up,
++        activated,
++        routes * intermediate,
++        intermediate,
++        beta,
++        linear_beta,
++        256,
++        num_warps=4,
++        enable_fp_fusion=False,
++    )
++    _grouped_mm[(row_blocks, triton.cdiv(hidden, block_n2))](
++        activated,
++        w2,
++        s2,
++        route_output,
++        sorted_ids,
++        expert_ids,
++        padded,
++        routes,
++        hidden,
++        intermediate,
++        experts,
++        1,
++        block_m,
++        block_n2,
++        block_k2,
++        BIT_DECODE=decode_optimized,
++        num_warps=4,
++        num_stages=1,
++    )
++    _weighted_sum[(tokens, triton.cdiv(hidden, 256))](
++        route_output,
++        topk_weights,
++        output,
++        hidden,
++        topk,
++        triton.next_power_of_2(topk),
++        256,
++        num_warps=4,
++        enable_fp_fusion=False,
++    )
++    return output
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/decode_bits.py
+@@ -0,0 +1,21 @@
++"""Independent exact-bit E2M1/E8M0 decode candidate; 4080 finite code/scale GPU pairs verified byte exact."""
++
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def decode_bits(code, scale):
++    magnitude = code & 7
++    adjust = tl.where(
++        magnitude <= 1, -1, tl.where(magnitude <= 3, 0, tl.where(magnitude <= 5, 1, 2))
++    )
++    biased = scale + adjust
++    mantissa = tl.where((magnitude > 1) & ((magnitude & 1) != 0), 64, 0)
++    normal = (biased << 7) | mantissa
++    subnormal = (128 | mantissa) >> tl.maximum(1 - biased, 0)
++    value = tl.where(biased <= 0, subnormal, normal)
++    value = tl.where(biased >= 255, 0x7F80, value)
++    value = tl.where(magnitude == 0, 0, value)
++    value = value | ((code & 8) << 12)
++    return value.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/mla_decode_short.py
+@@ -0,0 +1,179 @@
++"""Frozen dense arithmetic, gated to short rows; long rows return before work."""
++
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _short_dense_kernel(
++    Q_ptr,
++    stride_q_b,
++    stride_q_sq,
++    stride_q_h,
++    KV_cache,
++    stride_kv_bs,
++    stride_kv_block,
++    Block_table,
++    stride_bt_b,
++    Seq_lens,
++    Out,
++    stride_o_b,
++    stride_o_sq,
++    stride_o_h,
++    LSE,
++    stride_lse_b,
++    stride_lse_h,
++    sm_scale,
++    SQ,
++    HQ: tl.constexpr,
++    DQK: tl.constexpr,
++    HEAD_DIM_V: tl.constexpr,
++    PAGE_SIZE: tl.constexpr,
++    HAVE_CAUSAL: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    SHORT_LIMIT: tl.constexpr = 256,
++):
++    """
++    Dense decode kernel with paged attention and online softmax.
++    Grid: (ceil(HQ / BLOCK_H), batch_size * seq_q)
++    """
++    pid_h_block = tl.program_id(0)
++    pid_b_sq = tl.program_id(1)
++    i_b = pid_b_sq // SQ
++    i_sq = pid_b_sq % SQ
++    length = tl.load(Seq_lens + i_b)
++    if length > SHORT_LIMIT:
++        return
++    if length == 0:
++        empty_h = pid_h_block * BLOCK_H + tl.arange(0, BLOCK_H)
++        empty_d = tl.arange(0, HEAD_DIM_V)
++        tl.store(
++            Out
++            + i_b * stride_o_b
++            + i_sq * stride_o_sq
++            + empty_h[:, None] * stride_o_h
++            + empty_d[None, :],
++            0.0,
++            empty_h[:, None] < HQ,
++        )
++        tl.store(
++            LSE + i_b * stride_lse_b + empty_h * stride_lse_h + i_sq,
++            -float("inf"),
++            empty_h < HQ,
++        )
++        return
++
++    cur_head = pid_h_block * BLOCK_H + tl.arange(0, BLOCK_H)
++    mask_head = cur_head < HQ
++
++    # Load Q: NoPE part [BLOCK_H, HEAD_DIM_V] and RoPE part [BLOCK_H, DQK-HEAD_DIM_V]
++    offs_d_nope = tl.arange(0, HEAD_DIM_V)
++    offs_q_nope = (
++        i_b * stride_q_b
++        + i_sq * stride_q_sq
++        + cur_head[:, None] * stride_q_h
++        + offs_d_nope[None, :]
++    )
++    q_nope = tl.load(Q_ptr + offs_q_nope, mask=mask_head[:, None], other=0.0)
++
++    offs_d_pe = tl.arange(HEAD_DIM_V, DQK)
++    offs_q_pe = (
++        i_b * stride_q_b
++        + i_sq * stride_q_sq
++        + cur_head[:, None] * stride_q_h
++        + offs_d_pe[None, :]
++    )
++    q_pe = tl.load(Q_ptr + offs_q_pe, mask=mask_head[:, None], other=0.0)
++
++    # Online softmax accumulators
++    e_max = tl.full([BLOCK_H], value=float("-inf"), dtype=tl.float32)
++    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
++    acc = tl.zeros([BLOCK_H, HEAD_DIM_V], dtype=tl.float32)
++
++    cur_batch_seq_len = tl.load(Seq_lens + i_b)
++    Block_table += i_b * stride_bt_b
++
++    offs_n = tl.arange(0, BLOCK_N)
++    loop_time = cur_batch_seq_len // BLOCK_N
++    remainder = cur_batch_seq_len % BLOCK_N
++
++    for i in range(0, loop_time):
++        kv_page_number = tl.load(Block_table + offs_n // PAGE_SIZE)
++        kv_offset = (
++            kv_page_number.to(tl.int64) * stride_kv_block
++            + (offs_n % PAGE_SIZE).to(tl.int64) * stride_kv_bs
++        )
++
++        # Load V (NoPE part)
++        offs_v_c = kv_offset[:, None] + offs_d_nope[None, :]
++        v_c = tl.load(KV_cache + offs_v_c)
++        k_c = tl.trans(v_c)
++
++        # QK = q_nope @ k_nope^T
++        qk = tl.dot(q_nope, k_c)
++
++        # Add RoPE contribution
++        offs_k_pe = kv_offset[None, :] + offs_d_pe[:, None]
++        k_pe = tl.load(KV_cache + offs_k_pe)
++        qk += tl.dot(q_pe, k_pe)
++        qk *= sm_scale
++
++        # Online softmax update
++        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
++        re_scale = tl.exp(e_max - n_e_max)
++        p = tl.exp(qk - n_e_max[:, None])
++        acc *= re_scale[:, None]
++        acc += tl.dot(p.to(v_c.dtype), v_c)
++        e_sum = e_sum * re_scale + tl.sum(p, 1)
++        e_max = n_e_max
++        offs_n += BLOCK_N
++
++    if remainder:
++        mask_kvsplit = offs_n < cur_batch_seq_len
++        kv_page_number = tl.load(
++            Block_table + offs_n // PAGE_SIZE, mask=mask_kvsplit, other=0
++        )
++        kv_offset = (
++            kv_page_number.to(tl.int64) * stride_kv_block
++            + (offs_n % PAGE_SIZE).to(tl.int64) * stride_kv_bs
++        )
++
++        offs_v_c = kv_offset[:, None] + offs_d_nope[None, :]
++        v_c = tl.load(KV_cache + offs_v_c, mask=mask_kvsplit[:, None], other=0.0)
++        k_c = tl.trans(v_c)
++
++        qk = tl.dot(q_nope, k_c)
++
++        offs_k_pe = kv_offset[None, :] + offs_d_pe[:, None]
++        k_pe = tl.load(KV_cache + offs_k_pe, mask=mask_kvsplit[None, :], other=0.0)
++        qk += tl.dot(q_pe, k_pe)
++        qk *= sm_scale
++
++        qk = tl.where(mask_kvsplit[None, :], qk, float("-inf"))
++
++        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
++        re_scale = tl.exp(e_max - n_e_max)
++        p = tl.exp(qk - n_e_max[:, None])
++        acc *= re_scale[:, None]
++        acc += tl.dot(p.to(v_c.dtype), v_c)
++        e_sum = e_sum * re_scale + tl.sum(p, 1)
++        e_max = n_e_max
++
++    # Store output
++    offs_o = (
++        i_b * stride_o_b
++        + i_sq * stride_o_sq
++        + cur_head[:, None] * stride_o_h
++        + offs_d_nope[None, :]
++    )
++    tl.store(
++        Out + offs_o,
++        (acc / e_sum[:, None]).to(Out.dtype.element_ty),
++        mask=mask_head[:, None],
++    )
++
++    # Store LSE
++    lse_val = e_max + tl.math.log(e_sum)
++    lse_offset = i_b * stride_lse_b + cur_head * stride_lse_h + i_sq
++    tl.store(LSE + lse_offset, lse_val, mask=mask_head)
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/mla_decode.py
+@@ -0,0 +1,336 @@
++"""Independent dense MLA split-KV prototype, frozen BF16 products and FP32 merge."""
++
++from flag_gems import runtime
++
++import torch, triton
++from flaggems_vllm.ops.kimi_k3_metax.mla_decode_short import _short_dense_kernel
++import triton.language as tl
++
++
++@triton.jit
++def _split_decode_comp_kernel(
++    Q_ptr,
++    stride_q_b,
++    stride_q_sq,
++    stride_q_h,
++    KV_cache,
++    stride_kv_bs,
++    stride_kv_block,
++    Block_table,
++    stride_bt_b,
++    Seq_lens,
++    Out,
++    stride_o_b,
++    stride_o_sq,
++    stride_o_h,
++    LSE,
++    PartialMax,
++    PartialSum,
++    SPLITS: tl.constexpr,
++    stride_lse_b,
++    stride_lse_h,
++    sm_scale,
++    SQ,
++    HQ: tl.constexpr,
++    DQK: tl.constexpr,
++    HEAD_DIM_V: tl.constexpr,
++    PAGE_SIZE: tl.constexpr,
++    HAVE_CAUSAL: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++):
++    """
++    Dense decode kernel with paged attention and online softmax.
++    Grid: (ceil(HQ / BLOCK_H), batch_size * seq_q)
++    """
++    split = tl.program_id(2)
++    pid_h_block = tl.program_id(0)
++    pid_b_sq = tl.program_id(1)
++    i_b = pid_b_sq // SQ
++    i_sq = pid_b_sq % SQ
++
++    cur_head = pid_h_block * BLOCK_H + tl.arange(0, BLOCK_H)
++    mask_head = cur_head < HQ
++
++    # Load Q: NoPE part [BLOCK_H, HEAD_DIM_V] and RoPE part [BLOCK_H, DQK-HEAD_DIM_V]
++    offs_d_nope = tl.arange(0, HEAD_DIM_V)
++    offs_q_nope = (
++        i_b * stride_q_b
++        + i_sq * stride_q_sq
++        + cur_head[:, None] * stride_q_h
++        + offs_d_nope[None, :]
++    )
++    q_nope = tl.load(Q_ptr + offs_q_nope, mask=mask_head[:, None], other=0.0)
++
++    offs_d_pe = tl.arange(HEAD_DIM_V, DQK)
++    offs_q_pe = (
++        i_b * stride_q_b
++        + i_sq * stride_q_sq
++        + cur_head[:, None] * stride_q_h
++        + offs_d_pe[None, :]
++    )
++    q_pe = tl.load(Q_ptr + offs_q_pe, mask=mask_head[:, None], other=0.0)
++
++    # Online softmax accumulators
++    e_max = tl.full([BLOCK_H], value=float("-inf"), dtype=tl.float32)
++    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
++    acc = tl.zeros([BLOCK_H, HEAD_DIM_V], dtype=tl.float32)
++
++    cur_batch_seq_len = tl.load(Seq_lens + i_b)
++    if cur_batch_seq_len <= 256:
++        return
++    Block_table += i_b * stride_bt_b
++
++    blocks_per_split = tl.cdiv(tl.cdiv(cur_batch_seq_len, BLOCK_N), SPLITS)
++    first = split * blocks_per_split * BLOCK_N
++    end = tl.minimum((split + 1) * blocks_per_split * BLOCK_N, cur_batch_seq_len)
++    count = tl.maximum(end - first, 0)
++    offs_n = first + tl.arange(0, BLOCK_N)
++    loop_time = count // BLOCK_N
++    remainder = count % BLOCK_N
++
++    for i in range(0, loop_time):
++        kv_page_number = tl.load(Block_table + offs_n // PAGE_SIZE)
++        kv_offset = (
++            kv_page_number.to(tl.int64) * stride_kv_block
++            + (offs_n % PAGE_SIZE).to(tl.int64) * stride_kv_bs
++        )
++
++        # Load V (NoPE part)
++        offs_v_c = kv_offset[:, None] + offs_d_nope[None, :]
++        v_c = tl.load(KV_cache + offs_v_c)
++        k_c = tl.trans(v_c)
++
++        # QK = q_nope @ k_nope^T
++        qk = tl.dot(q_nope, k_c)
++
++        # Add RoPE contribution
++        offs_k_pe = kv_offset[None, :] + offs_d_pe[:, None]
++        k_pe = tl.load(KV_cache + offs_k_pe)
++        qk += tl.dot(q_pe, k_pe)
++        qk *= sm_scale
++
++        # Online softmax update
++        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
++        re_scale = tl.exp(e_max - n_e_max)
++        p = tl.exp(qk - n_e_max[:, None])
++        acc *= re_scale[:, None]
++        probability_hi = p.to(v_c.dtype)
++        probability_lo = (p - probability_hi.to(tl.float32)).to(v_c.dtype)
++        acc += tl.dot(probability_hi, v_c)
++        acc += tl.dot(probability_lo, v_c)
++        e_sum = e_sum * re_scale + tl.sum(p, 1)
++        e_max = n_e_max
++        offs_n += BLOCK_N
++
++    if remainder:
++        mask_kvsplit = offs_n < cur_batch_seq_len
++        kv_page_number = tl.load(
++            Block_table + offs_n // PAGE_SIZE, mask=mask_kvsplit, other=0
++        )
++        kv_offset = (
++            kv_page_number.to(tl.int64) * stride_kv_block
++            + (offs_n % PAGE_SIZE).to(tl.int64) * stride_kv_bs
++        )
++
++        offs_v_c = kv_offset[:, None] + offs_d_nope[None, :]
++        v_c = tl.load(KV_cache + offs_v_c, mask=mask_kvsplit[:, None], other=0.0)
++        k_c = tl.trans(v_c)
++
++        qk = tl.dot(q_nope, k_c)
++
++        offs_k_pe = kv_offset[None, :] + offs_d_pe[:, None]
++        k_pe = tl.load(KV_cache + offs_k_pe, mask=mask_kvsplit[None, :], other=0.0)
++        qk += tl.dot(q_pe, k_pe)
++        qk *= sm_scale
++
++        qk = tl.where(mask_kvsplit[None, :], qk, float("-inf"))
++
++        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
++        re_scale = tl.exp(e_max - n_e_max)
++        p = tl.exp(qk - n_e_max[:, None])
++        acc *= re_scale[:, None]
++        probability_hi = p.to(v_c.dtype)
++        probability_lo = (p - probability_hi.to(tl.float32)).to(v_c.dtype)
++        acc += tl.dot(probability_hi, v_c)
++        acc += tl.dot(probability_lo, v_c)
++        e_sum = e_sum * re_scale + tl.sum(p, 1)
++        e_max = n_e_max
++
++    # Keep unnormalized accumulators/statistics in FP32 for the merge.
++    slot = ((i_b * SQ + i_sq) * SPLITS + split) * HQ + cur_head
++    tl.store(
++        Out + slot[:, None] * HEAD_DIM_V + offs_d_nope[None, :], acc, mask_head[:, None]
++    )
++    tl.store(PartialMax + slot, e_max, mask_head)
++    tl.store(PartialSum + slot, e_sum, mask_head)
++
++
++@triton.jit
++def _merge_splits(
++    P,
++    M,
++    S,
++    O,
++    L,
++    Lengths,
++    B: tl.constexpr,
++    H: tl.constexpr,
++    V: tl.constexpr,
++    SPLITS: tl.constexpr,
++    RS: tl.constexpr,
++):
++    b = tl.program_id(0)
++    h = tl.program_id(1)
++    length = tl.load(Lengths + b)
++    if length <= 256:
++        return
++    split = tl.arange(0, RS)
++    d = tl.arange(0, V)
++    slot = (b * SPLITS + split) * H + h
++    maximum = tl.load(M + slot, split < SPLITS, -float("inf"))
++    denom = tl.load(S + slot, split < SPLITS, 0)
++    overall = tl.max(maximum, 0)
++    scale = tl.where(denom > 0, tl.exp(maximum - overall), 0)
++    part = tl.load(P + slot[:, None] * V + d[None, :], split[:, None] < SPLITS, 0)
++    numerator = tl.sum(part * scale[:, None], 0)
++    total = tl.sum(denom * scale, 0)
++    result = tl.where(total > 0, numerator / total, 0)
++    tl.store(O + (b * H + h) * V + d, result.to(tl.bfloat16))
++    tl.store(L + b * H + h, tl.where(total > 0, overall + tl.log(total), -float("inf")))
++
++
++def can_use(q, cache, table, lengths, out, lse, scale):
++    """Metadata-only guard; unsupported calls retain the existing dispatcher."""
++    return (
++        runtime.device.vendor_name == "metax"
++        and q.ndim == 4
++        and q.shape[0]
++        in (
++            1,
++            2,
++            3,
++            4,
++            5,
++            7,
++            8,
++            12,
++            16,
++            20,
++            24,
++            28,
++            32,
++            36,
++            40,
++            44,
++            48,
++            52,
++            55,
++            56,
++            60,
++            61,
++            64,
++        )
++        and tuple(q.shape[1:]) == (1, 3, 576)
++        and tuple(cache.shape[1:]) == (256, 1, 576)
++        and q.dtype == cache.dtype == torch.bfloat16
++        and table.dtype == lengths.dtype == torch.int32
++        and q.is_cuda
++        and all(x.device == q.device for x in (cache, table, lengths, out, lse))
++        and table.ndim == 2
++        and table.shape[0] == q.shape[0]
++        and lengths.shape == (q.shape[0],)
++        and lengths.is_contiguous()
++        and q.stride(-1) == cache.stride(-1) == table.stride(-1) == 1
++        and out.shape == (q.shape[0], 1, 3, 512)
++        and out.dtype == torch.bfloat16
++        and lse.shape == (q.shape[0], 3, 1)
++        and lse.dtype == torch.float32
++        and out.is_contiguous()
++        and lse.is_contiguous()
++        and abs(scale - 192**-0.5) <= 1e-15
++    )
++
++
++def run(q, cache, table, lengths, out, lse, *, softmax_scale, causal):
++    """Write caller outputs; retain original B2/short-row arithmetic."""
++    b = q.shape[0]
++    _short_dense_kernel[(1, b)](
++        q,
++        *q.stride()[:3],
++        cache,
++        cache.stride(1),
++        cache.stride(0),
++        table,
++        table.stride(0),
++        lengths,
++        out,
++        *out.stride()[:3],
++        lse,
++        lse.stride(0),
++        lse.stride(1),
++        softmax_scale,
++        1,
++        3,
++        576,
++        512,
++        256,
++        causal,
++        16,
++        16,
++        SHORT_LIMIT=table.shape[1] * 256 if b == 2 else 256,
++        num_warps=4,
++        num_stages=1,
++    )
++    if b == 2:
++        return
++    splits = 16 if b >= 16 else 32
++    partial = torch.empty((b, splits, 3, 512), device=q.device, dtype=torch.float32)
++    maximum = torch.empty((b, splits, 3), device=q.device, dtype=torch.float32)
++    denominator = torch.empty_like(maximum)
++    _split_decode_comp_kernel[(1, b, splits)](
++        q,
++        *q.stride()[:3],
++        cache,
++        cache.stride(1),
++        cache.stride(0),
++        table,
++        table.stride(0),
++        lengths,
++        partial,
++        0,
++        0,
++        0,
++        lse,
++        maximum,
++        denominator,
++        splits,
++        0,
++        0,
++        softmax_scale,
++        1,
++        3,
++        576,
++        512,
++        256,
++        causal,
++        16,
++        16,
++        num_warps=1,
++        num_stages=1,
++    )
++    _merge_splits[(b, 3)](
++        partial,
++        maximum,
++        denominator,
++        out,
++        lse,
++        lengths,
++        b,
++        3,
++        512,
++        splits,
++        triton.next_power_of_2(splits),
++        num_warps=4,
++        enable_fp_fusion=False,
++    )
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/expert_tail_gemv.py
+@@ -0,0 +1,61 @@
++"""Exact-bit G1 GEMV for the validated K3 TP32 M1/M2 tail batches."""
++
++import triton
++import triton.language as tl
++from flaggems_vllm.ops.kimi_k3_metax.decode_bits import decode_bits
++
++
++@triton.jit
++def _packed_gemv(
++    X,
++    W,
++    S,
++    Y,
++    IDS,
++    R: tl.constexpr,
++    N: tl.constexpr,
++    K: tl.constexpr,
++    INPUT_TOPK: tl.constexpr,
++    RP: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++):
++    routes = tl.program_id(0) * RP + tl.arange(0, RP)
++    cols = tl.program_id(1) * BN + tl.arange(0, BN)
++    kk = tl.arange(0, BK)
++    expert = tl.load(IDS + routes, routes < R, 0).to(tl.int64)
++    acc = tl.zeros((RP, BN), tl.float32)
++    for block in range(tl.cdiv(K, BK)):
++        k = block * BK + kk
++        a = tl.load(
++            X + (routes[:, None] // INPUT_TOPK) * K + k[None, :],
++            (routes[:, None] < R) & (k[None, :] < K),
++            0,
++        ).to(tl.float32)
++        mask = (
++            (routes[:, None, None] < R)
++            & (cols[None, :, None] < N)
++            & (k[None, None, :] < K)
++        )
++        packed = tl.load(
++            W
++            + (expert[:, None, None] * N + cols[None, :, None]) * (K // 2)
++            + k[None, None, :] // 2,
++            mask,
++            0,
++        ).to(tl.int32)
++        scale = tl.load(
++            S
++            + (expert[:, None, None] * N + cols[None, :, None]) * (K // 32)
++            + k[None, None, :] // 32,
++            mask,
++            127,
++        ).to(tl.int32)
++        code = (packed >> ((k[None, None, :] & 1) * 4)) & 15
++        w = decode_bits(code, scale).to(tl.float32)
++        acc += tl.sum(a[:, None, :] * w, 2)
++    tl.store(
++        Y + routes[:, None] * N + cols[None, :],
++        acc.to(tl.bfloat16),
++        (routes[:, None] < R) & (cols[None, :] < N),
++    )
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/mla_staged_packing.py
+@@ -0,0 +1,613 @@
++"""Independent selected MLA: bounded streamed QK states and folded PV replay."""
++
++import torch, triton
++import triton.language as tl
++from flaggems_vllm.ops.kimi_k3_metax.mla_decode_short import _short_dense_kernel
++from flaggems_vllm.ops.kimi_k3_metax.mla_decode import _merge_splits
++
++
++@triton.jit
++def _qk_stream_kernel(
++    Q_ptr,
++    stride_q_b,
++    stride_q_sq,
++    stride_q_h,
++    KV_cache,
++    stride_kv_bs,
++    stride_kv_block,
++    Block_table,
++    stride_bt_b,
++    Seq_lens,
++    Out,
++    stride_o_b,
++    stride_o_sq,
++    stride_o_h,
++    LSE,
++    PartialMax,
++    PartialSum,
++    ProbabilityLow,
++    Alpha,
++    MAX_CHUNKS: tl.constexpr,
++    SPLITS: tl.constexpr,
++    stride_lse_b,
++    stride_lse_h,
++    sm_scale,
++    SQ,
++    HQ: tl.constexpr,
++    DQK: tl.constexpr,
++    HEAD_DIM_V: tl.constexpr,
++    PAGE_SIZE: tl.constexpr,
++    HAVE_CAUSAL: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    K_TILE: tl.constexpr,
++    CAP: tl.constexpr,
++):
++    """
++    Dense decode kernel with paged attention and online softmax.
++    Grid: (ceil(HQ / BLOCK_H), batch_size * seq_q)
++    """
++    split = tl.program_id(2)
++    pid_h_block = tl.program_id(0)
++    pid_b_sq = tl.program_id(1)
++    i_b = pid_b_sq // SQ
++    i_sq = pid_b_sq % SQ
++    guard_length = tl.load(Seq_lens + i_b)
++    if (guard_length <= 256) | (guard_length > CAP):
++        return
++
++    cur_head = pid_h_block * BLOCK_H + tl.arange(0, BLOCK_H)
++    mask_head = cur_head < HQ
++
++    offs_d_pe = tl.arange(HEAD_DIM_V, DQK)
++    offs_q_pe = (
++        i_b * stride_q_b
++        + i_sq * stride_q_sq
++        + cur_head[:, None] * stride_q_h
++        + offs_d_pe[None, :]
++    )
++    q_pe = tl.load(Q_ptr + offs_q_pe, mask=mask_head[:, None], other=0.0)
++
++    # Online softmax accumulators
++    e_max = tl.full([BLOCK_H], value=float("-inf"), dtype=tl.float32)
++    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
++
++    cur_batch_seq_len = guard_length
++    Block_table += i_b * stride_bt_b
++
++    blocks_per_split = tl.cdiv(tl.cdiv(cur_batch_seq_len, BLOCK_N), SPLITS)
++    first = split * blocks_per_split * BLOCK_N
++    end = tl.minimum((split + 1) * blocks_per_split * BLOCK_N, cur_batch_seq_len)
++    count = tl.maximum(end - first, 0)
++    offs_n = first + tl.arange(0, BLOCK_N)
++    loop_time = count // BLOCK_N
++    remainder = count % BLOCK_N
++
++    for i in range(0, loop_time):
++        kv_page_number = tl.load(Block_table + offs_n // PAGE_SIZE)
++        kv_offset = (
++            kv_page_number.to(tl.int64) * stride_kv_block
++            + (offs_n % PAGE_SIZE).to(tl.int64) * stride_kv_bs
++        )
++
++        qk = tl.zeros((BLOCK_H, BLOCK_N), tl.float32)
++        for kd in range(0, HEAD_DIM_V, K_TILE):
++            col = kd + tl.arange(0, K_TILE)
++            qa = tl.load(
++                Q_ptr
++                + i_b * stride_q_b
++                + i_sq * stride_q_sq
++                + cur_head[:, None] * stride_q_h
++                + col[None, :],
++                mask_head[:, None] & (col[None, :] < HEAD_DIM_V),
++                0,
++            )
++            kb = tl.load(
++                KV_cache + kv_offset[None, :] + col[:, None],
++                (col[:, None] < HEAD_DIM_V) & tl.full((1, BLOCK_N), True, tl.int1),
++                0,
++            )
++            qk = tl.dot(qa, kb, qk)
++
++        # Add RoPE contribution
++        offs_k_pe = kv_offset[None, :] + offs_d_pe[:, None]
++        k_pe = tl.load(KV_cache + offs_k_pe)
++        qk += tl.dot(q_pe, k_pe)
++        qk *= sm_scale
++
++        # Online softmax update
++        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
++        re_scale = tl.exp(e_max - n_e_max)
++        p = tl.exp(qk - n_e_max[:, None])
++        probability_hi = p.to(tl.bfloat16)
++        probability_lo = (p - probability_hi.to(tl.float32)).to(tl.bfloat16)
++        chunk_slot = (((i_b * SPLITS + split) * HQ + cur_head) * MAX_CHUNKS + i).to(
++            tl.int64
++        )
++        column = tl.arange(0, BLOCK_N)
++        tl.store(
++            Out + chunk_slot[:, None] * BLOCK_N + column[None, :],
++            probability_hi,
++            mask_head[:, None],
++        )
++        tl.store(
++            ProbabilityLow + chunk_slot[:, None] * BLOCK_N + column[None, :],
++            probability_lo,
++            mask_head[:, None],
++        )
++        tl.store(Alpha + chunk_slot, re_scale, mask_head)
++        e_sum = e_sum * re_scale + tl.sum(p, 1)
++        e_max = n_e_max
++        offs_n += BLOCK_N
++
++    if remainder:
++        mask_kvsplit = offs_n < cur_batch_seq_len
++        kv_page_number = tl.load(
++            Block_table + offs_n // PAGE_SIZE, mask=mask_kvsplit, other=0
++        )
++        kv_offset = (
++            kv_page_number.to(tl.int64) * stride_kv_block
++            + (offs_n % PAGE_SIZE).to(tl.int64) * stride_kv_bs
++        )
++
++        qk = tl.zeros((BLOCK_H, BLOCK_N), tl.float32)
++        for kd in range(0, HEAD_DIM_V, K_TILE):
++            col = kd + tl.arange(0, K_TILE)
++            qa = tl.load(
++                Q_ptr
++                + i_b * stride_q_b
++                + i_sq * stride_q_sq
++                + cur_head[:, None] * stride_q_h
++                + col[None, :],
++                mask_head[:, None] & (col[None, :] < HEAD_DIM_V),
++                0,
++            )
++            kb = tl.load(
++                KV_cache + kv_offset[None, :] + col[:, None],
++                (col[:, None] < HEAD_DIM_V) & mask_kvsplit[None, :],
++                0,
++            )
++            qk = tl.dot(qa, kb, qk)
++
++        offs_k_pe = kv_offset[None, :] + offs_d_pe[:, None]
++        k_pe = tl.load(KV_cache + offs_k_pe, mask=mask_kvsplit[None, :], other=0.0)
++        qk += tl.dot(q_pe, k_pe)
++        qk *= sm_scale
++
++        qk = tl.where(mask_kvsplit[None, :], qk, float("-inf"))
++
++        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
++        re_scale = tl.exp(e_max - n_e_max)
++        p = tl.exp(qk - n_e_max[:, None])
++        probability_hi = p.to(tl.bfloat16)
++        probability_lo = (p - probability_hi.to(tl.float32)).to(tl.bfloat16)
++        chunk_slot = (
++            ((i_b * SPLITS + split) * HQ + cur_head) * MAX_CHUNKS + loop_time
++        ).to(tl.int64)
++        column = tl.arange(0, BLOCK_N)
++        tl.store(
++            Out + chunk_slot[:, None] * BLOCK_N + column[None, :],
++            probability_hi,
++            mask_head[:, None],
++        )
++        tl.store(
++            ProbabilityLow + chunk_slot[:, None] * BLOCK_N + column[None, :],
++            probability_lo,
++            mask_head[:, None],
++        )
++        tl.store(Alpha + chunk_slot, re_scale, mask_head)
++        e_sum = e_sum * re_scale + tl.sum(p, 1)
++        e_max = n_e_max
++
++    # Keep unnormalized accumulators/statistics in FP32 for the merge.
++    slot = ((i_b * SQ + i_sq) * SPLITS + split) * HQ + cur_head
++    tl.store(PartialMax + slot, e_max, mask_head)
++    tl.store(PartialSum + slot, e_sum, mask_head)
++
++
++@triton.jit
++def _long_fallback_kernel(
++    Q_ptr,
++    stride_q_b,
++    stride_q_sq,
++    stride_q_h,
++    KV_cache,
++    stride_kv_bs,
++    stride_kv_block,
++    Block_table,
++    stride_bt_b,
++    Seq_lens,
++    Out,
++    stride_o_b,
++    stride_o_sq,
++    stride_o_h,
++    LSE,
++    PartialMax,
++    PartialSum,
++    SPLITS: tl.constexpr,
++    stride_lse_b,
++    stride_lse_h,
++    sm_scale,
++    SQ,
++    HQ: tl.constexpr,
++    DQK: tl.constexpr,
++    HEAD_DIM_V: tl.constexpr,
++    PAGE_SIZE: tl.constexpr,
++    HAVE_CAUSAL: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    CAP: tl.constexpr,
++):
++    """
++    Dense decode kernel with paged attention and online softmax.
++    Grid: (ceil(HQ / BLOCK_H), batch_size * seq_q)
++    """
++    split = tl.program_id(2)
++    pid_h_block = tl.program_id(0)
++    pid_b_sq = tl.program_id(1)
++    i_b = pid_b_sq // SQ
++    i_sq = pid_b_sq % SQ
++    guard_length = tl.load(Seq_lens + i_b)
++    if guard_length <= CAP:
++        return
++
++    cur_head = pid_h_block * BLOCK_H + tl.arange(0, BLOCK_H)
++    mask_head = cur_head < HQ
++
++    # Load Q: NoPE part [BLOCK_H, HEAD_DIM_V] and RoPE part [BLOCK_H, DQK-HEAD_DIM_V]
++    offs_d_nope = tl.arange(0, HEAD_DIM_V)
++    offs_q_nope = (
++        i_b * stride_q_b
++        + i_sq * stride_q_sq
++        + cur_head[:, None] * stride_q_h
++        + offs_d_nope[None, :]
++    )
++    q_nope = tl.load(Q_ptr + offs_q_nope, mask=mask_head[:, None], other=0.0)
++
++    offs_d_pe = tl.arange(HEAD_DIM_V, DQK)
++    offs_q_pe = (
++        i_b * stride_q_b
++        + i_sq * stride_q_sq
++        + cur_head[:, None] * stride_q_h
++        + offs_d_pe[None, :]
++    )
++    q_pe = tl.load(Q_ptr + offs_q_pe, mask=mask_head[:, None], other=0.0)
++
++    # Online softmax accumulators
++    e_max = tl.full([BLOCK_H], value=float("-inf"), dtype=tl.float32)
++    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
++    acc = tl.zeros([BLOCK_H, HEAD_DIM_V], dtype=tl.float32)
++
++    cur_batch_seq_len = guard_length
++    Block_table += i_b * stride_bt_b
++
++    blocks_per_split = tl.cdiv(tl.cdiv(cur_batch_seq_len, BLOCK_N), SPLITS)
++    first = split * blocks_per_split * BLOCK_N
++    end = tl.minimum((split + 1) * blocks_per_split * BLOCK_N, cur_batch_seq_len)
++    count = tl.maximum(end - first, 0)
++    offs_n = first + tl.arange(0, BLOCK_N)
++    loop_time = count // BLOCK_N
++    remainder = count % BLOCK_N
++
++    for i in range(0, loop_time):
++        kv_page_number = tl.load(Block_table + offs_n // PAGE_SIZE)
++        kv_offset = (
++            kv_page_number.to(tl.int64) * stride_kv_block
++            + (offs_n % PAGE_SIZE).to(tl.int64) * stride_kv_bs
++        )
++
++        # Load V (NoPE part)
++        offs_v_c = kv_offset[:, None] + offs_d_nope[None, :]
++        v_c = tl.load(KV_cache + offs_v_c)
++        k_c = tl.trans(v_c)
++
++        # QK = q_nope @ k_nope^T
++        qk = tl.dot(q_nope, k_c)
++
++        # Add RoPE contribution
++        offs_k_pe = kv_offset[None, :] + offs_d_pe[:, None]
++        k_pe = tl.load(KV_cache + offs_k_pe)
++        qk += tl.dot(q_pe, k_pe)
++        qk *= sm_scale
++
++        # Online softmax update
++        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
++        re_scale = tl.exp(e_max - n_e_max)
++        p = tl.exp(qk - n_e_max[:, None])
++        acc *= re_scale[:, None]
++        probability_hi = p.to(v_c.dtype)
++        probability_lo = (p - probability_hi.to(tl.float32)).to(v_c.dtype)
++        acc += tl.dot(probability_hi, v_c)
++        acc += tl.dot(probability_lo, v_c)
++        e_sum = e_sum * re_scale + tl.sum(p, 1)
++        e_max = n_e_max
++        offs_n += BLOCK_N
++
++    if remainder:
++        mask_kvsplit = offs_n < cur_batch_seq_len
++        kv_page_number = tl.load(
++            Block_table + offs_n // PAGE_SIZE, mask=mask_kvsplit, other=0
++        )
++        kv_offset = (
++            kv_page_number.to(tl.int64) * stride_kv_block
++            + (offs_n % PAGE_SIZE).to(tl.int64) * stride_kv_bs
++        )
++
++        offs_v_c = kv_offset[:, None] + offs_d_nope[None, :]
++        v_c = tl.load(KV_cache + offs_v_c, mask=mask_kvsplit[:, None], other=0.0)
++        k_c = tl.trans(v_c)
++
++        qk = tl.dot(q_nope, k_c)
++
++        offs_k_pe = kv_offset[None, :] + offs_d_pe[:, None]
++        k_pe = tl.load(KV_cache + offs_k_pe, mask=mask_kvsplit[None, :], other=0.0)
++        qk += tl.dot(q_pe, k_pe)
++        qk *= sm_scale
++
++        qk = tl.where(mask_kvsplit[None, :], qk, float("-inf"))
++
++        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
++        re_scale = tl.exp(e_max - n_e_max)
++        p = tl.exp(qk - n_e_max[:, None])
++        acc *= re_scale[:, None]
++        probability_hi = p.to(v_c.dtype)
++        probability_lo = (p - probability_hi.to(tl.float32)).to(v_c.dtype)
++        acc += tl.dot(probability_hi, v_c)
++        acc += tl.dot(probability_lo, v_c)
++        e_sum = e_sum * re_scale + tl.sum(p, 1)
++        e_max = n_e_max
++
++    # Keep unnormalized accumulators/statistics in FP32 for the merge.
++    slot = ((i_b * SQ + i_sq) * SPLITS + split) * HQ + cur_head
++    tl.store(
++        Out + slot[:, None] * HEAD_DIM_V + offs_d_nope[None, :], acc, mask_head[:, None]
++    )
++    tl.store(PartialMax + slot, e_max, mask_head)
++    tl.store(PartialSum + slot, e_sum, mask_head)
++
++
++@triton.jit
++def _pv_fold_kernel(
++    Cache,
++    stride_kv_token,
++    stride_kv_block,
++    Table,
++    stride_table,
++    Lengths,
++    PH,
++    PL,
++    A,
++    Partial,
++    H: tl.constexpr,
++    SPLITS: tl.constexpr,
++    MAX_CHUNKS: tl.constexpr,
++    BN: tl.constexpr,
++    FOLD: tl.constexpr,
++    CAP: tl.constexpr,
++):
++    b = tl.program_id(0)
++    split = tl.program_id(1)
++    length = tl.load(Lengths + b)
++    if (length <= 256) | (length > CAP):
++        return
++    row = tl.arange(0, 16)
++    head = row % (16 // FOLD)
++    part = row // (16 // FOLD)
++    valid = head < H
++    d = tl.arange(0, 512)
++    n = tl.arange(0, BN)
++    blocks = tl.cdiv(tl.cdiv(length, BN), SPLITS)
++    first = split * blocks * BN
++    end = tl.minimum((split + 1) * blocks * BN, length)
++    count = tl.maximum(end - first, 0)
++    chunks = tl.cdiv(count, BN)
++    acc = tl.zeros((16, 512 // FOLD), tl.float32)
++    for step in range(chunks):
++        pos = first + step * BN + n
++        mask = pos < length
++        page = tl.load(Table + b * stride_table + pos // 256, mask, 0).to(tl.int64)
++        offset = page * stride_kv_block + (pos % 256) * stride_kv_token
++        v = tl.load(Cache + offset[:, None] + d[None, :], mask[:, None], 0)
++        slot = (((b * SPLITS + split) * H + head) * MAX_CHUNKS + step).to(tl.int64)
++        phi = tl.load(PH + slot[:, None] * BN + n[None, :], valid[:, None], 0)
++        plo = tl.load(PL + slot[:, None] * BN + n[None, :], valid[:, None], 0)
++        alpha = tl.load(A + slot, valid, 0)
++        slice_id = tl.arange(0, FOLD)
++        smask = part[:, None, None] == slice_id[None, None, :]
++        hp = tl.reshape(
++            tl.where(smask, phi[:, :, None], 0).to(tl.bfloat16), (16, BN * FOLD)
++        )
++        lp = tl.reshape(
++            tl.where(smask, plo[:, :, None], 0).to(tl.bfloat16), (16, BN * FOLD)
++        )
++        vp = tl.reshape(v, (BN * FOLD, 512 // FOLD))
++        acc *= alpha[:, None]
++        acc += tl.dot(hp, vp)
++        acc += tl.dot(lp, vp)
++    slot = (b * SPLITS + split) * H + head
++    cols = part[:, None] * (512 // FOLD) + tl.arange(0, 512 // FOLD)[None, :]
++    tl.store(Partial + slot[:, None] * 512 + cols, acc, valid[:, None])
++
++
++def try_run(q, cache, table, lengths, out, lse, *, softmax_scale, causal):
++    """Write caller outputs for the measured H3/SQ1 layout; False leaves buffers untouched."""
++    if q.ndim != 4 or cache.ndim != 4 or table.ndim != 2 or lengths.ndim != 1:
++        return False
++    b, sq, h, d = q.shape
++    if not (1 <= b <= 64 and b != 2 and (sq, h, d) == (1, 3, 576)):
++        return False
++    if (
++        cache.shape[1:] != (256, 1, 576)
++        or table.shape[0] != b
++        or not 1 <= table.shape[1] <= 272
++    ):
++        return False
++    if lengths.shape != (b,) or out.shape != (b, 1, 3, 512) or lse.shape != (b, 3, 1):
++        return False
++    if (
++        q.dtype != torch.bfloat16
++        or cache.dtype != q.dtype
++        or out.dtype != q.dtype
++        or lse.dtype != torch.float32
++    ):
++        return False
++    if table.dtype != torch.int32 or lengths.dtype != torch.int32:
++        return False
++    if not q.is_cuda or any(
++        t.device != q.device for t in (cache, table, lengths, out, lse)
++    ):
++        return False
++    if q.stride(-1) != 1 or cache.stride(-1) != 1 or table.stride(-1) != 1:
++        return False
++    if (
++        not lengths.is_contiguous()
++        or not out.is_contiguous()
++        or not lse.is_contiguous()
++    ):
++        return False
++    if softmax_scale != 192**-0.5 or causal not in (False, True):
++        return False
++    splits = 16 if b >= 16 else 32
++    cap = min(4096, table.shape[1] * 256)
++    _short_dense_kernel[(1, b)](
++        q,
++        *q.stride()[:3],
++        cache,
++        cache.stride(1),
++        cache.stride(0),
++        table,
++        table.stride(0),
++        lengths,
++        out,
++        *out.stride()[:3],
++        lse,
++        lse.stride(0),
++        lse.stride(1),
++        softmax_scale,
++        1,
++        h,
++        576,
++        512,
++        256,
++        causal,
++        16,
++        16,
++        SHORT_LIMIT=256,
++        num_warps=4,
++        num_stages=1,
++    )
++    max_chunks = triton.cdiv(triton.cdiv(cap, 16), splits)
++    ph = torch.empty(
++        (b, splits, h, max_chunks, 16), dtype=torch.bfloat16, device=q.device
++    )
++    pl = torch.empty_like(ph)
++    alpha = torch.empty(
++        (b, splits, h, max_chunks), dtype=torch.float32, device=q.device
++    )
++    pm = torch.empty((b, splits, h), dtype=torch.float32, device=q.device)
++    ps = torch.empty_like(pm)
++    partial = torch.empty((b, splits, h, 512), dtype=torch.float32, device=q.device)
++    _qk_stream_kernel[(1, b, splits)](
++        q,
++        *q.stride()[:3],
++        cache,
++        cache.stride(1),
++        cache.stride(0),
++        table,
++        table.stride(0),
++        lengths,
++        ph,
++        0,
++        0,
++        0,
++        lse,
++        pm,
++        ps,
++        pl,
++        alpha,
++        max_chunks,
++        splits,
++        0,
++        0,
++        softmax_scale,
++        1,
++        h,
++        576,
++        512,
++        256,
++        causal,
++        16,
++        16,
++        64,
++        cap,
++        num_warps=2,
++        num_stages=1,
++    )
++    _pv_fold_kernel[(b, splits)](
++        cache,
++        cache.stride(1),
++        cache.stride(0),
++        table,
++        table.stride(0),
++        lengths,
++        ph,
++        pl,
++        alpha,
++        partial,
++        h,
++        splits,
++        max_chunks,
++        16,
++        4,
++        cap,
++        num_warps=2,
++        num_stages=1,
++    )
++    _long_fallback_kernel[(1, b, splits)](
++        q,
++        *q.stride()[:3],
++        cache,
++        cache.stride(1),
++        cache.stride(0),
++        table,
++        table.stride(0),
++        lengths,
++        partial,
++        0,
++        0,
++        0,
++        lse,
++        pm,
++        ps,
++        splits,
++        0,
++        0,
++        softmax_scale,
++        1,
++        h,
++        576,
++        512,
++        256,
++        causal,
++        16,
++        16,
++        cap,
++        num_warps=1,
++        num_stages=1,
++    )
++    _merge_splits[(b, h)](
++        partial,
++        pm,
++        ps,
++        out,
++        lse,
++        lengths,
++        b,
++        h,
++        512,
++        splits,
++        triton.next_power_of_2(splits),
++        num_warps=4,
++        enable_fp_fusion=False,
++    )
++    return True
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/marlin_mxfp4.py
+@@ -0,0 +1,398 @@
++# Copyright 2026 FlagOS Contributors
++# SPDX-License-Identifier: Apache-2.0
++"""Portable FGV/Marlin-style MXFP4 layout and K3 expert chain.
++
++Derived from FlagGems-vllm snapshot3e9e47c grouped scheduling/interleave.
++PTX is replaced by validated exact integer BF16 decode. No BF16 weight expansion.
++G1 uses a fixed128-K storage tile; large-M computation reads64-K halves.
++"""
++
++import torch
++import triton
++import triton.language as tl
++from flaggems_vllm.ops.kimi_k3_metax.decode_bits import decode_bits
++from flaggems_vllm.ops.kimi_k3_metax.grouped_moe import _alignment, _situ, _weighted_sum
++
++
++@triton.jit
++def _pack_words(
++    W,
++    O,
++    WORDS: tl.constexpr,
++    N: tl.constexpr,
++    K: tl.constexpr,
++    TK: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    valid = idx < WORDS
++    n = idx % N
++    q = idx // N
++    e = q // (K // 8)
++    pk = q % (K // 8)
++    kp = TK // 8
++    block = pk // kp
++    lane = pk % kp
++    word = tl.full((BLOCK,), 0, tl.uint32)
++    for j in tl.static_range(8):
++        k = block * TK + j * kp + lane
++        byte = tl.load(W + (e * N + n) * (K // 2) + k // 2, valid, 0).to(tl.uint32)
++        word = word | (byte >> k % 2 * 4 & 15) << (j // 2 + j % 2 * 4) * 4
++    tl.store(O + idx, word, valid)
++
++
++def pack_matrix(w, s, tile_k):
++    (e, n, kh) = w.shape
++    k = kh * 2
++    assert k % tile_k == 0 and tile_k in (32, 64, 128)
++    out = torch.empty((e, k // 8, n), device=w.device, dtype=torch.int32)
++    _pack_words[triton.cdiv(out.numel(), 256),](
++        w, out, out.numel(), n, k, tile_k, 256, num_warps=4
++    )
++    return (out, s.transpose(1, 2).contiguous())
++
++
++@triton.jit
++def _decode_words(b, s0, s1, s2, s3, BK: tl.constexpr):
++    if BK == 32:
++        a0 = s0
++        a1 = s0
++        a2 = s0
++        a3 = s0
++        a4 = s0
++        a5 = s0
++        a6 = s0
++        a7 = s0
++    elif BK == 64:
++        a0 = s0
++        a1 = s0
++        a2 = s0
++        a3 = s0
++        a4 = s1
++        a5 = s1
++        a6 = s1
++        a7 = s1
++    else:
++        a0 = s0
++        a1 = s0
++        a2 = s1
++        a3 = s1
++        a4 = s2
++        a5 = s2
++        a6 = s3
++        a7 = s3
++    return (
++        decode_bits(b >> 0 & 15, a0),
++        decode_bits(b >> 16 & 15, a1),
++        decode_bits(b >> 4 & 15, a2),
++        decode_bits(b >> 20 & 15, a3),
++        decode_bits(b >> 8 & 15, a4),
++        decode_bits(b >> 24 & 15, a5),
++        decode_bits(b >> 12 & 15, a6),
++        decode_bits(b >> 28 & 15, a7),
++    )
++
++
++@triton.jit
++def _concat_k(bs, BN: tl.constexpr, BK: tl.constexpr):
++    j0 = tl.join(bs[0], bs[1])
++    j1 = tl.join(bs[2], bs[3])
++    j2 = tl.join(bs[4], bs[5])
++    j3 = tl.join(bs[6], bs[7])
++    p0 = tl.join(j0, j1)
++    p1 = tl.join(j2, j3)
++    q = tl.join(p0, p1)
++    return tl.reshape(tl.trans(q, 4, 3, 2, 0, 1), (BK, BN))
++
++
++@triton.jit
++def _marlin_portable_mxfp4(
++    X,
++    W,
++    S,
++    Y,
++    Sorted,
++    Experts,
++    Total,
++    N: tl.constexpr,
++    K: tl.constexpr,
++    EM: tl.constexpr,
++    R: tl.constexpr,
++    IT: tl.constexpr,
++    BM: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++    GM: tl.constexpr,
++    PACK_K: tl.constexpr = 0,
++):
++    PK: tl.constexpr = BK if PACK_K == 0 else PACK_K
++    tl.static_assert(PK == BK or (PK == 128 and BK == 64))
++    pid = tl.program_id(0)
++    nm = tl.cdiv(EM, BM)
++    nn = tl.cdiv(N, BN)
++    ng = GM * nn
++    group = pid // ng
++    first = group * GM
++    size = tl.minimum(nm - first, GM)
++    rm = first + pid % ng % size
++    cn = pid % ng // size
++    if rm * BM >= tl.load(Total):
++        return
++    routes = tl.load(Sorted + rm * BM + tl.arange(0, BM)).to(tl.int64)
++    valid = routes < R
++    expert = tl.load(Experts + rm).to(tl.int64)
++    if (expert < 0) | (expert >= 896):
++        return
++    cols = (cn * BN + tl.arange(0, BN).to(tl.int64)) % N
++    kp = tl.arange(0, PK // 8)
++    kk = tl.arange(0, BK)
++    bp = W + (expert * (K // 8) + kp[:, None]) * N + cols[None, :]
++    sp = S + expert * (K // 32) * N + cols
++    acc = tl.zeros((BM, BN), tl.float32)
++    for block in range(K // BK):
++        packed = tl.load(bp).to(tl.uint32)
++        sg = block * (BK // 32)
++        s0 = tl.load(sp + sg * N).to(tl.int32)
++        s1 = tl.load(sp + (sg + 1) * N, BK >= 64, 127).to(tl.int32)
++        s2 = tl.load(sp + (sg + 2) * N, BK >= 128, 127).to(tl.int32)
++        s3 = tl.load(sp + (sg + 3) * N, BK >= 128, 127).to(tl.int32)
++        if PK == BK:
++            parts = _decode_words(
++                packed, s0[None, :], s1[None, :], s2[None, :], s3[None, :], BK
++            )
++            b = _concat_k(parts, BN, BK)
++        else:
++            parts = _decode_half_words(packed, s0[None, :], s1[None, :], block % 2)
++            b = _concat_half(parts, BN)
++        a = tl.load(
++            X + routes[:, None] // IT * K + block * BK + kk[None, :], valid[:, None], 0
++        )
++        acc = tl.dot(a, b, acc)
++        if PK == BK:
++            bp += BK // 8 * N
++        else:
++            bp += tl.where(block % 2 == 1, PK // 8 * N, 0)
++    outcols = cn * BN + tl.arange(0, BN)
++    tl.store(
++        Y + routes[:, None] * N + outcols[None, :],
++        acc.to(tl.bfloat16),
++        valid[:, None] & (outcols[None, :] < N),
++    )
++
++
++@triton.jit
++def _marlin_tail_gemv(
++    X,
++    W,
++    S,
++    Y,
++    IDS,
++    R: tl.constexpr,
++    N: tl.constexpr,
++    K: tl.constexpr,
++    TK: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++):
++    route = tl.program_id(0)
++    cols = tl.program_id(1) * BN + tl.arange(0, BN)
++    kk = tl.arange(0, BK)
++    expert = tl.load(IDS + route).to(tl.int64)
++    kp = TK // 8
++    acc = tl.zeros((BN,), tl.float32)
++    for block in range(tl.cdiv(K, BK)):
++        k = block * BK + kk
++        valid = k < K
++        pk = k // TK * kp + k % kp
++        j = k % TK // kp
++        shift = (j // 2 + j % 2 * 4) * 4
++        x = tl.load(X + route // 16 * K + k, valid, 0).to(tl.float32)
++        word = tl.load(
++            W + (expert * (K // 8) + pk[None, :]) * N + cols[:, None],
++            (cols[:, None] < N) & valid[None, :],
++            0,
++        ).to(tl.uint32)
++        scale = tl.load(
++            S + (expert * (K // 32) + k[None, :] // 32) * N + cols[:, None],
++            (cols[:, None] < N) & valid[None, :],
++            127,
++        ).to(tl.int32)
++        weight = decode_bits(word >> shift[None, :] & 15, scale).to(tl.float32)
++        acc += tl.sum(weight * x[None, :], 1)
++    tl.store(Y + route * N + cols, acc.to(tl.bfloat16), cols < N)
++
++
++@triton.jit
++def _decode_half_words(b, s0, s1, half):
++    b = b >> half * 8
++    return (
++        decode_bits(b >> 0 & 15, s0),
++        decode_bits(b >> 16 & 15, s0),
++        decode_bits(b >> 4 & 15, s1),
++        decode_bits(b >> 20 & 15, s1),
++    )
++
++
++@triton.jit
++def _concat_half(bs, BN: tl.constexpr):
++    a = tl.join(bs[0], bs[1])
++    b = tl.join(bs[2], bs[3])
++    q = tl.join(a, b)
++    return tl.reshape(tl.trans(q, 3, 2, 0, 1), (64, BN))
++
++
++def repack_experts(w13, s13, w2, s2):
++    """Startup-only lossless byte rearrangement; replacement tensors have equal bytes."""
++    tensors = (w13, s13, w2, s2)
++    shapes = ((896, 192, 1792), (896, 192, 112), (896, 3584, 48), (896, 3584, 3))
++    if any((tuple(t.shape) != shape for (t, shape) in zip(tensors, shapes))):
++        raise ValueError("The packed expert backend requires the verified TP32 shapes")
++    if any(
++        (
++            t.dtype != torch.uint8 or not t.is_contiguous() or t.device != w13.device
++            for t in tensors
++        )
++    ):
++        raise ValueError(
++            "Expected contiguous checkpoint-native U8 weights/scales on one GPU"
++        )
++    (a, sa) = pack_matrix(w13, s13, 128)
++    (b, sb) = pack_matrix(w2, s2, 32)
++    result = (a, sa, b, sb)
++    assert sum((t.numel() * t.element_size() for t in tensors)) == sum(
++        (t.numel() * t.element_size() for t in result)
++    )
++    return result
++
++
++def configs_for_tokens(tokens):
++    """Fixed tested bins; no data-dependent autotuning or host reads of GPU routes."""
++    block_m = 16 if tokens < 256 else 32 if tokens < 2048 else 64
++    block_k1 = 128 if tokens < 2048 else 64
++    warps1 = 8 if tokens == 4096 else 4
++    return (block_m, block_k1, warps1)
++
++
++def grouped_experts_packed(
++    x, w13, s13, w2, s2, weights, ids, *, beta=4.0, linear_beta=25.0
++):
++    """Original BF16 materialization/FP32 SiTU+route order with one packed weight format."""
++    if x.ndim != 2 or x.shape[1] != 3584 or x.dtype != torch.bfloat16:
++        raise ValueError("Expected BF16 [tokens,3584] K3 expert inputs")
++    m = x.shape[0]
++    if (
++        ids.shape != (m, 16)
++        or weights.shape != ids.shape
++        or weights.dtype != torch.float32
++        or (ids.dtype not in (torch.int32, torch.int64))
++    ):
++        raise ValueError("Expected top16 integer routes and FP32 weights")
++    shapes = ((896, 448, 192), (896, 112, 192), (896, 12, 3584), (896, 3, 3584))
++    if any((tuple(t.shape) != shape for (t, shape) in zip((w13, s13, w2, s2), shapes))):
++        raise ValueError("Invalid packed expert tensor shapes")
++    if (
++        w13.dtype != torch.int32
++        or w2.dtype != torch.int32
++        or s13.dtype != torch.uint8
++        or (s2.dtype != torch.uint8)
++    ):
++        raise TypeError(
++            "Expected U32 bit payload in int32 tensors and raw E8M0 U8 scales"
++        )
++    if not x.is_cuda or not all(
++        (
++            t.is_contiguous() and t.device == x.device
++            for t in (x, w13, s13, w2, s2, weights, ids)
++        )
++    ):
++        raise ValueError("Packed expert tensors must be contiguous on one GPU")
++    if beta != 4.0 or linear_beta != 25.0:
++        raise ValueError("Only K3 SiTU beta4/up25 is validated for this backend")
++    if m == 0:
++        return torch.empty_like(x)
++    r = m * 16
++    (bm, bk1, warps1) = configs_for_tokens(m)
++    (sorted_ids, expert_ids, padded) = _alignment(ids, bm, 896)
++    row_blocks = min(
++        triton.cdiv(sorted_ids.numel(), bm), min(896, r) + (r - min(896, r)) // bm
++    )
++    scratch = torch.empty(r * 3584, dtype=torch.bfloat16, device=x.device)
++    gate_up = scratch[: r * 192].view(r, 192)
++    down = scratch.view(r, 3584)
++    activated = torch.empty((r, 96), dtype=torch.bfloat16, device=x.device)
++    output = torch.empty_like(x)
++    if m <= 2:
++        _marlin_tail_gemv[r, 48](
++            x,
++            w13,
++            s13,
++            gate_up,
++            ids,
++            r,
++            192,
++            3584,
++            128,
++            4,
++            512,
++            num_warps=4,
++            num_stages=1,
++            enable_fp_fusion=False,
++        )
++    else:
++        _marlin_portable_mxfp4[row_blocks * 3,](
++            x,
++            w13,
++            s13,
++            gate_up,
++            sorted_ids,
++            expert_ids,
++            padded,
++            192,
++            3584,
++            row_blocks * bm,
++            r,
++            16,
++            bm,
++            64,
++            bk1,
++            1,
++            PACK_K=128,
++            num_warps=warps1,
++            num_stages=2,
++        )
++    _situ[triton.cdiv(r * 96, 256),](
++        gate_up,
++        activated,
++        r * 96,
++        96,
++        beta,
++        linear_beta,
++        256,
++        num_warps=4,
++        enable_fp_fusion=False,
++    )
++    _marlin_portable_mxfp4[row_blocks * 56,](
++        activated,
++        w2,
++        s2,
++        down,
++        sorted_ids,
++        expert_ids,
++        padded,
++        3584,
++        96,
++        row_blocks * bm,
++        r,
++        1,
++        bm,
++        64,
++        32,
++        1,
++        PACK_K=32,
++        num_warps=4,
++        num_stages=2,
++    )
++    _weighted_sum[m, 14](
++        down, weights, output, 3584, 16, 16, 256, num_warps=4, enable_fp_fusion=False
++    )
++    return output
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/decode_experts.py
+@@ -0,0 +1,382 @@
++"""K3 TP32 decode experts with startup-checked exact normal-scale decoding.
++Uses exact arithmetic FP4 decoding with a startup-checked normal-scale specialization,
++and DeepGEMM-inspired GPU-count-driven SM-strided G2 work scheduling.
++Baseline MXFP4/E8M0 storage, BF16 boundaries and FP32 SiTU/route remain unchanged.
++"""
++
++from flaggems_vllm.ops.kimi_k3_metax.prefill_experts import grouped_experts_prefill
++
++from flaggems_vllm.ops.kimi_k3_metax.expert_gemm import (
++    _decode_math,
++    _decode_normal_pair,
++    _decode_words_math,
++    _decode_half_words_math,
++    _paired_arithmetic_mm,
++    meta,
++)
++
++# SPDX-License-Identifier: Apache-2.0
++import torch
++import triton
++import triton.language as tl
++from flaggems_vllm.ops.kimi_k3_metax.decode_bits import decode_bits
++from flaggems_vllm.ops.kimi_k3_metax.marlin_mxfp4 import (
++    grouped_experts_packed,
++    _decode_words,
++    _concat_k,
++    _decode_half_words,
++    _concat_half,
++    _marlin_tail_gemv,
++)
++from flaggems_vllm.ops.kimi_k3_metax.grouped_moe import _situ, _weighted_sum
++from flaggems_vllm.ops.kimi_k3_metax.small_alignment import align_small as _alignment
++
++
++@triton.jit
++def _paired_scheduled_mm(
++    X,
++    W,
++    S,
++    Y,
++    Sorted,
++    Experts,
++    Total,
++    N: tl.constexpr,
++    K: tl.constexpr,
++    R: tl.constexpr,
++    IT: tl.constexpr,
++    BM: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++    GM: tl.constexpr,
++    PROGRAMS: tl.constexpr,
++    EXPANDED: tl.constexpr = False,
++    MAX_BLOCKS: tl.constexpr = 0,
++    DECODE_MODE: tl.constexpr = 0,
++):
++    # Actual task count remains a GPU scalar. Captured launch shape is static.
++    nm = tl.cdiv(tl.load(Total), BM)
++    if MAX_BLOCKS > 0:
++        if nm > MAX_BLOCKS:
++            return
++    nn = tl.cdiv(N, BN)
++    for task in range(tl.program_id(0), nm * nn, PROGRAMS):
++        group = task // (GM * nn)
++        first = group * GM
++        size = tl.minimum(nm - first, GM)
++        rm = first + (task % (GM * nn)) % size
++        cn = (task % (GM * nn)) // size
++        rr = rm * BM + tl.arange(0, BM)
++        route = tl.load(Sorted + rr).to(tl.int64)
++        valid = route < R
++        expert = tl.load(Experts + rm).to(tl.int64)
++        if (expert >= 0) & (expert < 896):
++            col = (cn * BN + tl.arange(0, BN).to(tl.int64)) % N
++            kp = tl.arange(0, BK // 8)
++            kk = tl.arange(0, BK)
++            bp = W + (expert * (K // 8) + kp[:, None]) * N + col[None, :]
++            sp = S + expert * (K // 32) * N + col
++            acc = tl.zeros((BM, BN), tl.float32)
++            for block in range(K // BK):
++                packed = tl.load(bp).to(tl.uint32)
++                sg = block * (BK // 32)
++                s0 = tl.load(sp + sg * N).to(tl.int32)
++                s1 = tl.load(sp + (sg + 1) * N, BK >= 64, 127).to(tl.int32)
++                s2 = tl.load(sp + (sg + 2) * N, BK >= 128, 127).to(tl.int32)
++                s3 = tl.load(sp + (sg + 3) * N, BK >= 128, 127).to(tl.int32)
++                if DECODE_MODE > 0:
++                    parts = _decode_words_math(
++                        packed,
++                        s0[None, :],
++                        s1[None, :],
++                        s2[None, :],
++                        s3[None, :],
++                        BK,
++                        DECODE_MODE == 2,
++                    )
++                else:
++                    parts = _decode_words(
++                        packed, s0[None, :], s1[None, :], s2[None, :], s3[None, :], BK
++                    )
++                b = _concat_k(parts, BN, BK)
++                rows = rr if EXPANDED else route // IT
++                a = tl.load(
++                    X + rows[:, None] * K + block * BK + kk[None, :], valid[:, None], 0
++                )
++                acc = tl.dot(a, b, acc)
++                bp += BK // 8 * N
++            cols = cn * BN + tl.arange(0, BN)
++            tl.store(
++                Y + route[:, None] * N + cols[None, :],
++                acc.to(tl.bfloat16),
++                valid[:, None] & (cols[None, :] < N),
++            )
++
++
++@triton.jit
++def _route_gemv_g2(
++    X,
++    W,
++    S,
++    Y,
++    Ids,
++    R: tl.constexpr,
++    N: tl.constexpr,
++    BN: tl.constexpr,
++    PROGRAMS: tl.constexpr,
++    NORMAL: tl.constexpr,
++    K: tl.constexpr = 96,
++):
++    nn = tl.cdiv(N, BN)
++    kp = tl.arange(0, 4)
++    kk = tl.arange(0, 32)
++    for task in range(tl.program_id(0), R * nn, PROGRAMS):
++        route = task // nn
++        cols = task % nn * BN + tl.arange(0, BN)
++        expert = tl.load(Ids + route).to(tl.int64)
++        acc = tl.zeros((BN,), tl.float32)
++        for block in range(K // 32):
++            word = tl.load(
++                W + (expert * (K // 8) + block * 4 + kp[:, None]) * N + cols[None, :],
++                cols[None, :] < N,
++                0,
++            ).to(tl.uint32)
++            scale = tl.load(
++                S + (expert * (K // 32) + block) * N + cols, cols < N, 127
++            ).to(tl.int32)
++            parts = _decode_words_math(
++                word,
++                scale[None, :],
++                scale[None, :],
++                scale[None, :],
++                scale[None, :],
++                32,
++                NORMAL,
++            )
++            b = _concat_k(parts, BN, 32).to(tl.float32)
++            x = tl.load(X + route * K + block * 32 + kk).to(tl.float32)
++            acc += tl.sum(x[:, None] * b, 0)
++        tl.store(Y + route * N + cols, acc.to(tl.bfloat16), cols < N)
++
++
++@triton.jit
++def _adaptive_g2(
++    X,
++    W,
++    S,
++    Y,
++    Ids,
++    Sorted,
++    Experts,
++    Total,
++    R: tl.constexpr,
++    PROGRAMS: tl.constexpr,
++    NORMAL: tl.constexpr,
++):
++    blocks = tl.load(Total) // 16
++    if blocks * 4 >= R * 3:
++        _route_gemv_g2(X, W, S, Y, Ids, R, 3584, 128, PROGRAMS, NORMAL)
++    else:
++        _paired_scheduled_mm(
++            X,
++            W,
++            S,
++            Y,
++            Sorted,
++            Experts,
++            Total,
++            3584,
++            96,
++            R,
++            1,
++            16,
++            64,
++            32,
++            1,
++            PROGRAMS,
++            False,
++            0,
++            2 if NORMAL else 1,
++        )
++
++
++def prepare_decode_experts(packed):
++    """Run once after immutable weights are prepared, outside timed execution/Graph."""
++    if torch.cuda.is_current_stream_capturing():
++        raise RuntimeError("prepare must run before Graph capture")
++    w13, s13, w2, s2 = packed
++    expected = ((896, 448, 192), (896, 112, 192), (896, 12, 3584), (896, 3, 3584))
++    if any(tuple(t.shape) != shape for t, shape in zip(packed, expected)):
++        raise ValueError("Only current TP32 packed shapes are supported")
++    if (
++        w13.dtype != torch.int32
++        or w2.dtype != torch.int32
++        or s13.dtype != torch.uint8
++        or s2.dtype != torch.uint8
++    ):
++        raise TypeError("Expected packed int32 payload and raw E8M0 U8 scales")
++    ranges = []
++    for scale in (s13, s2):
++        lo = int(scale.min().item())
++        hi = int(scale.max().item())
++        if hi == 255:
++            raise ValueError("Non-finite E8M0 scale")
++        ranges.append((lo, hi))
++    return {
++        "normal_flags": tuple(lo >= 2 and hi <= 252 for lo, hi in ranges),
++        "scale_ranges": ranges,
++        "sms": torch.cuda.get_device_properties(w13.device).multi_processor_count,
++        "pointers": tuple(t.data_ptr() for t in packed),
++        "weight_contract": "immutable packed weights; rerun prepare after any weight changes",
++    }
++
++
++def grouped_experts_decode(x, packed, weights, ids, prepared, record=None):
++    m = x.shape[0]
++    if m == 0 or m > 4096:
++        return grouped_experts_packed(x, *packed, weights, ids)
++    if (
++        x.shape != (m, 3584)
++        or x.dtype != torch.bfloat16
++        or ids.shape != (m, 16)
++        or weights.shape != (m, 16)
++        or weights.dtype != torch.float32
++    ):
++        raise ValueError("Expected BF16 H3584 inputs and FP32 top16 routing")
++    if ids.dtype not in (torch.int32, torch.int64) or not all(
++        t.is_contiguous() and t.device == x.device for t in (x, weights, ids, *packed)
++    ):
++        raise ValueError("Expected contiguous tensors on the same GPU")
++    if tuple(t.data_ptr() for t in packed) != prepared["pointers"]:
++        raise ValueError("Prepared state does not belong to these weights")
++    if m > 64:
++        return grouped_experts_prefill(x, packed, weights, ids, prepared, record)
++    w13, s13, w2, s2 = packed
++    r = m * 16
++    bm = 16
++    fast_g2 = prepared["normal_flags"][1]
++    if m > 2 or not fast_g2:
++        si, ei, total = _alignment(ids, bm, 896)
++        cap = min(triton.cdiv(si.numel(), bm), min(896, r) + (r - min(896, r)) // bm)
++    scratch = torch.empty(r * 3584, dtype=torch.bfloat16, device=x.device)
++    gu = scratch[: r * 192].view(r, 192)
++    down = scratch.view(r, 3584)
++    act = torch.empty((r, 96), dtype=torch.bfloat16, device=x.device)
++    out = torch.empty_like(x)
++    mode1 = 2 if prepared["normal_flags"][0] else 1
++    mode2 = 2 if prepared["normal_flags"][1] else 1
++    if m <= 2:
++        first = _marlin_tail_gemv[(r, 48)](
++            x,
++            w13,
++            s13,
++            gu,
++            ids,
++            r,
++            192,
++            3584,
++            128,
++            4,
++            512,
++            num_warps=4,
++            num_stages=1,
++            enable_fp_fusion=False,
++        )
++    else:
++        first = _paired_arithmetic_mm[(cap * 3,)](
++            x,
++            w13,
++            s13,
++            gu,
++            si,
++            ei,
++            total,
++            192,
++            3584,
++            cap * bm,
++            r,
++            16,
++            bm,
++            64,
++            128,
++            1,
++            PACK_K=128,
++            MODE=mode1,
++            num_warps=4,
++            num_stages=2,
++        )
++    _situ[(triton.cdiv(r * 96, 256),)](
++        gu, act, r * 96, 96, 4.0, 25.0, 256, num_warps=4, enable_fp_fusion=False
++    )
++    if m <= 2 and fast_g2:
++        # At most two token rows per expert: skip alignment and all BM16 padding.
++        programs = min(r * 56, prepared["sms"] * 16)
++        second = _route_gemv_g2[(programs,)](
++            act,
++            w2,
++            s2,
++            down,
++            ids,
++            r,
++            3584,
++            64,
++            programs,
++            prepared["normal_flags"][1],
++            num_warps=1,
++            num_stages=1,
++            enable_fp_fusion=False,
++        )
++    elif m in (4, 8, 16, 32) and fast_g2:
++        # One uniform GPU branch reuses the existing padded-block count.
++        # Sparse batches use route GEMV; concentrated batches retain MMA reuse.
++        programs = min(cap * 56, prepared["sms"] * 16)
++        second = _adaptive_g2[(programs,)](
++            act,
++            w2,
++            s2,
++            down,
++            ids,
++            si,
++            ei,
++            total,
++            r,
++            programs,
++            prepared["normal_flags"][1],
++            num_warps=2,
++            num_stages=1,
++            enable_fp_fusion=False,
++        )
++    else:
++        programs = min(cap * 28, prepared["sms"] * 16)
++        second = _paired_scheduled_mm[(programs,)](
++            act,
++            w2,
++            s2,
++            down,
++            si,
++            ei,
++            total,
++            3584,
++            96,
++            r,
++            1,
++            bm,
++            128,
++            32,
++            1,
++            programs,
++            DECODE_MODE=mode2,
++            num_warps=4,
++            num_stages=2,
++        )
++    _weighted_sum[(m, 14)](
++        down, weights, out, 3584, 16, 16, 256, num_warps=4, enable_fp_fusion=False
++    )
++    if record is not None:
++        record.update(
++            G1=meta(first),
++            G2=meta(second),
++            normal_flags=prepared["normal_flags"],
++            programs_G2=programs,
++        )
++    return out
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/small_alignment.py
+@@ -0,0 +1,85 @@
++"""Single-CTA small-route alignment; no CPU route reads and no E-by-E workspace."""
++
++import torch
++import triton
++import triton.language as tl
++from flaggems_vllm.ops.kimi_k3_metax.grouped_moe import _alignment as baseline_alignment
++
++
++@triton.jit
++def _align_small(
++    IDS,
++    SORTED,
++    EXPERTS,
++    TOTAL,
++    R: tl.constexpr,
++    E: tl.constexpr,
++    BM: tl.constexpr,
++    B: tl.constexpr,
++    EB: tl.constexpr,
++):
++    r = tl.arange(0, B)
++    raw = tl.load(IDS + r, r < R, EB - 1).to(tl.int32)
++    counts = tl.histogram(raw, EB)
++    e = tl.arange(0, EB)
++    counts = tl.where(e < E, counts, 0)
++    padded = tl.cdiv(counts, BM) * BM
++    raw_end = tl.cumsum(counts, 0)
++    pad_end = tl.cumsum(padded, 0)
++    raw_start = raw_end - counts
++    pad_start = pad_end - padded
++    total = tl.sum(padded, 0)
++    tl.store(TOTAL, total)
++    # Stable expert then route order. Sentinel keys sort behind all valid routes.
++    key = tl.where(r < R, raw * B + r, 0x7FFFFFFF)
++    key = tl.sort(key, descending=False)
++    owner = tl.minimum(key // B, EB - 1)
++    route = key % B
++    position = r - tl.gather(raw_start, owner, 0)
++    destination = tl.gather(pad_start, owner, 0) + position
++    tl.store(SORTED + destination, route, r < R)
++    tl.store(EXPERTS + destination // BM, owner, (r < R) & (position % BM == 0))
++    # Padding tails are disjoint from valid destinations; no clear/scatter race.
++    for j in range(BM - 1):
++        p = pad_start + counts + j
++        tl.store(SORTED + p, R, (e < E) & (j < padded - counts))
++
++
++def align_small(ids, block_m, experts, *, num_warps=4, record=None):
++    if (
++        ids.ndim != 2
++        or ids.shape[1] != 16
++        or not (2 <= ids.shape[0] <= 64)
++        or block_m != 16
++        or experts != 896
++    ):
++        return baseline_alignment(ids, block_m, experts)
++    if ids.dtype not in (torch.int32, torch.int64) or not ids.is_contiguous():
++        raise ValueError("Expected contiguous integer route IDs")
++    r = ids.numel()
++    cap = min(experts, r) + (r - min(experts, r)) // block_m
++    si = torch.empty(cap * block_m, dtype=torch.int32, device=ids.device)
++    ei = torch.empty(cap, dtype=torch.int32, device=ids.device)
++    total = torch.empty(1, dtype=torch.int32, device=ids.device)
++    obj = _align_small[(1,)](
++        ids,
++        si,
++        ei,
++        total,
++        r,
++        experts,
++        block_m,
++        triton.next_power_of_2(r),
++        triton.next_power_of_2(experts),
++        num_warps=num_warps,
++    )
++    if record is not None:
++        record.update(
++            n_regs=obj.n_regs,
++            n_spills=obj.n_spills,
++            shared=obj.metadata.shared,
++            sorted_capacity=si.numel(),
++            expert_capacity=ei.numel(),
++            workspace_bytes=sum(t.numel() * t.element_size() for t in (si, ei, total)),
++        )
++    return si, ei, total
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/mla4k_long.py
+@@ -0,0 +1,573 @@
++"""K3 long-context MLA: bounded QK lifetime, staged PV and FP32 split merge."""
++
++from flag_gems import runtime
++
++# SPDX-License-Identifier: Apache-2.0
++import torch, triton
++import triton.language as tl
++
++
++@triton.jit
++def _qk_long_kernel(
++    Q_ptr,
++    stride_q_b,
++    stride_q_sq,
++    stride_q_h,
++    KV_cache,
++    stride_kv_bs,
++    stride_kv_block,
++    Block_table,
++    stride_bt_b,
++    Seq_lens,
++    Out,
++    stride_o_b,
++    stride_o_sq,
++    stride_o_h,
++    LSE,
++    PartialMax,
++    PartialSum,
++    ProbabilityLow,
++    Alpha,
++    MAX_CHUNKS: tl.constexpr,
++    SPLITS: tl.constexpr,
++    stride_lse_b,
++    stride_lse_h,
++    sm_scale,
++    SQ,
++    HQ: tl.constexpr,
++    DQK: tl.constexpr,
++    HEAD_DIM_V: tl.constexpr,
++    PAGE_SIZE: tl.constexpr,
++    HAVE_CAUSAL: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    K_TILE: tl.constexpr,
++    CAP: tl.constexpr,
++    COMPENSATE: tl.constexpr,
++    MIN_LENGTH: tl.constexpr = 256,
++    SHORT_SPLITS: tl.constexpr = 0,
++    SHORT_LIMIT: tl.constexpr = 4096,
++):
++    """
++    Dense decode kernel with paged attention and online softmax.
++    Grid: (ceil(HQ / BLOCK_H), batch_size * seq_q)
++    """
++    split = tl.program_id(2)
++    pid_h_block = tl.program_id(0)
++    pid_b_sq = tl.program_id(1)
++    i_b = pid_b_sq // SQ
++    i_sq = pid_b_sq % SQ
++    guard_length = tl.load(Seq_lens + i_b)
++    if (guard_length <= MIN_LENGTH) | (guard_length > CAP):
++        return
++
++    cur_head = pid_h_block * BLOCK_H + tl.arange(0, BLOCK_H)
++    mask_head = cur_head < HQ
++
++    offs_d_pe = tl.arange(HEAD_DIM_V, DQK)
++    offs_q_pe = (
++        i_b * stride_q_b
++        + i_sq * stride_q_sq
++        + cur_head[:, None] * stride_q_h
++        + offs_d_pe[None, :]
++    )
++    q_pe = tl.load(Q_ptr + offs_q_pe, mask=mask_head[:, None], other=0.0)
++
++    # Online softmax accumulators
++    e_max = tl.full([BLOCK_H], value=float("-inf"), dtype=tl.float32)
++    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
++
++    cur_batch_seq_len = guard_length
++    Block_table += i_b * stride_bt_b
++
++    if SHORT_SPLITS > 0:
++        active_splits = tl.where(cur_batch_seq_len <= SHORT_LIMIT, SHORT_SPLITS, SPLITS)
++        if split >= active_splits:
++            return
++        blocks_per_split = tl.where(
++            cur_batch_seq_len <= SHORT_LIMIT,
++            tl.cdiv(tl.cdiv(cur_batch_seq_len, BLOCK_N), SHORT_SPLITS),
++            tl.cdiv(tl.cdiv(cur_batch_seq_len, BLOCK_N), SPLITS),
++        )
++    else:
++        active_splits = (
++            tl.where(cur_batch_seq_len <= 5120, 128, SPLITS)
++            if SPLITS == 256
++            else SPLITS
++        )
++        blocks_per_split = tl.cdiv(tl.cdiv(cur_batch_seq_len, BLOCK_N), active_splits)
++    first = split * blocks_per_split * BLOCK_N
++    end = tl.minimum((split + 1) * blocks_per_split * BLOCK_N, cur_batch_seq_len)
++    count = tl.maximum(end - first, 0)
++    offs_n = first + tl.arange(0, BLOCK_N)
++    loop_time = count // BLOCK_N
++    remainder = count % BLOCK_N
++
++    for i in range(0, loop_time):
++        kv_page_number = tl.load(Block_table + offs_n // PAGE_SIZE)
++        kv_offset = (
++            kv_page_number.to(tl.int64) * stride_kv_block
++            + (offs_n % PAGE_SIZE).to(tl.int64) * stride_kv_bs
++        )
++
++        qk = tl.zeros((BLOCK_H, BLOCK_N), tl.float32)
++        for kd in range(0, HEAD_DIM_V, K_TILE):
++            col = kd + tl.arange(0, K_TILE)
++            qa = tl.load(
++                Q_ptr
++                + i_b * stride_q_b
++                + i_sq * stride_q_sq
++                + cur_head[:, None] * stride_q_h
++                + col[None, :],
++                mask_head[:, None] & (col[None, :] < HEAD_DIM_V),
++                0,
++            )
++            kb = tl.load(
++                KV_cache + kv_offset[None, :] + col[:, None],
++                (col[:, None] < HEAD_DIM_V) & tl.full((1, BLOCK_N), True, tl.int1),
++                0,
++            )
++            qk = tl.dot(qa, kb, qk)
++
++        # Add RoPE contribution
++        offs_k_pe = kv_offset[None, :] + offs_d_pe[:, None]
++        k_pe = tl.load(KV_cache + offs_k_pe)
++        qk += tl.dot(q_pe, k_pe)
++        qk *= sm_scale
++
++        # Online softmax update
++        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
++        re_scale = tl.exp(e_max - n_e_max)
++        p = tl.exp(qk - n_e_max[:, None])
++        probability_hi = p.to(tl.bfloat16)
++        probability_lo = (
++            (p - probability_hi.to(tl.float32)).to(tl.bfloat16)
++            if COMPENSATE
++            else tl.full((BLOCK_H, BLOCK_N), 0, tl.bfloat16)
++        )
++        chunk_slot = (((i_b * SPLITS + split) * HQ + cur_head) * MAX_CHUNKS + i).to(
++            tl.int64
++        )
++        column = tl.arange(0, BLOCK_N)
++        tl.store(
++            Out + chunk_slot[:, None] * BLOCK_N + column[None, :],
++            probability_hi,
++            mask_head[:, None],
++        )
++        tl.store(
++            ProbabilityLow + chunk_slot[:, None] * BLOCK_N + column[None, :],
++            probability_lo,
++            mask_head[:, None],
++        )
++        tl.store(Alpha + chunk_slot, re_scale, mask_head)
++        e_sum = e_sum * re_scale + tl.sum(p, 1)
++        e_max = n_e_max
++        offs_n += BLOCK_N
++
++    if remainder:
++        mask_kvsplit = offs_n < cur_batch_seq_len
++        kv_page_number = tl.load(
++            Block_table + offs_n // PAGE_SIZE, mask=mask_kvsplit, other=0
++        )
++        kv_offset = (
++            kv_page_number.to(tl.int64) * stride_kv_block
++            + (offs_n % PAGE_SIZE).to(tl.int64) * stride_kv_bs
++        )
++
++        qk = tl.zeros((BLOCK_H, BLOCK_N), tl.float32)
++        for kd in range(0, HEAD_DIM_V, K_TILE):
++            col = kd + tl.arange(0, K_TILE)
++            qa = tl.load(
++                Q_ptr
++                + i_b * stride_q_b
++                + i_sq * stride_q_sq
++                + cur_head[:, None] * stride_q_h
++                + col[None, :],
++                mask_head[:, None] & (col[None, :] < HEAD_DIM_V),
++                0,
++            )
++            kb = tl.load(
++                KV_cache + kv_offset[None, :] + col[:, None],
++                (col[:, None] < HEAD_DIM_V) & mask_kvsplit[None, :],
++                0,
++            )
++            qk = tl.dot(qa, kb, qk)
++
++        offs_k_pe = kv_offset[None, :] + offs_d_pe[:, None]
++        k_pe = tl.load(KV_cache + offs_k_pe, mask=mask_kvsplit[None, :], other=0.0)
++        qk += tl.dot(q_pe, k_pe)
++        qk *= sm_scale
++
++        qk = tl.where(mask_kvsplit[None, :], qk, float("-inf"))
++
++        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
++        re_scale = tl.exp(e_max - n_e_max)
++        p = tl.exp(qk - n_e_max[:, None])
++        probability_hi = p.to(tl.bfloat16)
++        probability_lo = (
++            (p - probability_hi.to(tl.float32)).to(tl.bfloat16)
++            if COMPENSATE
++            else tl.full((BLOCK_H, BLOCK_N), 0, tl.bfloat16)
++        )
++        chunk_slot = (
++            ((i_b * SPLITS + split) * HQ + cur_head) * MAX_CHUNKS + loop_time
++        ).to(tl.int64)
++        column = tl.arange(0, BLOCK_N)
++        tl.store(
++            Out + chunk_slot[:, None] * BLOCK_N + column[None, :],
++            probability_hi,
++            mask_head[:, None],
++        )
++        tl.store(
++            ProbabilityLow + chunk_slot[:, None] * BLOCK_N + column[None, :],
++            probability_lo,
++            mask_head[:, None],
++        )
++        tl.store(Alpha + chunk_slot, re_scale, mask_head)
++        e_sum = e_sum * re_scale + tl.sum(p, 1)
++        e_max = n_e_max
++
++    # Keep unnormalized accumulators/statistics in FP32 for the merge.
++    slot = ((i_b * SQ + i_sq) * SPLITS + split) * HQ + cur_head
++    tl.store(PartialMax + slot, e_max, mask_head)
++    tl.store(PartialSum + slot, e_sum, mask_head)
++
++
++@triton.jit
++def _pv_long_kernel(
++    Cache,
++    stride_kv_token,
++    stride_kv_block,
++    Table,
++    stride_table,
++    Lengths,
++    PH,
++    PL,
++    A,
++    Partial,
++    H: tl.constexpr,
++    SPLITS: tl.constexpr,
++    MAX_CHUNKS: tl.constexpr,
++    BN: tl.constexpr,
++    FOLD: tl.constexpr,
++    CAP: tl.constexpr,
++    COMPENSATE: tl.constexpr,
++    VT: tl.constexpr,
++    FUSED: tl.constexpr,
++):
++    b = tl.program_id(0)
++    split = tl.program_id(1)
++    length = tl.load(Lengths + b)
++    if (length <= 256) | (length > CAP):
++        return
++    row = tl.arange(0, 16)
++    head = row % (16 // FOLD)
++    part = row // (16 // FOLD)
++    valid = head < H
++    if VT == 512 // FOLD:
++        d = tl.arange(0, 512)
++    else:
++        d = tl.reshape(
++            tl.arange(0, FOLD)[:, None] * (512 // FOLD)
++            + tl.program_id(2) * VT
++            + tl.arange(0, VT)[None, :],
++            (FOLD * VT,),
++        )
++    n = tl.arange(0, BN)
++    active_splits = tl.where(length <= 5120, 128, SPLITS) if SPLITS == 256 else SPLITS
++    blocks = tl.cdiv(tl.cdiv(length, BN), active_splits)
++    first = split * blocks * BN
++    end = tl.minimum((split + 1) * blocks * BN, length)
++    count = tl.maximum(end - first, 0)
++    chunks = tl.cdiv(count, BN)
++    acc = tl.zeros((16, VT), tl.float32)
++    for step in range(chunks):
++        pos = first + step * BN + n
++        mask = pos < length
++        page = tl.load(Table + b * stride_table + pos // 256, mask, 0).to(tl.int64)
++        offset = page * stride_kv_block + (pos % 256) * stride_kv_token
++        v = tl.load(Cache + offset[:, None] + d[None, :], mask[:, None], 0)
++        slot = (((b * SPLITS + split) * H + head) * MAX_CHUNKS + step).to(tl.int64)
++        phi = tl.load(PH + slot[:, None] * BN + n[None, :], valid[:, None], 0)
++        alpha = tl.load(A + slot, valid, 0)
++        slice_id = tl.arange(0, FOLD)
++        smask = part[:, None, None] == slice_id[None, None, :]
++        hp = tl.reshape(
++            tl.where(smask, phi[:, :, None], 0).to(tl.bfloat16), (16, BN * FOLD)
++        )
++        vp = tl.reshape(v, (BN * FOLD, VT))
++        acc *= alpha[:, None]
++        if FUSED:
++            acc = tl.dot(hp, vp, acc)
++        else:
++            acc += tl.dot(hp, vp)
++        if COMPENSATE:
++            plo = tl.load(PL + slot[:, None] * BN + n[None, :], valid[:, None], 0)
++            lp = tl.reshape(
++                tl.where(smask, plo[:, :, None], 0).to(tl.bfloat16), (16, BN * FOLD)
++            )
++            if FUSED:
++                acc = tl.dot(lp, vp, acc)
++            else:
++                acc += tl.dot(lp, vp)
++    slot = (b * SPLITS + split) * H + head
++    cols = (
++        part[:, None] * (512 // FOLD)
++        + tl.program_id(2) * VT
++        + tl.arange(0, VT)[None, :]
++    )
++    tl.store(Partial + slot[:, None] * 512 + cols, acc, valid[:, None])
++
++
++@triton.jit
++def _merge_long_kernel(
++    P,
++    M,
++    S,
++    O,
++    L,
++    Lengths,
++    OriginalLengths,
++    B: tl.constexpr,
++    H: tl.constexpr,
++    V: tl.constexpr,
++    SPLITS: tl.constexpr,
++    RS: tl.constexpr,
++    VT: tl.constexpr,
++    MIN_LENGTH: tl.constexpr = 256,
++    SHORT_SPLITS: tl.constexpr = 0,
++    SHORT_LIMIT: tl.constexpr = 4096,
++):
++    b = tl.program_id(0)
++    h = tl.program_id(1)
++    length = tl.load(Lengths + b)
++    if length <= MIN_LENGTH:
++        if tl.load(OriginalLengths + b) == 0:
++            zero_d = tl.program_id(2) * VT + tl.arange(0, VT)
++            tl.store(O + (b * H + h) * V + zero_d, 0, zero_d < V)
++            if tl.program_id(2) == 0:
++                tl.store(L + b * H + h, -float("inf"))
++        return
++    active_splits = (
++        tl.where(length <= SHORT_LIMIT, SHORT_SPLITS, SPLITS)
++        if SHORT_SPLITS > 0
++        else SPLITS
++    )
++    split = tl.arange(0, RS)
++    d = tl.program_id(2) * VT + tl.arange(0, VT)
++    slot = (b * SPLITS + split) * H + h
++    maximum = tl.load(M + slot, split < active_splits, -float("inf"))
++    denom = tl.load(S + slot, split < active_splits, 0)
++    overall = tl.max(maximum, 0)
++    scale = tl.where(denom > 0, tl.exp(maximum - overall), 0)
++    part = tl.load(
++        P + slot[:, None] * V + d[None, :],
++        (split[:, None] < active_splits) & (d[None, :] < V),
++        0,
++    )
++    numerator = tl.sum(part * scale[:, None], 0)
++    total = tl.sum(denom * scale, 0)
++    result = tl.where(total > 0, numerator / total, 0)
++    tl.store(O + (b * H + h) * V + d, result.to(tl.bfloat16), d < V)
++    if tl.program_id(2) == 0:
++        tl.store(
++            L + b * H + h, tl.where(total > 0, overall + tl.log(total), -float("inf"))
++        )
++
++
++@triton.jit
++def _partition_lengths(
++    L, Old, New, B: tl.constexpr, CAP: tl.constexpr, R: tl.constexpr
++):
++    i = tl.arange(0, R)
++    n = tl.load(L + i, i < B, 0)
++    use = (n > 4096) & (n <= CAP)
++    tl.store(Old + i, tl.where(use, 0, n), i < B)
++    tl.store(New + i, tl.where(use, n, 0), i < B)
++
++
++def supported(q, cache, table, lengths, out, scale):
++    if runtime.device.vendor_name != "metax":
++        return False
++    if not all(isinstance(x, torch.Tensor) for x in (q, cache, table, lengths)):
++        return False
++    if q.ndim != 4 or cache.ndim != 4 or table.ndim != 2 or lengths.ndim != 1:
++        return False
++    b, sq, h, d = q.shape
++    if not (1 <= b <= 64 and (sq, h, d) == (1, 3, 576)):
++        return False
++    if (
++        tuple(cache.shape[1:]) != (256, 1, 576)
++        or table.shape[0] != b
++        or not 17 <= table.shape[1] <= 272
++    ):
++        return False
++    if lengths.shape != (b,) or q.dtype != torch.bfloat16 or cache.dtype != q.dtype:
++        return False
++    if table.dtype != torch.int32 or lengths.dtype != torch.int32:
++        return False
++    if not q.is_cuda or any(x.device != q.device for x in (cache, table, lengths)):
++        return False
++    if (
++        q.stride(-1) != 1
++        or cache.stride(-1) != 1
++        or table.stride(-1) != 1
++        or not lengths.is_contiguous()
++    ):
++        return False
++    if out is not None and (
++        out.shape != (b, 1, 3, 512)
++        or out.dtype != q.dtype
++        or out.device != q.device
++        or not out.is_contiguous()
++    ):
++        return False
++    if out is not None:
++        base = out.untyped_storage().data_ptr()
++        if any(
++            base == x.untyped_storage().data_ptr() for x in (q, cache, table, lengths)
++        ):
++            return False
++    return scale == 192**-0.5
++
++
++def run(q, cache, table, lengths, *, previous, record=None):
++    """Only4097..69632 rows use the staged math; previous dispatcher handles other rows.
++    previous(masked_lengths) must execute the canonical prior dispatch and return(out,lse).
++    There is no host read of lengths, no extra output copy, and no new registration.
++    """
++    b, sq, h, d = q.shape
++    cap = min(69632, table.shape[1] * 256)
++    splits = 16 if b > 33 else 32 if b > 16 else 64 if b > 8 else 128 if b > 2 else 256
++    q_warps = 2
++    pv_warps = 2
++    k_tile = 64
++    compensated = True
++    old_lengths = torch.empty_like(lengths)
++    new_lengths = torch.empty_like(lengths)
++    _partition_lengths[(1,)](
++        lengths,
++        old_lengths,
++        new_lengths,
++        b,
++        cap,
++        triton.next_power_of_2(b),
++        num_warps=1,
++    )
++    out, lse = previous(old_lengths)
++    max_chunks = max(
++        triton.cdiv(triton.cdiv(cap, 16), splits),
++        triton.cdiv(triton.cdiv(min(cap, 5120), 16), 128) if splits == 256 else 0,
++    )
++    ph = torch.empty(
++        (b, splits, h, max_chunks, 16), dtype=torch.bfloat16, device=q.device
++    )
++    pl = torch.empty_like(ph)
++    alpha = torch.empty(
++        (b, splits, h, max_chunks), dtype=torch.float32, device=q.device
++    )
++    pm = torch.empty((b, splits, h), dtype=torch.float32, device=q.device)
++    ps = torch.empty_like(pm)
++    partial = torch.empty((b, splits, h, 512), dtype=torch.float32, device=q.device)
++    qo = _qk_long_kernel[(1, b, splits)](
++        q,
++        *q.stride()[:3],
++        cache,
++        cache.stride(1),
++        cache.stride(0),
++        table,
++        table.stride(0),
++        new_lengths,
++        ph,
++        0,
++        0,
++        0,
++        lse,
++        pm,
++        ps,
++        pl,
++        alpha,
++        max_chunks,
++        splits,
++        0,
++        0,
++        192**-0.5,
++        1,
++        h,
++        576,
++        512,
++        256,
++        False,
++        16,
++        16,
++        k_tile,
++        cap,
++        compensated,
++        num_warps=q_warps,
++        num_stages=1,
++    )
++    po = _pv_long_kernel[(b, splits, 1)](
++        cache,
++        cache.stride(1),
++        cache.stride(0),
++        table,
++        table.stride(0),
++        new_lengths,
++        ph,
++        pl,
++        alpha,
++        partial,
++        h,
++        splits,
++        max_chunks,
++        16,
++        4,
++        cap,
++        compensated,
++        128,
++        compensated,
++        num_warps=pv_warps,
++        num_stages=1,
++    )
++    mo = _merge_long_kernel[(b, h, 4)](
++        partial,
++        pm,
++        ps,
++        out,
++        lse,
++        new_lengths,
++        lengths,
++        b,
++        h,
++        512,
++        splits,
++        triton.next_power_of_2(splits),
++        128,
++        num_warps=4,
++        enable_fp_fusion=False,
++    )
++    if record is not None:
++
++        def md(k):
++            return {
++                "n_regs": k.n_regs,
++                "n_spills": k.n_spills,
++                "shared": k.metadata.shared,
++            }
++
++        record.update(
++            qk=md(qo),
++            pv=md(po),
++            merge=md(mo),
++            splits=splits,
++            cap=cap,
++            compensated=compensated,
++            fused_accumulator=compensated,
++            target_workspace_bytes=sum(
++                x.numel() * x.element_size()
++                for x in (ph, pl, alpha, pm, ps, partial, old_lengths, new_lengths)
++            ),
++            output_copy=False,
++            range_guard="4096<L<=cap;all other rows previous dispatch;empty0/-inf",
++        )
++    return out, lse
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/prefill_mma.py
+@@ -0,0 +1,313 @@
++"""K3 MLA prefill: BF16 tiled QK/PV with short register lifetime and FP32 online state."""
++
++from flag_gems import runtime
++
++
++import torch, triton
++import triton.language as tl
++
++
++@triton.jit
++def _prefill_mma(
++    Q,
++    K,
++    V,
++    CQ,
++    CK,
++    O,
++    L,
++    H: tl.constexpr,
++    SCALE: tl.constexpr,
++    CAUSAL: tl.constexpr,
++    BQ: tl.constexpr,
++    BK: tl.constexpr,
++    COMP: tl.constexpr,
++    KT: tl.constexpr,
++    VT: tl.constexpr,
++    PM,
++    PS,
++    NQ,
++    SPLITS: tl.constexpr,
++    LSE_HEAD_MAJOR: tl.constexpr = False,
++):
++    block = tl.program_id(0) // SPLITS
++    split = tl.program_id(0) % SPLITS
++    head = tl.program_id(1) // (128 // VT)
++    vblock = tl.program_id(1) % (128 // VT)
++    seq = tl.program_id(2)
++    q0 = tl.load(CQ + seq)
++    q1 = tl.load(CQ + seq + 1)
++    k0 = tl.load(CK + seq)
++    k1 = tl.load(CK + seq + 1)
++    nq = q1 - q0
++    nk = k1 - k0
++    first = block * BQ
++    if first >= nq:
++        return
++    qr = first + tl.arange(0, BQ)
++    dv = vblock * VT + tl.arange(0, VT)
++    nn = tl.arange(0, BK)
++    maximum = tl.full((BQ,), -float("inf"), tl.float32)
++    denom = tl.zeros((BQ,), tl.float32)
++    acc = tl.zeros((BQ, VT), tl.float32)
++    limit = tl.maximum(0, tl.minimum(nk, nk - nq + first + BQ)) if CAUSAL else nk
++    split_blocks = tl.cdiv(tl.cdiv(limit, BK), SPLITS)
++    begin = split * split_blocks * BK
++    end = tl.minimum((split + 1) * split_blocks * BK, limit)
++    for start in range(begin, end, BK):
++        n = start + nn
++        scores = tl.zeros((BQ, BK), tl.float32)
++        for kd in range(0, 192, KT):
++            d = kd + tl.arange(0, KT)
++            qa = tl.load(
++                Q + ((q0 + qr[:, None]) * H + head) * 192 + d[None, :],
++                (qr[:, None] < nq) & (d[None, :] < 192),
++                0,
++            )
++            keys = tl.load(
++                K + ((k0 + n[None, :]) * H + head) * 192 + d[:, None],
++                (n[None, :] < nk) & (d[:, None] < 192),
++                0,
++            )
++            scores = tl.dot(qa, keys, scores)
++        scores = scores * SCALE
++        mask = (n[None, :] < nk) & (qr[:, None] < nq)
++        if CAUSAL:
++            mask = mask & (n[None, :] <= nk - nq + qr[:, None])
++        scores = tl.where(mask, scores, -float("inf"))
++        cur = tl.maximum(maximum, tl.max(scores, 1))
++        alpha = tl.where(maximum != -float("inf"), tl.exp(maximum - cur), 0.0)
++        prob = tl.where(mask, tl.exp(scores - cur[:, None]), 0.0)
++        vals = tl.load(
++            V + ((k0 + n[:, None]) * H + head) * 128 + dv[None, :], n[:, None] < nk, 0
++        )
++        hi = prob.to(tl.bfloat16)
++        acc = acc * alpha[:, None]
++        acc = tl.dot(hi, vals, acc)
++        if COMP:
++            lo = (prob - hi.to(tl.float32)).to(tl.bfloat16)
++            acc = tl.dot(lo, vals, acc)
++            tail = (prob - hi.to(tl.float32) - lo.to(tl.float32)).to(tl.bfloat16)
++            acc = tl.dot(tail, vals, acc)
++        denom = denom * alpha + tl.sum(prob, 1)
++        maximum = cur
++    if SPLITS > 1:
++        tl.store(
++            O + ((split * NQ + q0 + qr[:, None]) * H + head) * 128 + dv[None, :],
++            acc,
++            qr[:, None] < nq,
++        )
++        if vblock == 0:
++            tl.store(PM + (split * NQ + q0 + qr) * H + head, maximum, qr < nq)
++            tl.store(PS + (split * NQ + q0 + qr) * H + head, denom, qr < nq)
++    else:
++        out = tl.where(denom[:, None] > 0, acc / denom[:, None], 0.0)
++        tl.store(
++            O + ((q0 + qr[:, None]) * H + head) * 128 + dv[None, :],
++            out,
++            qr[:, None] < nq,
++        )
++        if vblock == 0:
++            lse_offset = head * NQ + q0 + qr if LSE_HEAD_MAJOR else (q0 + qr) * H + head
++            tl.store(
++                L + lse_offset,
++                tl.where(denom > 0, maximum + tl.log(denom), -float("inf")),
++                qr < nq,
++            )
++
++
++@triton.jit
++def _merge_prefill_splits(P, M, S, O, L, NQ, H: tl.constexpr, SPLITS: tl.constexpr):
++    q = tl.program_id(0)
++    h = tl.program_id(1)
++    part = tl.arange(0, SPLITS)
++    d = tl.arange(0, 128)
++    idx = (part * NQ + q) * H + h
++    maximum = tl.load(M + idx)
++    denom = tl.load(S + idx)
++    overall = tl.max(maximum, 0)
++    weights = tl.where(denom > 0, tl.exp(maximum - overall), 0.0)
++    values = tl.load(P + idx[:, None] * 128 + d[None, :])
++    total = tl.sum(weights * denom, 0)
++    result = tl.sum(values * weights[:, None], 0)
++    tl.store(O + (q * H + h) * 128 + d, tl.where(total > 0, result / total, 0.0))
++    tl.store(L + q * H + h, tl.where(total > 0, overall + tl.log(total), -float("inf")))
++
++
++def can_use(q, k, v, cq, ck, maxq, scale):
++    if runtime.device.vendor_name != "metax":
++        return False
++    if not all(isinstance(x, torch.Tensor) for x in (q, k, v, cq, ck)):
++        return False
++    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3 or cq.ndim != 1 or ck.ndim != 1:
++        return False
++    if (
++        q.shape[1] not in (3, 12)
++        or q.shape[2] != 192
++        or k.shape[1:] != q.shape[1:]
++        or v.shape[1:] != (q.shape[1], 128)
++        or k.shape[0] != v.shape[0]
++        or k.shape[0] > (66048 if q.shape[1] == 12 else 65536)
++    ):
++        return False
++    if not isinstance(maxq, int) or not (1 <= q.shape[0] <= 4096 and 1 <= maxq <= 4096):
++        return False
++    if cq.shape != ck.shape or cq.numel() < 2:
++        return False
++    if not q.is_cuda or any(
++        x.device != q.device or not x.is_contiguous() for x in (q, k, v, cq, ck)
++    ):
++        return False
++    if (
++        not all(x.dtype == torch.bfloat16 for x in (q, k, v))
++        or cq.dtype != torch.int32
++        or ck.dtype != torch.int32
++    ):
++        return False
++    return isinstance(scale, (float, int)) and scale == 192**-0.5
++
++
++def configuration(totalq, maxq, causal):
++    # Keep compile-time tiles independent of GPU sequence-length values.
++    if totalq >= 2048:
++        return 32, 32, 2, 32, 64
++    if maxq <= 768:
++        return 16, 64, 4, 64, 64
++    return 32, 32, 4, 64, 64
++
++
++def run(
++    q,
++    k,
++    v,
++    cq,
++    ck,
++    maxq,
++    scale,
++    causal=True,
++    record=None,
++    *,
++    out=None,
++    head_major_lse=False,
++):
++    h = q.shape[1]
++    bq, bk, warps, kt, vt = configuration(q.shape[0], maxq, causal)
++    # The real new-token caller shares the same cumulative lengths for Q/K.
++    # Context fragments retain their previous configuration.
++    if (
++        h == 12
++        and causal
++        and 449 <= q.shape[0] <= 512
++        and k.shape[0] == q.shape[0]
++        and cq is ck
++    ):
++        bq, bk, warps, kt, vt = 64, 32, 4, 32, 64
++    o = (
++        torch.empty((q.shape[0], h, 128), dtype=torch.float32, device=q.device)
++        if out is None
++        else out
++    )
++    l = torch.empty(
++        (h, q.shape[0]) if head_major_lse else q.shape[:2],
++        dtype=torch.float32,
++        device=q.device,
++    )
++    # Prefix fragments with very few queries otherwise launch too few blocks
++    # and sum thousands of KV tiles serially. Split only that independent axis.
++    splits = 16 if not causal and maxq <= 64 and k.shape[0] > 4096 else 1
++    # TP8 context tiles reuse each KV load across more query rows. Long chunks
++    # split the independent KV axis to bound serial FP32 denominator accumulation.
++    if (
++        h == 12
++        and not causal
++        and 65 <= q.shape[0] <= 512
++        and k.shape[0] >= 2048
++        and (128 <= maxq <= 512 or (maxq == 64 and q.shape[0] == 512))
++    ):
++        bq, bk, warps, kt, vt = 64, 32, 4, 32, 64
++        splits = (
++            1
++            if k.shape[0] <= 4096
++            else (16 if 128 <= maxq <= 256 and k.shape[0] > 32768 else 8)
++        )
++
++    # Large TP8 prefill query blocks reuse KV over64 queries and64 key rows.
++    # Long context fragments use four independent KV partitions for stable FP32
++    # online statistics. Selection uses CPU tensor geometry, neverGPU length reads.
++    if h == 12 and 513 <= q.shape[0] <= 4096 and maxq >= 128:
++        bq, bk, warps, kt, vt = 64, 64, 4, 64, 64
++        splits = 4 if not causal and k.shape[0] > 32768 else 1
++
++    if head_major_lse and splits > 1:
++        raise ValueError(
++            "Direct head-major output is only qualified for new-token attention"
++        )
++    partial = (
++        torch.empty((splits, q.shape[0], h, 128), dtype=torch.float32, device=q.device)
++        if splits > 1
++        else o
++    )
++    pm = (
++        torch.empty((splits, q.shape[0], h), dtype=torch.float32, device=q.device)
++        if splits > 1
++        else l
++    )
++    ps = torch.empty_like(pm) if splits > 1 else l
++    kern = _prefill_mma[
++        (triton.cdiv(maxq, bq) * splits, h * (128 // vt), cq.numel() - 1)
++    ](
++        q,
++        k,
++        v,
++        cq,
++        ck,
++        partial,
++        l,
++        h,
++        scale,
++        causal,
++        bq,
++        bk,
++        True,
++        kt,
++        vt,
++        pm,
++        ps,
++        q.shape[0],
++        splits,
++        LSE_HEAD_MAJOR=head_major_lse,
++        num_warps=warps,
++        num_stages=1,
++        enable_fp_fusion=False,
++    )
++    merge = None
++    if splits > 1:
++        merge = _merge_prefill_splits[(q.shape[0], h)](
++            partial,
++            pm,
++            ps,
++            o,
++            l,
++            q.shape[0],
++            h,
++            splits,
++            num_warps=4,
++            enable_fp_fusion=False,
++        )
++    if record is not None:
++        record.update(
++            n_regs=kern.n_regs,
++            n_spills=kern.n_spills,
++            shared=kern.metadata.shared,
++            BQ=bq,
++            BK=bk,
++            warps=warps,
++            KT=kt,
++            VT=vt,
++            compensated=True,
++            probability_bf16_parts=3,
++            score_matrix_materialized=False,
++            splits=splits,
++            merge_spills=None if merge is None else merge.n_spills,
++        )
++    return o, l
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/prefill_experts.py
+@@ -0,0 +1,105 @@
++"""K3 TP32 BF16 prefill experts, qualified shape tiles and exact FP32 combine.
++
++Original compressed weights, SiTU and BF16 materialization boundaries remain.
++"""
++
++import torch
++import triton
++from flag_gems import runtime
++from flaggems_vllm.ops.kimi_k3_metax.expert_gemm import _paired_arithmetic_mm, meta
++from flaggems_vllm.ops.kimi_k3_metax.marlin_mxfp4 import configs_for_tokens
++from flaggems_vllm.ops.kimi_k3_metax.grouped_moe import _alignment, _situ, _weighted_sum
++from flaggems_vllm.ops.kimi_k3_metax.prefill_combine import combine_prefill
++
++
++def grouped_experts_prefill(x, packed, weights, ids, prepared, record=None):
++    m = x.shape[0]
++    bm, bk1, _ = configs_for_tokens(m)
++    warps1 = 8 if m >= 2048 else 4
++    if m == 1024 and prepared["normal_flags"][0]:
++        bk1, warps1 = 64, 8
++    bn2 = 256 if m in (3553, 4096) and prepared["normal_flags"][1] else 128
++    warps2 = 8 if bn2 == 256 else 4
++    r = m * 16
++    w13, s13, w2, s2 = packed
++    sorted_ids, expert_ids, total = _alignment(ids, bm, 896)
++    cap = min(
++        triton.cdiv(sorted_ids.numel(), bm), min(896, r) + (r - min(896, r)) // bm
++    )
++    down = torch.empty((r, 3584), dtype=torch.bfloat16, device=x.device)
++    gate_up = down.view(-1)[: r * 192].view(r, 192)
++    activated = torch.empty((r, 96), dtype=torch.bfloat16, device=x.device)
++    out = torch.empty_like(x)
++    first = _paired_arithmetic_mm[(cap * 3,)](
++        x,
++        w13,
++        s13,
++        gate_up,
++        sorted_ids,
++        expert_ids,
++        total,
++        192,
++        3584,
++        cap * bm,
++        r,
++        16,
++        bm,
++        64,
++        bk1,
++        1,
++        PACK_K=128,
++        MODE=2 if prepared["normal_flags"][0] else 1,
++        num_warps=warps1,
++        num_stages=2,
++    )
++    _situ[(triton.cdiv(r * 96, 256),)](
++        gate_up,
++        activated,
++        r * 96,
++        96,
++        4.0,
++        25.0,
++        256,
++        num_warps=4,
++        enable_fp_fusion=False,
++    )
++    second = _paired_arithmetic_mm[(cap * triton.cdiv(3584, bn2),)](
++        activated,
++        w2,
++        s2,
++        down,
++        sorted_ids,
++        expert_ids,
++        total,
++        3584,
++        96,
++        cap * bm,
++        r,
++        1,
++        bm,
++        bn2,
++        32,
++        1,
++        PACK_K=32,
++        MODE=2 if prepared["normal_flags"][1] else 1,
++        num_warps=warps2,
++        num_stages=2,
++    )
++    if 512 <= m <= 4096 and runtime.device.vendor_name == "metax":
++        combine_prefill(down, weights, out)
++    else:
++        _weighted_sum[(m, 14)](
++            down, weights, out, 3584, 16, 16, 256, num_warps=4, enable_fp_fusion=False
++        )
++    if record is not None:
++        record.update(
++            G1=meta(first),
++            G2=meta(second),
++            bm=bm,
++            bk1=bk1,
++            bn2=bn2,
++            normal_flags=prepared["normal_flags"],
++            programs_G2=cap * triton.cdiv(3584, bn2),
++            persistent=False,
++        )
++    return out
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/prefill_combine.py
+@@ -0,0 +1,60 @@
++"""Preserve the inspected C256/W4 reduction tree while widening the output tile.
++The frozen reference first adds row-bit3, then0, then2, then1.
++Explicit FP32 adds avoid a layout-dependent tl.sum rewrite.
++"""
++
++import triton, triton.language as tl
++from triton.language.extra import libdevice
++
++
++@triton.jit
++def _term(X, W, t, col, s, H: tl.constexpr):
++    v = tl.load(X + (t * 16 + s) * H + col, col < H, 0).to(tl.float32)
++    w = tl.load(W + t * 16 + s).to(tl.float32)
++    product = libdevice.mul_rn(v, w)
++    return tl.where(product == 0, 0.0, product)
++
++
++@triton.jit
++def _four(X, W, t, col, s, H: tl.constexpr, B0: tl.constexpr, B1: tl.constexpr):
++    return (_term(X, W, t, col, s, H) + _term(X, W, t, col, s + (1 << B0), H)) + (
++        _term(X, W, t, col, s + (1 << B1), H)
++        + _term(X, W, t, col, s + (1 << B0) + (1 << B1), H)
++    )
++
++
++@triton.jit
++def _combine_prefill(
++    X,
++    W,
++    Y,
++    H: tl.constexpr,
++    C: tl.constexpr,
++    B0: tl.constexpr = 3,
++    B1: tl.constexpr = 0,
++    B2: tl.constexpr = 2,
++    B3: tl.constexpr = 1,
++):
++    t = tl.program_id(0)
++    col = tl.program_id(1) * C + tl.arange(0, C)
++    a = _four(X, W, t, col, 0, H, B0, B1) + _four(X, W, t, col, 1 << B2, H, B0, B1)
++    b = _four(X, W, t, col, 1 << B3, H, B0, B1) + _four(
++        X, W, t, col, (1 << B2) + (1 << B3), H, B0, B1
++    )
++    z = a + b
++    tl.store(Y + t * H + col, z.to(tl.bfloat16), col < H)
++
++
++def combine_prefill(route_output, weights, output):
++    """Caller guarantees current K3 BF16 route output, FP32 weights and H3584/top16."""
++    m = output.shape[0]
++    return _combine_prefill[(m, 1)](
++        route_output,
++        weights,
++        output,
++        3584,
++        4096,
++        num_warps=8,
++        num_stages=1,
++        enable_fp_fusion=False,
++    )
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/mla_decode_b2.py
+@@ -0,0 +1,404 @@
++"""Selective B2 split-K decode; old arithmetic retained outside257..4096KV."""
++
++import torch, triton
++import triton.language as tl
++from flaggems_vllm.ops.kimi_k3_metax.mla_staged_packing import _pv_fold_kernel
++
++
++@triton.jit
++def _qk_b2_scores_kernel(
++    Q_ptr,
++    stride_q_b,
++    stride_q_sq,
++    stride_q_h,
++    KV_cache,
++    stride_kv_bs,
++    stride_kv_block,
++    Block_table,
++    stride_bt_b,
++    Seq_lens,
++    Out,
++    stride_o_b,
++    stride_o_sq,
++    stride_o_h,
++    LSE,
++    PartialMax,
++    PartialSum,
++    ProbabilityLow,
++    Alpha,
++    Scores,
++    MAX_CHUNKS: tl.constexpr,
++    SPLITS: tl.constexpr,
++    stride_lse_b,
++    stride_lse_h,
++    sm_scale,
++    SQ,
++    HQ: tl.constexpr,
++    DQK: tl.constexpr,
++    HEAD_DIM_V: tl.constexpr,
++    PAGE_SIZE: tl.constexpr,
++    HAVE_CAUSAL: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    K_TILE: tl.constexpr,
++    CAP: tl.constexpr,
++):
++    """
++    Dense decode kernel with paged attention and online softmax.
++    Grid: (ceil(HQ / BLOCK_H), batch_size * seq_q)
++    """
++    split = tl.program_id(2)
++    pid_h_block = tl.program_id(0)
++    pid_b_sq = tl.program_id(1)
++    i_b = pid_b_sq // SQ
++    i_sq = pid_b_sq % SQ
++    guard_length = tl.load(Seq_lens + i_b)
++    if (guard_length <= 256) | (guard_length > CAP):
++        return
++
++    cur_head = pid_h_block * BLOCK_H + tl.arange(0, BLOCK_H)
++    mask_head = cur_head < HQ
++
++    offs_d_pe = tl.arange(HEAD_DIM_V, DQK)
++    offs_q_pe = (
++        i_b * stride_q_b
++        + i_sq * stride_q_sq
++        + cur_head[:, None] * stride_q_h
++        + offs_d_pe[None, :]
++    )
++    q_pe = tl.load(Q_ptr + offs_q_pe, mask=mask_head[:, None], other=0.0)
++
++    # Online softmax accumulators
++    e_max = tl.full([BLOCK_H], value=float("-inf"), dtype=tl.float32)
++    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
++
++    cur_batch_seq_len = guard_length
++    Block_table += i_b * stride_bt_b
++
++    blocks_per_split = tl.cdiv(tl.cdiv(cur_batch_seq_len, BLOCK_N), SPLITS)
++    first = split * blocks_per_split * BLOCK_N
++    end = tl.minimum((split + 1) * blocks_per_split * BLOCK_N, cur_batch_seq_len)
++    count = tl.maximum(end - first, 0)
++    offs_n = first + tl.arange(0, BLOCK_N)
++    loop_time = count // BLOCK_N
++    remainder = count % BLOCK_N
++
++    for i in range(0, loop_time):
++        kv_page_number = tl.load(Block_table + offs_n // PAGE_SIZE)
++        kv_offset = (
++            kv_page_number.to(tl.int64) * stride_kv_block
++            + (offs_n % PAGE_SIZE).to(tl.int64) * stride_kv_bs
++        )
++
++        qk = tl.zeros((BLOCK_H, BLOCK_N), tl.float32)
++        for kd in range(0, HEAD_DIM_V, K_TILE):
++            col = kd + tl.arange(0, K_TILE)
++            qa = tl.load(
++                Q_ptr
++                + i_b * stride_q_b
++                + i_sq * stride_q_sq
++                + cur_head[:, None] * stride_q_h
++                + col[None, :],
++                mask_head[:, None] & (col[None, :] < HEAD_DIM_V),
++                0,
++            )
++            kb = tl.load(
++                KV_cache + kv_offset[None, :] + col[:, None],
++                (col[:, None] < HEAD_DIM_V) & tl.full((1, BLOCK_N), True, tl.int1),
++                0,
++            )
++            qk = tl.dot(qa, kb, qk)
++
++        # Add RoPE contribution
++        offs_k_pe = kv_offset[None, :] + offs_d_pe[:, None]
++        k_pe = tl.load(KV_cache + offs_k_pe)
++        qk += tl.dot(q_pe, k_pe)
++        qk *= sm_scale
++        score_offsets = (i_b * HQ + cur_head[:, None]) * CAP + offs_n[None, :]
++        tl.store(
++            Scores + score_offsets,
++            qk,
++            mask_head[:, None] & (offs_n[None, :] < cur_batch_seq_len),
++        )
++
++        # Online softmax update
++        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
++        re_scale = tl.exp(e_max - n_e_max)
++        p = tl.exp(qk - n_e_max[:, None])
++        probability_hi = p.to(tl.bfloat16)
++        probability_lo = (p - probability_hi.to(tl.float32)).to(tl.bfloat16)
++        chunk_slot = (((i_b * SPLITS + split) * HQ + cur_head) * MAX_CHUNKS + i).to(
++            tl.int64
++        )
++        column = tl.arange(0, BLOCK_N)
++        tl.store(
++            Out + chunk_slot[:, None] * BLOCK_N + column[None, :],
++            probability_hi,
++            mask_head[:, None],
++        )
++        tl.store(
++            ProbabilityLow + chunk_slot[:, None] * BLOCK_N + column[None, :],
++            probability_lo,
++            mask_head[:, None],
++        )
++        tl.store(Alpha + chunk_slot, re_scale, mask_head)
++        e_sum = e_sum * re_scale + tl.sum(p, 1)
++        e_max = n_e_max
++        offs_n += BLOCK_N
++
++    if remainder:
++        mask_kvsplit = offs_n < cur_batch_seq_len
++        kv_page_number = tl.load(
++            Block_table + offs_n // PAGE_SIZE, mask=mask_kvsplit, other=0
++        )
++        kv_offset = (
++            kv_page_number.to(tl.int64) * stride_kv_block
++            + (offs_n % PAGE_SIZE).to(tl.int64) * stride_kv_bs
++        )
++
++        qk = tl.zeros((BLOCK_H, BLOCK_N), tl.float32)
++        for kd in range(0, HEAD_DIM_V, K_TILE):
++            col = kd + tl.arange(0, K_TILE)
++            qa = tl.load(
++                Q_ptr
++                + i_b * stride_q_b
++                + i_sq * stride_q_sq
++                + cur_head[:, None] * stride_q_h
++                + col[None, :],
++                mask_head[:, None] & (col[None, :] < HEAD_DIM_V),
++                0,
++            )
++            kb = tl.load(
++                KV_cache + kv_offset[None, :] + col[:, None],
++                (col[:, None] < HEAD_DIM_V) & mask_kvsplit[None, :],
++                0,
++            )
++            qk = tl.dot(qa, kb, qk)
++
++        offs_k_pe = kv_offset[None, :] + offs_d_pe[:, None]
++        k_pe = tl.load(KV_cache + offs_k_pe, mask=mask_kvsplit[None, :], other=0.0)
++        qk += tl.dot(q_pe, k_pe)
++        qk *= sm_scale
++        score_offsets = (i_b * HQ + cur_head[:, None]) * CAP + offs_n[None, :]
++        tl.store(
++            Scores + score_offsets,
++            qk,
++            mask_head[:, None] & (offs_n[None, :] < cur_batch_seq_len),
++        )
++
++        qk = tl.where(mask_kvsplit[None, :], qk, float("-inf"))
++
++        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
++        re_scale = tl.exp(e_max - n_e_max)
++        p = tl.exp(qk - n_e_max[:, None])
++        probability_hi = p.to(tl.bfloat16)
++        probability_lo = (p - probability_hi.to(tl.float32)).to(tl.bfloat16)
++        chunk_slot = (
++            ((i_b * SPLITS + split) * HQ + cur_head) * MAX_CHUNKS + loop_time
++        ).to(tl.int64)
++        column = tl.arange(0, BLOCK_N)
++        tl.store(
++            Out + chunk_slot[:, None] * BLOCK_N + column[None, :],
++            probability_hi,
++            mask_head[:, None],
++        )
++        tl.store(
++            ProbabilityLow + chunk_slot[:, None] * BLOCK_N + column[None, :],
++            probability_lo,
++            mask_head[:, None],
++        )
++        tl.store(Alpha + chunk_slot, re_scale, mask_head)
++        e_sum = e_sum * re_scale + tl.sum(p, 1)
++        e_max = n_e_max
++
++    # Keep unnormalized accumulators/statistics in FP32 for the merge.
++    slot = ((i_b * SQ + i_sq) * SPLITS + split) * HQ + cur_head
++    tl.store(PartialMax + slot, e_max, mask_head)
++    tl.store(PartialSum + slot, e_sum, mask_head)
++
++
++@triton.jit
++def _lse_from_scores(Scores, Lengths, LSE, H: tl.constexpr, CAP: tl.constexpr):
++    b = tl.program_id(0)
++    length = tl.load(Lengths + b)
++    if (length <= 256) | (length > CAP):
++        return
++    heads = tl.arange(0, 16)
++    n = tl.arange(0, 16)
++    valid = heads < H
++    maximum = tl.full((16,), -float("inf"), tl.float32)
++    denominator = tl.zeros((16,), tl.float32)
++    for step in range(tl.cdiv(length, 16)):
++        pos = step * 16 + n
++        qk = tl.load(
++            Scores + (b * H + heads[:, None]) * CAP + pos[None, :],
++            valid[:, None] & (pos[None, :] < length),
++            -float("inf"),
++        )
++        next_max = tl.maximum(tl.max(qk, 1), maximum)
++        rescale = tl.exp(maximum - next_max)
++        p = tl.exp(qk - next_max[:, None])
++        denominator = denominator * rescale + tl.sum(p, 1)
++        maximum = next_max
++    tl.store(LSE + b * H + heads, maximum + tl.math.log(denominator), valid)
++
++
++from flaggems_vllm.ops.kimi_k3_metax import mla_decode
++
++
++@triton.jit
++def _partition_b2_lengths(L, Old, New, CAP: tl.constexpr):
++    i = tl.arange(0, 2)
++    n = tl.load(L + i)
++    use = (n > 256) & (n <= CAP)
++    tl.store(Old + i, tl.where(use, 0, n))
++    tl.store(New + i, tl.where(use, n, 0))
++
++
++def try_run(q, cache, table, lengths, out, lse, *, softmax_scale, causal, record=None):
++    # Called behind the existing K3 dtype/layout/scale guard. All other batches
++    # retain the exact previous dispatcher and issue no additional GPU launches.
++    if q.shape != (2, 1, 3, 576) or table.shape[1] <= 1 or softmax_scale != 192**-0.5:
++        return False
++    if out.untyped_storage().data_ptr() in {
++        x.untyped_storage().data_ptr() for x in (q, cache, table, lengths)
++    }:
++        return False
++    splits = 32
++    cap = min(4096, table.shape[1] * 256)
++    b = 2
++    h = 3
++    old_lengths = torch.empty_like(lengths)
++    new_lengths = torch.empty_like(lengths)
++    part = _partition_b2_lengths[(1,)](
++        lengths, old_lengths, new_lengths, cap, num_warps=1
++    )
++    mla_decode.run(
++        q,
++        cache,
++        table,
++        old_lengths,
++        out,
++        lse,
++        softmax_scale=softmax_scale,
++        causal=causal,
++    )
++    max_chunks = triton.cdiv(triton.cdiv(cap, 16), splits)
++    ph = torch.empty(
++        (b, splits, h, max_chunks, 16), dtype=torch.bfloat16, device=q.device
++    )
++    pl = torch.empty_like(ph)
++    alpha = torch.empty(
++        (b, splits, h, max_chunks), dtype=torch.float32, device=q.device
++    )
++    pm = torch.empty((b, splits, h), dtype=torch.float32, device=q.device)
++    ps = torch.empty_like(pm)
++    partial = torch.empty((b, splits, h, 512), dtype=torch.float32, device=q.device)
++    scores = torch.empty((b, h, cap), dtype=torch.float32, device=q.device)
++    qo = _qk_b2_scores_kernel[(1, b, splits)](
++        q,
++        *q.stride()[:3],
++        cache,
++        cache.stride(1),
++        cache.stride(0),
++        table,
++        table.stride(0),
++        new_lengths,
++        ph,
++        0,
++        0,
++        0,
++        lse,
++        pm,
++        ps,
++        pl,
++        alpha,
++        scores,
++        max_chunks,
++        splits,
++        0,
++        0,
++        192**-0.5,
++        1,
++        h,
++        576,
++        512,
++        256,
++        causal,
++        16,
++        16,
++        64,
++        cap,
++        num_warps=2,
++        num_stages=1,
++    )
++    po = _pv_fold_kernel[(b, splits)](
++        cache,
++        cache.stride(1),
++        cache.stride(0),
++        table,
++        table.stride(0),
++        new_lengths,
++        ph,
++        pl,
++        alpha,
++        partial,
++        h,
++        splits,
++        max_chunks,
++        16,
++        4,
++        cap,
++        num_warps=2,
++        num_stages=1,
++    )
++    mo = mla_decode._merge_splits[(b, h)](
++        partial,
++        pm,
++        ps,
++        out,
++        lse,
++        new_lengths,
++        b,
++        h,
++        512,
++        splits,
++        triton.next_power_of_2(splits),
++        num_warps=4,
++        enable_fp_fusion=False,
++    )
++    # Reuse parallel FP32 scores; only the light sequential statistics remain.
++    slse = _lse_from_scores[(b,)](scores, new_lengths, lse, h, cap, num_warps=4)
++    if record is not None:
++
++        def md(k):
++            return {
++                "n_regs": k.n_regs,
++                "n_spills": k.n_spills,
++                "shared": k.metadata.shared,
++            }
++
++        record.update(
++            qk=md(qo),
++            pv=md(po),
++            merge=md(mo),
++            partition=md(part),
++            sequential_lse=md(slse),
++            splits=splits,
++            cap=cap,
++            workspace_bytes=sum(
++                x.numel() * x.element_size()
++                for x in (
++                    old_lengths,
++                    new_lengths,
++                    ph,
++                    pl,
++                    alpha,
++                    pm,
++                    ps,
++                    partial,
++                    scores,
++                )
++            ),
++        )
++    return True
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/ep_experts.py
+@@ -0,0 +1,128 @@
++"""Device-side routing, SiTU and FP32 combine for the packed EP expert path."""
++
++import torch
++import triton
++import triton.language as tl
++from flag_gems.utils import tl_extra_shim
++from flaggems_vllm.ops.moe_align_block_size import (
++    moe_align_block_size_no_tle,
++    moe_align_block_size_singleton,
++)
++
++_tanh = tl_extra_shim.tanh
++_exp2 = tl_extra_shim.exp2
++
++
++@triton.jit
++def _weighted_sum(
++    ROUTE_OUTPUT,
++    WEIGHTS,
++    OUTPUT,
++    IDS,
++    EXPERT_MAP,
++    USE_EP: tl.constexpr,
++    H: tl.constexpr,
++    TOPK: tl.constexpr,
++    RT: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    token = tl.program_id(0)
++    columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    slots = tl.arange(0, RT)
++    valid_slot = slots < TOPK
++    if USE_EP:
++        expert = tl.load(IDS + token * TOPK + slots, valid_slot, 0).to(tl.int64)
++        local_expert = tl.load(EXPERT_MAP + expert, valid_slot, -1)
++        valid_slot = valid_slot & (local_expert >= 0)
++    values = tl.load(
++        ROUTE_OUTPUT + (token * TOPK + slots[:, None]) * H + columns[None, :],
++        valid_slot[:, None] & (columns[None, :] < H),
++        0,
++    ).to(tl.float32)
++    weights = tl.load(WEIGHTS + token * TOPK + slots, slots < TOPK, 0).to(tl.float32)
++    result = tl.sum(values * weights[:, None], axis=0)
++    # EP keeps partial route sums in FP32 until the cross-rank combine.
++    tl.store(OUTPUT + token * H + columns, result, columns < H)
++
++
++def _alignment(ids, block_m, experts):
++    if ids.shape[0] == 1:
++        return moe_align_block_size_singleton(ids, block_m)
++    # Padding is for routing metadata only. It lets the existing vectorized
++    # prefix-scan run for E=896; no weight matrix or model expert is added.
++    metadata_experts = triton.next_power_of_2(experts)
++    return moe_align_block_size_no_tle(ids, block_m, metadata_experts)
++
++
++@triton.jit
++def _map_local_experts(
++    IDS,
++    EXPERT_MAP,
++    LOCAL_IDS,
++    ROUTES: tl.constexpr,
++    REMOTE_EXPERT: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    experts = tl.load(IDS + offsets, offsets < ROUTES, 0).to(tl.int64)
++    local = tl.load(EXPERT_MAP + experts, offsets < ROUTES, -1)
++    tl.store(
++        LOCAL_IDS + offsets,
++        tl.where(local >= 0, local, REMOTE_EXPERT),
++        offsets < ROUTES,
++    )
++
++
++@triton.jit
++def _situ_local(
++    GATE_UP,
++    ACTIVATED,
++    SORTED,
++    EXPERTS,
++    TOTAL,
++    ROUTES: tl.constexpr,
++    LOCAL_EXPERTS: tl.constexpr,
++    I: tl.constexpr,
++    BM: tl.constexpr,
++    BN: tl.constexpr,
++    BETA: tl.constexpr,
++    LINEAR_BETA: tl.constexpr,
++):
++    row_block = tl.program_id(0)
++    if row_block * BM >= tl.load(TOTAL):
++        return
++    expert = tl.load(EXPERTS + row_block)
++    if expert < 0 or expert >= LOCAL_EXPERTS:
++        return
++    rows = tl.load(SORTED + row_block * BM + tl.arange(0, BM))
++    columns = tl.program_id(1) * BN + tl.arange(0, BN)
++    valid = (rows[:, None] < ROUTES) & (columns[None, :] < I)
++    gate = tl.load(GATE_UP + rows[:, None] * (2 * I) + columns[None, :], valid, 0).to(
++        tl.float32
++    )
++    up = tl.load(GATE_UP + rows[:, None] * (2 * I) + I + columns[None, :], valid, 0).to(
++        tl.float32
++    )
++    sigmoid = 1.0 / (1.0 + _exp2(-gate * 1.4426950408889634))
++    gate = BETA * _tanh(gate / BETA) * sigmoid
++    if LINEAR_BETA > 0:
++        up = LINEAR_BETA * _tanh(up / LINEAR_BETA)
++    result = tl.fma(gate, up, 0.0).to(tl.bfloat16)
++    tl.store(ACTIVATED + rows[:, None] * I + columns[None, :], result, valid)
++
++
++def _local_alignment(ids, expert_map, block_m, local_experts):
++    # FGV's four-stage aligner requires nonnegative IDs. Consolidate all
++    # remote routes into one final metadata-only bucket; no extra weight exists.
++    metadata_experts = triton.next_power_of_2(local_experts + 1)
++    local_ids = torch.empty_like(ids, dtype=torch.int32)
++    _map_local_experts[(triton.cdiv(ids.numel(), 256),)](
++        ids,
++        expert_map,
++        local_ids,
++        ids.numel(),
++        metadata_experts - 1,
++        256,
++        num_warps=4,
++    )
++    return _alignment(local_ids, block_m, metadata_experts)
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/mla_tp8.py
+@@ -0,0 +1,252 @@
++"""TP8 MLA decode:12query heads,page768,staged BF16QK/PV and FP32merge."""
++
++import torch
++import triton
++import triton.language as tl
++from flaggems_vllm.ops.kimi_k3_metax.mla4k_long import (
++    _qk_long_kernel,
++    _merge_long_kernel,
++)
++
++
++@triton.jit
++def _pv_tp8(
++    Cache,
++    ST,
++    SB,
++    Table,
++    STB,
++    Lengths,
++    PH,
++    PL,
++    Alpha,
++    Partial,
++    H: tl.constexpr,
++    SPLITS: tl.constexpr,
++    CHUNKS: tl.constexpr,
++    PAGE: tl.constexpr,
++    CAP: tl.constexpr,
++    BN: tl.constexpr,
++    VT: tl.constexpr,
++    SHORT_SPLITS: tl.constexpr = 0,
++    SHORT_LIMIT: tl.constexpr = 4096,
++):
++    b = tl.program_id(0)
++    part = tl.program_id(1)
++    tile = tl.program_id(2)
++    length = tl.load(Lengths + b)
++    if (length <= 0) | (length > CAP):
++        return
++    h = tl.arange(0, 16)
++    d = tile * VT + tl.arange(0, VT)
++    n = tl.arange(0, BN)
++    if SHORT_SPLITS > 0:
++        active = tl.where(length <= SHORT_LIMIT, SHORT_SPLITS, SPLITS)
++        if part >= active:
++            return
++        blocks = tl.where(
++            length <= SHORT_LIMIT,
++            tl.cdiv(tl.cdiv(length, BN), SHORT_SPLITS),
++            tl.cdiv(tl.cdiv(length, BN), SPLITS),
++        )
++    else:
++        blocks = tl.cdiv(tl.cdiv(length, BN), SPLITS)
++    start = part * blocks * BN
++    end = tl.minimum((part + 1) * blocks * BN, length)
++    chunks = tl.cdiv(tl.maximum(end - start, 0), BN)
++    acc = tl.zeros((16, VT), tl.float32)
++    for step in range(chunks):
++        pos = start + step * BN + n
++        valid = pos < length
++        page = tl.load(Table + b * STB + pos // PAGE, valid, 0).to(tl.int64)
++        offset = page * SB + (pos % PAGE) * ST
++        value = tl.load(Cache + offset[:, None] + d[None, :], valid[:, None], 0)
++        slot = (((b * SPLITS + part) * H + h) * CHUNKS + step).to(tl.int64)
++        hi = tl.load(PH + slot[:, None] * BN + n[None, :], h[:, None] < H, 0)
++        lo = tl.load(PL + slot[:, None] * BN + n[None, :], h[:, None] < H, 0)
++        alpha = tl.load(Alpha + slot, h < H, 0)
++        acc = acc * alpha[:, None]
++        acc = tl.dot(hi, value, acc)
++        acc = tl.dot(lo, value, acc)
++    tl.store(
++        Partial + ((b * SPLITS + part) * H + h[:, None]) * 512 + d[None, :],
++        acc,
++        h[:, None] < H,
++    )
++
++
++def can_use(q, cache, table, lengths):
++    return (
++        q.ndim == 4
++        and 1 <= q.shape[0] <= 64
++        and q.shape[1:] == (1, 12, 576)
++        and cache.ndim == 4
++        and cache.shape[1:] == (768, 1, 576)
++        and table.ndim == 2
++        and table.shape[0] == q.shape[0]
++        and table.stride(-1) == 1
++        and lengths.shape == (q.shape[0],)
++        and lengths.is_contiguous()
++        and q.dtype == cache.dtype == torch.bfloat16
++        and table.dtype == lengths.dtype == torch.int32
++        and q.is_cuda
++        and all(t.device == q.device for t in (cache, table, lengths))
++        and q.stride(-1) == cache.stride(-1) == 1
++    )
++
++
++def run(
++    q,
++    cache,
++    table,
++    lengths,
++    scale,
++    record=None,
++    *,
++    pv_vt=128,
++    pv_warps=4,
++    merge_vt=128,
++    merge_warps=4,
++    qk_tile=None,
++    qk_warps=None,
++    short_splits=None,
++    short_limit=None,
++):
++    if not can_use(q, cache, table, lengths) or scale != 192**-0.5:
++        raise ValueError("TP8 MLA requires qualified12head/page768 layout")
++    if pv_vt not in (64, 128, 256, 512) or merge_vt not in (64, 128, 256, 512):
++        raise ValueError("Invalid V tile")
++    b = q.shape[0]
++    h = 12
++    splits = 64 if b >= 4 else 128
++    if qk_tile is None:
++        qk_tile = 128 if b in (1, 2, 4, 8) else 64
++    if qk_warps is None:
++        qk_warps = 4 if b in (1, 2, 4, 8) else 2
++    if short_splits is None:
++        short_splits = 64 if b == 2 else 32 if 4 <= b <= 16 else 0
++    if short_limit is None:
++        short_limit = 5120 if b == 8 else 1024 if b == 4 else 2048
++    if short_limit not in (1024, 2048, 5120):
++        raise ValueError("Unqualified short KV boundary")
++    cap = min(69632, table.shape[1] * 768)
++    chunks = triton.cdiv(triton.cdiv(cap, 16), splits)
++    if short_splits:
++        if short_splits not in (8, 16, 32, 64) or short_splits > splits:
++            raise ValueError("Invalid short partition count")
++        chunks = max(
++            chunks, triton.cdiv(triton.cdiv(min(cap, short_limit), 16), short_splits)
++        )
++    out = torch.empty((b, 1, h, 512), device=q.device, dtype=q.dtype)
++    lse = torch.empty((b, h, 1), device=q.device, dtype=torch.float32)
++    ph = torch.empty((b, splits, h, chunks, 16), device=q.device, dtype=torch.bfloat16)
++    pl = torch.empty_like(ph)
++    alpha = torch.empty((b, splits, h, chunks), device=q.device, dtype=torch.float32)
++    pm = torch.empty((b, splits, h), device=q.device, dtype=torch.float32)
++    ps = torch.empty_like(pm)
++    partial = torch.empty((b, splits, h, 512), device=q.device, dtype=torch.float32)
++    qk = _qk_long_kernel[(1, b, splits)](
++        q,
++        *q.stride()[:3],
++        cache,
++        cache.stride(1),
++        cache.stride(0),
++        table,
++        table.stride(0),
++        lengths,
++        ph,
++        0,
++        0,
++        0,
++        lse,
++        pm,
++        ps,
++        pl,
++        alpha,
++        chunks,
++        splits,
++        0,
++        0,
++        scale,
++        1,
++        h,
++        576,
++        512,
++        768,
++        False,
++        16,
++        16,
++        qk_tile,
++        cap,
++        True,
++        MIN_LENGTH=0,
++        SHORT_SPLITS=short_splits,
++        SHORT_LIMIT=short_limit,
++        num_warps=qk_warps,
++        num_stages=1,
++    )
++    pv = _pv_tp8[(b, splits, 512 // pv_vt)](
++        cache,
++        cache.stride(1),
++        cache.stride(0),
++        table,
++        table.stride(0),
++        lengths,
++        ph,
++        pl,
++        alpha,
++        partial,
++        h,
++        splits,
++        chunks,
++        768,
++        cap,
++        16,
++        pv_vt,
++        SHORT_SPLITS=short_splits,
++        SHORT_LIMIT=short_limit,
++        num_warps=pv_warps,
++        num_stages=1,
++    )
++    merge = _merge_long_kernel[(b, h, 512 // merge_vt)](
++        partial,
++        pm,
++        ps,
++        out,
++        lse,
++        lengths,
++        lengths,
++        b,
++        h,
++        512,
++        splits,
++        splits,
++        merge_vt,
++        MIN_LENGTH=0,
++        SHORT_SPLITS=short_splits,
++        SHORT_LIMIT=short_limit,
++        num_warps=merge_warps,
++        enable_fp_fusion=False,
++    )
++    if record is not None:
++        record.update(
++            heads=h,
++            page=768,
++            splits=splits,
++            qk_tile=qk_tile,
++            qk_warps=qk_warps,
++            short_splits=short_splits,
++            short_limit=short_limit,
++            workspace_bytes=sum(
++                t.numel() * t.element_size() for t in (ph, pl, alpha, pm, ps, partial)
++            ),
++            kernels={
++                name: {
++                    "n_regs": k.n_regs,
++                    "n_spills": k.n_spills,
++                    "shared": k.metadata.shared,
++                }
++                for name, k in [("qk", qk), ("pv", pv), ("merge", merge)]
++            },
++        )
++    return out, lse
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/ep_packed.py
+@@ -0,0 +1,189 @@
++"""Lossless EP14 word packing and the already-qualified paired BF16 decoder."""
++
++import torch, triton
++from flaggems_vllm.ops.kimi_k3_metax.marlin_mxfp4 import pack_matrix
++from flaggems_vllm.ops.kimi_k3_metax.expert_gemm import _paired_arithmetic_mm
++from flaggems_vllm.ops.kimi_k3_metax.ep_experts import (
++    _local_alignment,
++    _situ_local,
++    _weighted_sum,
++)
++from flaggems_vllm.ops.kimi_k3_metax.ep_decode_routes import align as align_decode
++
++
++def prepare(w13, s13, w2, s2):
++    if torch.cuda.is_current_stream_capturing():
++        raise RuntimeError("Pack immutable expert weights before Graph capture")
++    shapes = ((14, 6144, 1792), (14, 6144, 112), (14, 3584, 1536), (14, 3584, 96))
++    tensors = (w13, s13, w2, s2)
++    if any(
++        tuple(t.shape) != shape
++        or t.dtype != torch.uint8
++        or not t.is_contiguous()
++        or t.device != w13.device
++        for t, shape in zip(tensors, shapes)
++    ):
++        raise ValueError("Expected checkpoint-native EP14 full experts")
++    ranges = [(int(s.min().item()), int(s.max().item())) for s in (s13, s2)]
++    if any(hi == 255 for lo, hi in ranges):
++        raise ValueError("Non-finite E8M0 scale")
++    a, sa = pack_matrix(w13, s13, 32)
++    b, sb = pack_matrix(w2, s2, 32)
++    packed = (a, sa, b, sb)
++    before = sum(t.numel() * t.element_size() for t in tensors)
++    after = sum(t.numel() * t.element_size() for t in packed)
++    assert before == after
++    return packed, {
++        "normal_flags": [lo >= 2 and hi <= 252 for lo, hi in ranges],
++        "scale_ranges": ranges,
++        "resident_bytes": after,
++        "storage_tile": 32,
++    }
++
++
++def run(
++    x, packed, weights, ids, expert_map, prepared, *, bn=128, warps=8, gm=8, record=None
++):
++    m, h = x.shape
++    e = 14
++    i = 3072
++    r = m * 16
++    if h != 3584 or x.dtype != torch.bfloat16 or not x.is_cuda or not x.is_contiguous():
++        raise ValueError("Expected BF16 EP latent tokens")
++    if (
++        tuple(ids.shape) != (m, 16)
++        or ids.dtype not in (torch.int32, torch.int64)
++        or weights.shape != ids.shape
++        or weights.dtype != torch.float32
++    ):
++        raise ValueError("Expected top16 routes")
++    if expert_map.dtype != torch.int32 or tuple(expert_map.shape) != (896,):
++        raise ValueError("Expected canonical global-to-local map")
++    w13, s13, w2, s2 = packed
++    if any(
++        tuple(t.shape) != shape
++        for t, shape in zip(
++            packed, ((14, 448, 6144), (14, 112, 6144), (14, 384, 3584), (14, 96, 3584))
++        )
++    ):
++        raise ValueError("Incorrect packed EP14 dimensions")
++    if (
++        w13.dtype != torch.int32
++        or w2.dtype != torch.int32
++        or any(
++            t.device != x.device or not t.is_contiguous()
++            for t in (*packed, weights, ids, expert_map)
++        )
++    ):
++        raise ValueError("Packed tensors must be contiguous on one device")
++    if bn not in (32, 64, 128) or warps not in (4, 8) or gm not in (1, 4, 8, 16):
++        raise ValueError("Unqualified tile option")
++    if m == 0:
++        return torch.empty_like(x, dtype=torch.float32)
++    bm = 16 if m < 256 else 32 if m < 2048 else 64
++    if m <= 128:
++        # EP decode has few token rows per full expert. Smaller N tiles and
++        # compact local blocks avoid using the prefill launch layout here.
++        bn, warps, gm = 64, 4, 1
++        sorted_ids, expert_ids, total = align_decode(ids, expert_map, bm, e)
++    else:
++        # Keep M tiles unchanged: smaller M tiles lost badly on skewed routes.
++        # These prefill N/warp choices improved both uniform and skewed cases.
++        if 256 <= m < 2048:
++            bn, warps, gm = 64, 4, 8
++        elif 2048 <= m <= 4096:
++            bn, warps, gm = 128, 4, 8
++        sorted_ids, expert_ids, total = _local_alignment(ids, expert_map, bm, e)
++    blocks = triton.cdiv(sorted_ids.numel(), bm)
++    scratch = torch.empty(r * 6144, dtype=torch.bfloat16, device=x.device)
++    up = scratch.view(r, 6144)
++    down = scratch[: r * h].view(r, h)
++    activated = torch.empty((r, i), dtype=torch.bfloat16, device=x.device)
++    out = torch.empty_like(x, dtype=torch.float32)
++    first = _paired_arithmetic_mm[(blocks * triton.cdiv(6144, bn),)](
++        x,
++        w13,
++        s13,
++        up,
++        sorted_ids,
++        expert_ids,
++        total,
++        6144,
++        3584,
++        blocks * bm,
++        r,
++        16,
++        bm,
++        bn,
++        32,
++        gm,
++        PACK_K=32,
++        MODE=2 if prepared["normal_flags"][0] else 1,
++        EXPERT_LIMIT=e,
++        num_warps=warps,
++        num_stages=1,
++    )
++    _situ_local[(blocks, triton.cdiv(i, 128))](
++        up,
++        activated,
++        sorted_ids,
++        expert_ids,
++        total,
++        r,
++        e,
++        i,
++        bm,
++        128,
++        4.0,
++        25.0,
++        num_warps=4,
++        enable_fp_fusion=False,
++    )
++    second = _paired_arithmetic_mm[(blocks * triton.cdiv(h, bn),)](
++        activated,
++        w2,
++        s2,
++        down,
++        sorted_ids,
++        expert_ids,
++        total,
++        h,
++        i,
++        blocks * bm,
++        r,
++        1,
++        bm,
++        bn,
++        32,
++        gm,
++        PACK_K=32,
++        MODE=2 if prepared["normal_flags"][1] else 1,
++        EXPERT_LIMIT=e,
++        num_warps=warps,
++        num_stages=1,
++    )
++    _weighted_sum[(m, triton.cdiv(h, 256))](
++        down,
++        weights,
++        out,
++        ids,
++        expert_map,
++        True,
++        h,
++        16,
++        16,
++        256,
++        num_warps=4,
++        enable_fp_fusion=False,
++    )
++    if record is not None:
++        record.update(
++            bm=bm,
++            G1={"n_regs": first.n_regs, "n_spills": first.n_spills},
++            G2={"n_regs": second.n_regs, "n_spills": second.n_spills},
++            bn=bn,
++            warps=warps,
++            gm=gm,
++            **prepared,
++        )
++    return out
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/mla_bmm.py
+@@ -0,0 +1,85 @@
++"""TP8 MLA Q absorption; original V restoration is retained."""
++
++import torch, triton
++import triton.language as tl
++
++
++@triton.jit
++def mm(
++    A,
++    B,
++    C,
++    M: tl.constexpr,
++    N: tl.constexpr,
++    K: tl.constexpr,
++    AH: tl.constexpr,
++    AM: tl.constexpr,
++    AK: tl.constexpr,
++    BH: tl.constexpr,
++    BKSTR: tl.constexpr,
++    BNSTR: tl.constexpr,
++    CH: tl.constexpr,
++    CM: tl.constexpr,
++    CN: tl.constexpr,
++    BM: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++):
++    h = tl.program_id(2)
++    m = tl.program_id(0) * BM + tl.arange(0, BM)
++    n = tl.program_id(1) * BN + tl.arange(0, BN)
++    rk = tl.arange(0, BK)
++    acc = tl.zeros((BM, BN), tl.float32)
++    for start in range(triton.cdiv(K, BK)):
++        kk = start * BK + rk
++        a = tl.load(
++            A + h * AH + m[:, None] * AM + kk[None, :] * AK,
++            (m[:, None] < M) & (kk[None, :] < K),
++            0,
++        )
++        b = tl.load(
++            B + h * BH + kk[:, None] * BKSTR + n[None, :] * BNSTR,
++            (kk[:, None] < K) & (n[None, :] < N),
++            0,
++        )
++        acc = tl.dot(a, b, acc)
++    tl.store(
++        C + h * CH + m[:, None] * CM + n[None, :] * CN,
++        acc.to(tl.bfloat16),
++        (m[:, None] < M) & (n[None, :] < N),
++    )
++
++
++def project_query(x, w):
++    if not (
++        x.is_cuda
++        and x.ndim == w.ndim == 3
++        and x.shape[0] == 12
++        and 1 <= x.shape[1] <= 16
++        and x.shape[2] == 128
++        and tuple(w.shape) == (12, 128, 512)
++        and x.dtype == w.dtype == torch.bfloat16
++        and x.device == w.device
++        and x.stride(-1) == 1
++    ):
++        return torch.bmm(x, w)
++    b = x.shape[1]
++    out = torch.empty((12, b, 512), dtype=x.dtype, device=x.device)
++    bn, warps = (32, 2) if b == 1 else (64, 4)
++    mm[(1, triton.cdiv(512, bn), 12)](
++        x,
++        w,
++        out,
++        b,
++        512,
++        128,
++        *x.stride(),
++        *w.stride(),
++        *out.stride(),
++        16,
++        bn,
++        64,
++        num_warps=warps,
++        num_stages=1,
++    )
++    return out
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/kda_preprocess.py
+@@ -0,0 +1,93 @@
++"""Materialize KDA FP32 inputs while preserving the legacy BF16 rounding."""
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _prepare(
++    Q,
++    K,
++    V,
++    QF,
++    KF,
++    VF,
++    H: tl.constexpr,
++    QT: tl.constexpr,
++    QH: tl.constexpr,
++    KT: tl.constexpr,
++    KH: tl.constexpr,
++    VT: tl.constexpr,
++    VH: tl.constexpr,
++):
++    row = tl.program_id(0)
++    part = tl.program_id(1)
++    t, h = row // H, row % H
++    d = tl.arange(0, 128)
++    if part == 0:
++        value = tl.load(Q + t * QT + h * QH + d)
++    elif part == 1:
++        value = tl.load(K + t * KT + h * KH + d)
++    else:
++        value = tl.load(V + t * VT + h * VH + d)
++    if part < 2:
++        x = value.to(tl.float64)
++        denominator = tl.sqrt(tl.sum(x * x, 0) + tl.full((), 1e-6, tl.float64))
++        # These two roundings are part of the existing normalization interface.
++        result = (x / denominator).to(tl.float32).to(tl.bfloat16).to(tl.float32)
++    else:
++        result = value.to(tl.float32)
++    if part == 0:
++        tl.store(QF + row * 128 + d, result)
++    elif part == 1:
++        tl.store(KF + row * 128 + d, result)
++    else:
++        tl.store(VF + row * 128 + d, result)
++
++
++def can_prepare(q, k, v):
++    return (
++        q.ndim == 4
++        and q.shape[0] == 1
++        and q.shape[2:] == (12, 128)
++        and 1 <= q.shape[1] <= 512
++        and all(
++            x.shape == q.shape
++            and x.is_cuda
++            and x.device == q.device
++            and x.dtype == torch.bfloat16
++            and x.stride(-1) == 1
++            for x in (q, k, v)
++        )
++    )
++
++
++def prepare(q, k, v, record=None):
++    if not can_prepare(q, k, v):
++        raise ValueError("KDA fused materialization requires BF16 [1,T<=512,12,128]")
++    outputs = tuple(
++        torch.empty(q.shape, device=q.device, dtype=torch.float32) for _ in range(3)
++    )
++    kernel = _prepare[(q.shape[1] * 12, 3)](
++        q,
++        k,
++        v,
++        *outputs,
++        12,
++        q.stride(1),
++        q.stride(2),
++        k.stride(1),
++        k.stride(2),
++        v.stride(1),
++        v.stride(2),
++        num_warps=4,
++        enable_fp_fusion=False,
++    )
++    if record is not None:
++        record.update(
++            n_regs=kernel.n_regs,
++            n_spills=kernel.n_spills,
++            shared=kernel.metadata.shared,
++        )
++    return outputs
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/ep_decode_routes.py
+@@ -0,0 +1,79 @@
++"""Stable local expert alignment, GPU counts, no remote padding bucket."""
++
++import torch, triton
++import triton.language as tl
++
++
++@triton.jit
++def _count(IDS, MAP, COUNTS, R: tl.constexpr, B: tl.constexpr):
++    e = tl.program_id(0)
++    rr = tl.arange(0, B)
++    g = tl.load(IDS + rr, rr < R, 0).to(tl.int64)
++    local = tl.load(MAP + g, rr < R, -1)
++    count = tl.sum(((rr < R) & (local == e)).to(tl.int32), 0)
++    tl.store(COUNTS + e, count)
++
++
++@triton.jit
++def _scatter(
++    IDS,
++    MAP,
++    COUNTS,
++    SORTED,
++    EXPERTS,
++    TOTAL,
++    R: tl.constexpr,
++    CAP: tl.constexpr,
++    BM: tl.constexpr,
++    B: tl.constexpr,
++    E: tl.constexpr,
++):
++    e = tl.program_id(0)
++    ee = tl.arange(0, 16)
++    counts = tl.load(COUNTS + ee, ee < E, 0)
++    padded = tl.cdiv(counts, BM) * BM
++    offset = tl.sum(tl.where(ee < e, padded, 0), 0)
++    count = tl.load(COUNTS + e)
++    size = tl.cdiv(count, BM) * BM
++    if e == 0:
++        tl.store(TOTAL, tl.sum(padded, 0))
++    cc = tl.arange(0, triton.next_power_of_2(CAP))
++    tl.store(SORTED + offset + cc, R, cc < size)
++    tl.debug_barrier()
++    rr = tl.arange(0, B)
++    g = tl.load(IDS + rr, rr < R, 0).to(tl.int64)
++    local = tl.load(MAP + g, rr < R, -1)
++    keep = (rr < R) & (local == e)
++    pos = tl.cumsum(keep.to(tl.int32), 0) - 1
++    tl.store(SORTED + offset + pos, rr, keep)
++    bb = tl.arange(0, triton.next_power_of_2(CAP // BM))
++    tl.store(EXPERTS + offset // BM + bb, e, bb < size // BM)
++
++
++def align(ids, expert_map, bm, e):
++    m = ids.shape[0]
++    r = ids.numel()
++    if ids.shape != (m, 16) or not 1 <= m <= 128:
++        raise ValueError("decode unique top16, 1..128 token rows required")
++    # Unique top-k IDs bound each expert to at most M rows. Counts stay on GPU.
++    cap = triton.cdiv(m, bm) * bm
++    si = torch.empty(e * cap, dtype=torch.int32, device=ids.device)
++    ei = torch.empty(e * cap // bm, dtype=torch.int32, device=ids.device)
++    total = torch.empty(1, dtype=torch.int32, device=ids.device)
++    counts = torch.empty(e, dtype=torch.int32, device=ids.device)
++    _count[e,](ids, expert_map, counts, r, triton.next_power_of_2(r), num_warps=4)
++    _scatter[e,](
++        ids,
++        expert_map,
++        counts,
++        si,
++        ei,
++        total,
++        r,
++        cap,
++        bm,
++        triton.next_power_of_2(r),
++        e,
++        num_warps=4,
++    )
++    return (si, ei, total)
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/tp8_experts.py
+@@ -0,0 +1,301 @@
++"""Ordinary TP8 experts: reuse the TP32 lossless layout and paired FP4 kernels.
++
++TP8 keeps all 896 experts with I384. BF16 GEMM boundaries, FP32 SiTU
++and the existing top16 reduction remain unchanged.
++"""
++
++import torch
++import triton
++from flaggems_vllm.ops.kimi_k3_metax.marlin_mxfp4 import pack_matrix, _marlin_tail_gemv
++from flaggems_vllm.ops.kimi_k3_metax.decode_experts import (
++    _paired_arithmetic_mm,
++    _paired_scheduled_mm,
++    _route_gemv_g2,
++    meta,
++)
++from flaggems_vllm.ops.kimi_k3_metax.grouped_moe import _alignment, _situ, _weighted_sum
++from flaggems_vllm.ops.kimi_k3_metax.small_alignment import align_small
++from flaggems_vllm.ops.kimi_k3_metax.tp8_expert_g1 import _tp8_g1_situ
++
++
++from flaggems_vllm.ops.kimi_k3_metax.workspace_contract import (
++    MIN_PREFILL_TOKENS,
++    MAX_PREFILL_TOKENS,
++    ROUTE_COLUMNS,
++)
++
++
++def prepare(w13, s13, w2, s2):
++    shapes = ((896, 768, 1792), (896, 768, 112), (896, 3584, 192), (896, 3584, 12))
++    values = (w13, s13, w2, s2)
++    if any(
++        tuple(t.shape) != s
++        or t.dtype != torch.uint8
++        or not t.is_contiguous()
++        or t.device != w13.device
++        for t, s in zip(values, shapes)
++    ):
++        raise ValueError("Expected ordinary TP8 I384 checkpoint weights")
++    if torch.cuda.is_current_stream_capturing():
++        raise RuntimeError("Weight preparation must precede Graph capture")
++    ranges = [(int(t.min().item()), int(t.max().item())) for t in (s13, s2)]
++    if any(hi == 255 for lo, hi in ranges):
++        raise ValueError("Nonfinite E8M0 scale")
++    a, sa = pack_matrix(w13, s13, 128)
++    b, sb = pack_matrix(w2, s2, 32)
++    packed = (a, sa, b, sb)
++    assert sum(t.numel() * t.element_size() for t in values) == sum(
++        t.numel() * t.element_size() for t in packed
++    )
++    return packed, {
++        "normal_flags": tuple(lo >= 2 and hi <= 252 for lo, hi in ranges),
++        "scale_ranges": ranges,
++        "pointers": tuple(t.data_ptr() for t in packed),
++        "sms": torch.cuda.get_device_properties(w13.device).multi_processor_count,
++    }
++
++
++def run(x, packed, weights, ids, prepared, record=None, *, tiles=None, workspace=None):
++    m = x.shape[0]
++    if (
++        x.shape != (m, 3584)
++        or x.dtype != torch.bfloat16
++        or ids.shape != (m, 16)
++        or weights.shape != (m, 16)
++        or weights.dtype != torch.float32
++    ):
++        raise ValueError("Expected BF16 H3584 and FP32 top16")
++    if ids.dtype not in (torch.int32, torch.int64) or not all(
++        t.is_contiguous() and t.device == x.device for t in (x, weights, ids, *packed)
++    ):
++        raise ValueError("Expected contiguous tensors on one GPU")
++    if tuple(t.data_ptr() for t in packed) != prepared["pointers"]:
++        raise ValueError("Prepared weight identity changed")
++    if m == 0:
++        return torch.empty_like(x)
++    # Preserve baseline tiles for tails and untuned shapes.
++    # Qualified middle batches select scheduled G2 below.
++    bm = 16 if m < 256 else 32 if m < 2048 else 64
++    bn1, bk1, w1, bn2, w2, tail = (
++        64 if m == 1 else 128,
++        128,
++        4,
++        64 if m <= 8 else 128,
++        4,
++        False,
++    )
++    if tiles is not None:
++        bm, bn1, bk1, w1, bn2, w2, tail = tiles
++    r = m * 16
++    si, ei, total = align_small(ids, bm, 896) if m <= 64 else _alignment(ids, bm, 896)
++    cap = min(triton.cdiv(si.numel(), bm), min(896, r) + (r - min(896, r)) // bm)
++    # Bound the prefill routing scratch; each output column retains the same
++    # FP32 dot, BF16 rounding and top16 reduction as the full-width path.
++    bounded = tiles is None and MIN_PREFILL_TOKENS <= m <= MAX_PREFILL_TOKENS
++    down_width = ROUTE_COLUMNS if bounded else 3584
++    if bounded and not torch.cuda.is_current_stream_capturing():
++        if workspace is None:
++            raise RuntimeError("TP8 prefill requires a reserved model workspace")
++        scratch, arena_act = workspace.get(x.device)
++        act = arena_act[:r]
++    else:
++        scratch = torch.empty(
++            r * max(768, down_width), dtype=torch.bfloat16, device=x.device
++        )
++        act = torch.empty((r, 384), dtype=torch.bfloat16, device=x.device)
++    gu = scratch[: r * 768].view(r, 768)
++    down = scratch[: r * down_width].view(r, down_width)
++    out = torch.empty_like(x)
++    a, sa, b, sb = packed
++    fused_g1 = tiles is None and m in (2, 8, 12, 16, 24, 32)
++    if fused_g1:
++        first = _tp8_g1_situ[(cap * 12,)](
++            x,
++            a,
++            sa,
++            act,
++            si,
++            ei,
++            total,
++            r,
++            prepared["normal_flags"][0],
++            num_warps=2,
++            num_stages=1,
++            enable_fp_fusion=False,
++        )
++    elif tail:
++        first = _marlin_tail_gemv[(r, 192)](
++            x,
++            a,
++            sa,
++            gu,
++            ids,
++            r,
++            768,
++            3584,
++            128,
++            4,
++            512,
++            num_warps=4,
++            num_stages=1,
++            enable_fp_fusion=False,
++        )
++    else:
++        first = _paired_arithmetic_mm[(cap * triton.cdiv(768, bn1),)](
++            x,
++            a,
++            sa,
++            gu,
++            si,
++            ei,
++            total,
++            768,
++            3584,
++            cap * bm,
++            r,
++            16,
++            bm,
++            bn1,
++            bk1,
++            1,
++            PACK_K=128,
++            MODE=2 if prepared["normal_flags"][0] else 1,
++            num_warps=w1,
++            num_stages=2,
++        )
++    if not fused_g1:
++        _situ[(triton.cdiv(r * 384, 256),)](
++            gu, act, r * 384, 384, 4.0, 25.0, 256, num_warps=4, enable_fp_fusion=False
++        )
++    if bounded:
++        slice_meta = []
++        for start in range(0, 3584, down_width):
++            width = min(down_width, 3584 - start)
++            down_part = scratch[: r * width].view(r, width)
++            second = _paired_arithmetic_mm[(cap * triton.cdiv(width, bn2),)](
++                act,
++                b,
++                sb,
++                down_part,
++                si,
++                ei,
++                total,
++                3584,
++                384,
++                cap * bm,
++                r,
++                1,
++                bm,
++                bn2,
++                32,
++                1,
++                PACK_K=32,
++                MODE=2 if prepared["normal_flags"][1] else 1,
++                N_START=start,
++                OUTPUT_N=width,
++                num_warps=w2,
++                num_stages=2,
++            )
++            _weighted_sum[(m, triton.cdiv(width, 256))](
++                down_part,
++                weights,
++                out,
++                3584,
++                16,
++                16,
++                256,
++                ROUTE_H=width,
++                OUTPUT_START=start,
++                num_warps=4,
++                enable_fp_fusion=False,
++            )
++            if record is not None:
++                slice_meta.append(meta(second))
++        if record is not None:
++            record.update(
++                G1=meta(first),
++                G2=meta(second),
++                G2_slices=slice_meta,
++                G1_fused_situ=fused_g1,
++                tiles=(bm, bn1, bk1, w1, bn2, w2, tail),
++                bounded_route_columns=down_width,
++                scratch_bytes=scratch.numel() * 2,
++            )
++        return out
++    if tail:
++        programs = min(r * 56, prepared["sms"] * 16)
++        second = _route_gemv_g2[(programs,)](
++            act,
++            b,
++            sb,
++            down,
++            ids,
++            r,
++            3584,
++            64,
++            programs,
++            prepared["normal_flags"][1],
++            K=384,
++            num_warps=1,
++            num_stages=1,
++            enable_fp_fusion=False,
++        )
++    elif tiles is None and m in (12, 16, 24, 32):
++        programs = min(cap * 56, prepared["sms"] * 48)
++        second = _paired_scheduled_mm[(programs,)](
++            act,
++            b,
++            sb,
++            down,
++            si,
++            ei,
++            total,
++            3584,
++            384,
++            r,
++            1,
++            16,
++            64,
++            32,
++            1,
++            programs,
++            False,
++            0,
++            2 if prepared["normal_flags"][1] else 1,
++            num_warps=4,
++            num_stages=2,
++        )
++    else:
++        second = _paired_arithmetic_mm[(cap * triton.cdiv(3584, bn2),)](
++            act,
++            b,
++            sb,
++            down,
++            si,
++            ei,
++            total,
++            3584,
++            384,
++            cap * bm,
++            r,
++            1,
++            bm,
++            bn2,
++            32,
++            1,
++            PACK_K=32,
++            MODE=2 if prepared["normal_flags"][1] else 1,
++            num_warps=w2,
++            num_stages=2,
++        )
++    _weighted_sum[(m, 14)](
++        down, weights, out, 3584, 16, 16, 256, num_warps=4, enable_fp_fusion=False
++    )
++    if record is not None:
++        record.update(
++            G1=meta(first),
++            G2=meta(second),
++            G1_fused_situ=fused_g1,
++            tiles=(bm, bn1, bk1, w1, bn2, w2, tail),
++        )
++    return out
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/tp8_expert_g1.py
+@@ -0,0 +1,62 @@
++# SPDX-License-Identifier: Apache-2.0
++"""TP8 small-batch gate/up projection fused with SiTU.
++
++Packed FP4/E8M0 storage and the intermediate BF16 rounding are unchanged.
++Each output tile pairs 32 gate columns with their matching 32 up columns.
++"""
++
++import triton
++import triton.language as tl
++from flaggems_vllm.ops.kimi_k3_metax.decode_experts import _decode_words_math
++from flaggems_vllm.ops.kimi_k3_metax.marlin_mxfp4 import _concat_k
++from flaggems_vllm.ops.kimi_k3_metax.grouped_moe import _tanh, _exp2
++
++
++@triton.jit
++def _tp8_g1_situ(
++    X, W, S, Activated, Sorted, Experts, Total, R: tl.constexpr, NORMAL: tl.constexpr
++):
++    task = tl.program_id(0)
++    row_block, column_block = task // 12, task % 12
++    if row_block * 16 >= tl.load(Total):
++        return
++    route = tl.load(Sorted + row_block * 16 + tl.arange(0, 16)).to(tl.int32)
++    expert = tl.load(Experts + row_block).to(tl.int32)
++    if (expert < 0) | (expert >= 896):
++        return
++    valid = route < R
++    index = tl.arange(0, 64)
++    column = column_block * 32 + index % 32 + index // 32 * 384
++    word_k = tl.arange(0, 16)
++    k = tl.arange(0, 128)
++    weight_ptr = W + (expert * 448 + word_k[:, None]) * 768 + column[None, :]
++    scale_ptr = S + expert * 112 * 768 + column
++    acc = tl.zeros((16, 64), tl.float32)
++    for block in range(28):
++        a = tl.load(
++            X + route[:, None] // 16 * 3584 + block * 128 + k[None, :],
++            valid[:, None],
++            0,
++        )
++        word = tl.load(weight_ptr).to(tl.uint32)
++        base = scale_ptr + block * 4 * 768
++        s0 = tl.load(base).to(tl.int32)
++        s1 = tl.load(base + 768).to(tl.int32)
++        s2 = tl.load(base + 1536).to(tl.int32)
++        s3 = tl.load(base + 2304).to(tl.int32)
++        parts = _decode_words_math(
++            word, s0[None, :], s1[None, :], s2[None, :], s3[None, :], 128, NORMAL
++        )
++        b = _concat_k(parts, 64, 128)
++        acc = tl.dot(a, b, acc)
++        weight_ptr += 16 * 768
++    # Preserve G1's BF16 materialization before all FP32 SiTU arithmetic.
++    rounded = tl.reshape(acc.to(tl.bfloat16), (16, 2, 32))
++    gate, up = tl.split(tl.permute(rounded, (0, 2, 1)))
++    gate, up = gate.to(tl.float32), up.to(tl.float32)
++    sigmoid = 1.0 / (1.0 + _exp2(-gate * 1.4426950408889634))
++    gate = 4.0 * _tanh(gate / 4.0) * sigmoid
++    up = 25.0 * _tanh(up / 25.0)
++    value = tl.fma(gate, up, 0.0).to(tl.bfloat16)
++    column = column_block * 32 + tl.arange(0, 32)
++    tl.store(Activated + route[:, None] * 384 + column[None, :], value, valid[:, None])
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/expert_gemm.py
+@@ -0,0 +1,213 @@
++from flaggems_vllm.ops.kimi_k3_metax.marlin_mxfp4 import _decode_half_words
++"""Shared canonical expert GEMM and MXFP4 decode primitives."""
++
++import torch
++import triton
++import triton.language as tl
++from flaggems_vllm.ops.kimi_k3_metax.decode_bits import decode_bits
++from flaggems_vllm.ops.kimi_k3_metax.marlin_mxfp4 import _concat_k, _concat_half
++
++
++@triton.jit
++def _decode_math(code, scale, NORMAL: tl.constexpr = False):
++    code = code.to(tl.int32)
++    scale = scale.to(tl.int32)
++    magnitude = code & 7
++    biased = scale + (magnitude >> 1) - 1
++    mantissa = tl.where(magnitude > 1, (magnitude & 1) << 6, 0)
++    value = (biased << 7) | mantissa
++    if not NORMAL:
++        subnormal = (128 | mantissa) >> tl.maximum(1 - biased, 0)
++        value = tl.where(biased <= 0, subnormal, value)
++        value = tl.where(biased >= 255, 0x7F80, value)
++    value = tl.where(magnitude == 0, 0, value) | ((code & 8) << 12)
++    return value.to(tl.uint16).to(tl.bfloat16, bitcast=True)
++
++
++@triton.jit
++def _decode_normal_pair(word, scale, SHIFT: tl.constexpr):
++    pair = (word.to(tl.uint32) >> SHIFT) & 0x000F000F
++    mag = pair & 0x00070007
++    biased = (scale.to(tl.uint32) - 1) * 0x00010001 + ((mag >> 1) & 0x00030003)
++    exponent = biased << 7
++    mantissa = ((mag + 0x00060006) & (mag << 3) & 0x00080008) << 3
++    nonzero = ((mag + 0x00070007) >> 3) & 0x00010001
++    bits = ((exponent | mantissa) & (nonzero * 0x7FFF)) | ((pair & 0x00080008) << 12)
++    return (
++        (bits & 0xFFFF).to(tl.uint16).to(tl.bfloat16, bitcast=True),
++        (bits >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True),
++    )
++
++
++@triton.jit
++def _decode_words_math(
++    b, s0, s1, s2, s3, BK: tl.constexpr, NORMAL: tl.constexpr = False
++):
++    if NORMAL:
++        if BK == 32:
++            a0 = s0
++            a1 = s0
++            a2 = s0
++            a3 = s0
++        elif BK == 64:
++            a0 = s0
++            a1 = s0
++            a2 = s1
++            a3 = s1
++        else:
++            a0 = s0
++            a1 = s1
++            a2 = s2
++            a3 = s3
++        (p0, p1) = _decode_normal_pair(b, a0, 0)
++        (p2, p3) = _decode_normal_pair(b, a1, 4)
++        (p4, p5) = _decode_normal_pair(b, a2, 8)
++        (p6, p7) = _decode_normal_pair(b, a3, 12)
++        return (p0, p1, p2, p3, p4, p5, p6, p7)
++    if BK == 32:
++        a0 = s0
++        a1 = s0
++        a2 = s0
++        a3 = s0
++        a4 = s0
++        a5 = s0
++        a6 = s0
++        a7 = s0
++    elif BK == 64:
++        a0 = s0
++        a1 = s0
++        a2 = s0
++        a3 = s0
++        a4 = s1
++        a5 = s1
++        a6 = s1
++        a7 = s1
++    else:
++        a0 = s0
++        a1 = s0
++        a2 = s1
++        a3 = s1
++        a4 = s2
++        a5 = s2
++        a6 = s3
++        a7 = s3
++    return (
++        _decode_math(b >> 0 & 15, a0, NORMAL),
++        _decode_math(b >> 16 & 15, a1, NORMAL),
++        _decode_math(b >> 4 & 15, a2, NORMAL),
++        _decode_math(b >> 20 & 15, a3, NORMAL),
++        _decode_math(b >> 8 & 15, a4, NORMAL),
++        _decode_math(b >> 24 & 15, a5, NORMAL),
++        _decode_math(b >> 12 & 15, a6, NORMAL),
++        _decode_math(b >> 28 & 15, a7, NORMAL),
++    )
++
++
++@triton.jit
++def _decode_half_words_math(word, s0, s1, half, NORMAL: tl.constexpr):
++    if NORMAL:
++        shifted = word.to(tl.uint32) >> (half * 8)
++        a0, a1 = _decode_normal_pair(shifted, s0, 0)
++        a2, a3 = _decode_normal_pair(shifted, s1, 4)
++        return a0, a1, a2, a3
++    return _decode_half_words(word, s0, s1, half)
++
++
++@triton.jit
++def _paired_arithmetic_mm(
++    X,
++    W,
++    S,
++    Y,
++    Sorted,
++    Experts,
++    Total,
++    N: tl.constexpr,
++    K: tl.constexpr,
++    EM: tl.constexpr,
++    R: tl.constexpr,
++    IT: tl.constexpr,
++    BM: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++    GM: tl.constexpr,
++    PACK_K: tl.constexpr = 0,
++    MODE: tl.constexpr = 1,
++    EXPERT_LIMIT: tl.constexpr = 896,
++    N_START: tl.constexpr = 0,
++    OUTPUT_N: tl.constexpr = 0,
++):
++    ON: tl.constexpr = N if OUTPUT_N == 0 else OUTPUT_N
++    tl.static_assert(0 <= N_START and N_START + ON <= N)
++    PK: tl.constexpr = BK if PACK_K == 0 else PACK_K
++    tl.static_assert(PK == BK or (PK == 128 and BK == 64))
++    pid = tl.program_id(0)
++    nm = tl.cdiv(EM, BM)
++    nn = tl.cdiv(ON, BN)
++    ng = GM * nn
++    group = pid // ng
++    first = group * GM
++    size = tl.minimum(nm - first, GM)
++    rm = first + pid % ng % size
++    cn = pid % ng // size
++    if rm * BM >= tl.load(Total):
++        return
++    routes = tl.load(Sorted + rm * BM + tl.arange(0, BM)).to(tl.int64)
++    valid = routes < R
++    expert = tl.load(Experts + rm).to(tl.int64)
++    if (expert < 0) | (expert >= EXPERT_LIMIT):
++        return
++    cols = (N_START + cn * BN + tl.arange(0, BN).to(tl.int64)) % N
++    kp = tl.arange(0, PK // 8)
++    kk = tl.arange(0, BK)
++    bp = W + (expert * (K // 8) + kp[:, None]) * N + cols[None, :]
++    sp = S + expert * (K // 32) * N + cols
++    acc = tl.zeros((BM, BN), tl.float32)
++    for block in range(K // BK):
++        packed = tl.load(bp).to(tl.uint32)
++        sg = block * (BK // 32)
++        s0 = tl.load(sp + sg * N).to(tl.int32)
++        s1 = tl.load(sp + (sg + 1) * N, BK >= 64, 127).to(tl.int32)
++        s2 = tl.load(sp + (sg + 2) * N, BK >= 128, 127).to(tl.int32)
++        s3 = tl.load(sp + (sg + 3) * N, BK >= 128, 127).to(tl.int32)
++        if PK == BK:
++            parts = _decode_words_math(
++                packed,
++                s0[None, :],
++                s1[None, :],
++                s2[None, :],
++                s3[None, :],
++                BK,
++                MODE == 2,
++            )
++            b = _concat_k(parts, BN, BK)
++        else:
++            parts = _decode_half_words_math(
++                packed, s0[None, :], s1[None, :], block % 2, MODE == 2
++            )
++            b = _concat_half(parts, BN)
++        a = tl.load(
++            X + routes[:, None] // IT * K + block * BK + kk[None, :], valid[:, None], 0
++        )
++        acc = tl.dot(a, b, acc)
++        if PK == BK:
++            bp += BK // 8 * N
++        else:
++            bp += tl.where(block % 2 == 1, PK // 8 * N, 0)
++    outcols = cn * BN + tl.arange(0, BN)
++    tl.store(
++        Y + routes[:, None] * ON + outcols[None, :],
++        acc.to(tl.bfloat16),
++        valid[:, None] & (outcols[None, :] < ON),
++    )
++
++
++def meta(obj):
++    m = obj.metadata
++    return {
++        "n_regs": getattr(obj, "n_regs", None),
++        "n_spills": getattr(obj, "n_spills", None),
++        "shared": getattr(m, "shared", None),
++        "num_warps": getattr(m, "num_warps", None),
++        "num_stages": getattr(m, "num_stages", None),
++    }
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/__init__.py
+@@ -0,0 +1 @@
++"""Qualified Kimi K3 MetaX operators; explicitly selected by the plugin."""
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/workspace_contract.py
+@@ -0,0 +1,7 @@
++"""Size contract shared by the owning runner and borrowing kernels."""
++
++MIN_PREFILL_TOKENS = 2048
++MAX_PREFILL_TOKENS = 4096
++TOP_K = 16
++ROUTE_COLUMNS = 1024
++ACTIVATION_COLUMNS = 384
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/activations.py
+@@ -0,0 +1,69 @@
++"""Accepted SiTU materialization and fused kernel paths."""
++
++import torch
++import triton
++import triton.language as tl
++from .grouped_moe import _situ
++
++
++def situ(x, beta, linear_beta):
++    gate, up = x.chunk(2, dim=-1)
++    gate, up = gate.float(), up.float()
++    gate = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
++    if linear_beta is not None:
++        up = linear_beta * torch.tanh(up / linear_beta)
++    return (gate * up).to(x.dtype)
++
++
++@triton.jit
++def _shared_situ(
++    X,
++    OUT,
++    ELEMENTS: tl.constexpr,
++    I: tl.constexpr,
++    BETA: tl.constexpr,
++    LINEAR_BETA: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    # Inline the same canonical math, but give shared/dense FFN a distinct
++    # profiler entry. This is one GPU launch, not an extra conversion or copy.
++    _situ(X, OUT, ELEMENTS, I, BETA, LINEAR_BETA, BLOCK)
++
++
++def _can_fuse_situ_input(x, beta, linear_beta):
++    return (
++        x.is_cuda
++        and x.dtype == torch.bfloat16
++        and x.ndim == 2
++        and 1 <= x.shape[0] <= 4096
++        and x.shape[1] in (384, 1536, 2112, 8448)
++        and x.is_contiguous()
++        and beta == 4.0
++        and linear_beta == 25.0
++    )
++
++
++def situ_out(out, x, beta=1.0, linear_beta=-1.0):
++    # Qualified decode and prefill shared/dense FFN shapes. Reuse the routed-expert SiTU kernel:
++    # identical BF16 boundaries and FP32 math; write the caller's out directly.
++    if (
++        _can_fuse_situ_input(x, beta, linear_beta)
++        and out.is_contiguous()
++        and out.device == x.device
++        and out.dtype == x.dtype
++        and tuple(out.shape) == (x.shape[0], x.shape[1] // 2)
++    ):
++        d = x.shape[1] // 2
++        _shared_situ[(triton.cdiv(out.numel(), 256),)](
++            x,
++            out,
++            out.numel(),
++            d,
++            beta,
++            linear_beta,
++            256,
++            num_warps=4,
++            enable_fp_fusion=False,
++        )
++        return
++    out.copy_(situ(x, beta, linear_beta if linear_beta > 0 else None))
+--- /dev/null
++++ b/src/flaggems_vllm/ops/kimi_k3_metax/attn_res_padding.py
+@@ -0,0 +1,8 @@
++from vllm.triton_utils import triton, tl
++
++
++@triton.jit
++def _bf16_pad(X, Y, N: tl.constexpr, P: tl.constexpr, BLOCK: tl.constexpr):
++    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    value = tl.load(X + i, i < N, other=0)
++    tl.store(Y + i, value, i < P)
