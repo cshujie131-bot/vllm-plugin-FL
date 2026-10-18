@@ -137,7 +137,7 @@ def _topk_per_row_fixed(
     if tag == "prefill" and _dsv4.current.prefill_native_topk:
         if _prefill_topk_native_op is None:
             raise RuntimeError(
-                "VLLM_FL_METAX_PREFILL_NATIVE_TOPK=1 but prefill_topk_native_op import failed"
+                "framework.prefill_native_topk is enabled but its operator import failed"
             )
         torch.ops.vllm_fl.prefill_topk_native(
             logits,

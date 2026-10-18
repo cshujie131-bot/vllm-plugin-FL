@@ -3,7 +3,7 @@
 
 
 # ---------------------------------------------------
-# Note: enable with MACA_VLLM_ENABLE_MCTLASS_PYTHON_API=1
+# Enabled by the typed MoE policy in vllm_fl.dsv4_config.
 # ---------------------------------------------------
 
 import torch

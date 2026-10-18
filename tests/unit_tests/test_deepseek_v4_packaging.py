@@ -1,0 +1,354 @@
+# SPDX-License-Identifier: Apache-2.0
+"""CPU-only publication checks. Do not import Torch or initialize an accelerator."""
+
+import ast
+import difflib
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[2]
+EXAMPLE = ROOT / "examples/deepseek_v4_metax"
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+prepare = load("ds_prepare", EXAMPLE / "prepare_dependencies.py")
+serve = load("ds_serve", EXAMPLE / "serve.py")
+
+
+class PackagingTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def config(self, thinking=False):
+        return serve.make_config(
+            self.root / "model", self.root / "cache", 18010, thinking
+        )
+
+    def test_production_settings(self):
+        policy = self.config()["deepseek_v4_metax"]
+        self.assertEqual(policy["framework"]["indexer_query_shards"], 4)
+        self.assertEqual(policy["service"]["tensor_parallel_size"], 8)
+        self.assertEqual(policy["service"]["max_num_batched_tokens"], 4096)
+        self.assertEqual(policy["service"]["max_model_len"], 66560)
+        self.assertEqual(
+            policy["service"]["compilation_config"]["cudagraph_mode"],
+            "FULL_DECODE_ONLY",
+        )
+        self.assertTrue(policy["kernels"]["decode_qkfold"])
+        self.assertTrue(policy["kernels"]["prefill_staged"])
+
+    def test_thinking_changes_only_serving_limits(self):
+        normal = self.config()["deepseek_v4_metax"]
+        thinking = self.config(True)["deepseek_v4_metax"]
+        for name in ("framework", "kernels", "moe", "rms"):
+            self.assertEqual(normal[name], thinking[name])
+        self.assertEqual(thinking["service"]["max_model_len"], 131072)
+        self.assertEqual(thinking["service"]["max_num_seqs"], 32)
+
+    def test_command_has_no_image_or_private_paths(self):
+        command = serve.command_for(self.config())
+        self.assertEqual(command[:2], ["vllm", "serve"])
+        self.assertIn("--disable-custom-all-reduce", command)
+        self.assertIn("18010", command)
+        self.assertNotIn("/data/sj", " ".join(command))
+
+    def test_environment_isolates_caches_and_clears_old_knobs(self):
+        inherited = {
+            "VLLM_FL_METAX_OLD": "1",
+            "DSV4_OLD": "1",
+            "PYTHONPATH": "/old/runtime",
+            "PATH": "/bin",
+        }
+        env = serve.environment_for(self.config(), self.root / "cache", inherited)
+        self.assertNotIn("VLLM_FL_METAX_OLD", env)
+        self.assertNotIn("DSV4_OLD", env)
+        self.assertEqual(env["PATH"], "/bin")
+        self.assertEqual(env["USE_FLAGGEMS"], "1")
+        self.assertEqual(env["PYTHONPATH"], str(EXAMPLE / "bootstrap"))
+        caches = [
+            env[k]
+            for k in ("TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR", "VLLM_CACHE_ROOT")
+        ]
+        self.assertEqual(len(set(caches)), 3)
+
+    def test_cache_reuse_and_configuration_guard(self):
+        config = self.config()
+        cache = self.root / "cache"
+        serve.prepare_cache(config, cache)
+        serve.prepare_cache(config, cache)
+        config["deepseek_v4_metax"]["service"]["port"] += 1
+        with self.assertRaisesRegex(ValueError, "another source"):
+            serve.prepare_cache(config, cache)
+
+    def test_refuse_unrecognized_cache_without_deleting_it(self):
+        cache = self.root / "cache"
+        cache.mkdir()
+        (cache / "keep").write_text("user data")
+        with self.assertRaises(ValueError):
+            serve.prepare_cache(self.config(), cache)
+        self.assertEqual((cache / "keep").read_text(), "user data")
+
+    def test_dry_run_does_not_create_cache_or_import_torch(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(EXAMPLE / "serve.py"),
+                "--model",
+                "/not/a/model",
+                "--cache-dir",
+                str(self.root / "unused"),
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        self.assertIn("FULL_DECODE_ONLY", result.stdout)
+        self.assertFalse((self.root / "unused").exists())
+        self.assertNotIn("torch", sys.modules)
+
+    def fixture(self):
+        source = self.root / "source"
+        package = source / "src/demo"
+        package.mkdir(parents=True)
+        (source / "pyproject.toml").write_text("[project]\nname='demo'\nversion='0'\n")
+        (package / "__init__.py").write_text("VALUE = 1\n")
+        before = prepare.source_hash(package)
+        (package / "__init__.py").write_text("VALUE = 2\n")
+        after = prepare.source_hash(package)
+        (package / "__init__.py").write_text("VALUE = 1\n")
+        change = "".join(
+            difflib.unified_diff(
+                ["VALUE = 1\n"],
+                ["VALUE = 2\n"],
+                fromfile="a/src/demo/__init__.py",
+                tofile="b/src/demo/__init__.py",
+            )
+        )
+        (self.root / "demo.patch").write_text(change)
+        lock = {
+            "demo": {
+                "commit": "pinned",
+                "source_sha256": before,
+                "result_sha256": after,
+                "patches": ["demo.patch"],
+            }
+        }
+        path = self.root / "lock.json"
+        path.write_text(json.dumps(lock))
+        return source, path
+
+    def test_dependency_round_trip_does_not_modify_input(self):
+        source, lock = self.fixture()
+        output = prepare.prepare({"demo": source}, self.root / "prepared", lock)
+        self.assertEqual(
+            (output / "demo/src/demo/__init__.py").read_text(), "VALUE = 2\n"
+        )
+        self.assertEqual((source / "src/demo/__init__.py").read_text(), "VALUE = 1\n")
+
+    def test_dependency_mismatch_fails_before_output(self):
+        source, lock = self.fixture()
+        (source / "src/demo/__init__.py").write_text("tampered\n")
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            prepare.prepare({"demo": source}, self.root / "output", lock)
+        self.assertFalse((self.root / "output").exists())
+
+    def test_dependency_refuses_existing_output(self):
+        source, lock = self.fixture()
+        with self.assertRaises(FileExistsError):
+            prepare.prepare({"demo": source}, source, lock)
+
+    def test_dependency_refuses_nested_output(self):
+        source, lock = self.fixture()
+        with self.assertRaisesRegex(ValueError, "separate"):
+            prepare.prepare({"demo": source}, source / "nested", lock)
+
+    def test_failed_patch_cleans_only_own_staging(self):
+        source, lock = self.fixture()
+        (self.root / "demo.patch").write_text("invalid patch\n")
+        with self.assertRaises(subprocess.CalledProcessError):
+            prepare.prepare({"demo": source}, self.root / "output", lock)
+        self.assertFalse((self.root / "output").exists())
+        self.assertFalse(list(self.root.glob(".dsv4-deps-*")))
+        self.assertTrue(source.exists())
+
+    def test_hash_ignores_bytecode_cache(self):
+        source, _ = self.fixture()
+        package = source / "src/demo"
+        before = prepare.source_hash(package)
+        (package / "__pycache__").mkdir()
+        (package / "__pycache__/dummy.py").write_text("ignored")
+        self.assertEqual(before, prepare.source_hash(package))
+
+    def test_published_patches_are_readable_git_diffs(self):
+        lock = json.loads((EXAMPLE / "dependencies/lock.json").read_text())
+        for name, item in lock.items():
+            self.assertEqual(len(item["commit"]), 40)
+            self.assertEqual(len(item["source_sha256"]), 64)
+            for patch_name in item["patches"]:
+                result = subprocess.run(
+                    [
+                        "git",
+                        "apply",
+                        "--stat",
+                        str(EXAMPLE / "dependencies" / patch_name),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertIn("file", result.stdout)
+
+    def test_no_frozen_source_tree(self):
+        self.assertFalse((EXAMPLE / "profile/src").exists())
+        self.assertFalse((EXAMPLE / "profile/manifest.json").exists())
+        self.assertNotIn("sitecustomize", (ROOT / "pyproject.toml").read_text())
+
+    def test_typed_policy_is_opt_in_and_immutable(self):
+        policy = load("ds_policy_test", ROOT / "vllm_fl/dsv4_config.py")
+        self.assertFalse(policy.is_enabled())
+        config = self.config()["deepseek_v4_metax"]
+        policy.configure(config["framework"], config["moe"])
+        self.assertTrue(policy.is_enabled())
+        policy.configure(config["framework"], config["moe"])
+        with self.assertRaises(ValueError):
+            policy.configure({"indexer_query_shards": 8}, config["moe"])
+        with self.assertRaises(TypeError):
+            policy.configure({"decode_hq16": 1}, config["moe"])
+        with self.assertRaises(RuntimeError):
+            policy.configure(
+                {**config["framework"], "prefill_headpack": False}, config["moe"]
+            )
+
+    def test_runtime_uses_existing_config_variable(self):
+        module = load(
+            "ds_runtime_config", ROOT / "vllm_fl/patches/deepseek_v4_metax/config.py"
+        )
+        config = self.config()
+        path = self.root / "config.json"
+        path.write_text(json.dumps(config))
+        with patch.dict(os.environ, {"VLLM_FL_CONFIG": str(path)}):
+            self.assertEqual(module.load()["dispatch"]["prefer"], "flagos")
+            config["deepseek_v4_metax"]["service"]["compilation_config"][
+                "cudagraph_mode"
+            ] = "FULL"
+            path.write_text(json.dumps(config))
+            with self.assertRaises(ValueError):
+                module.load()
+
+    def test_checkpoint_scope_before_startup(self):
+        model = self.root / "model"
+        model.mkdir()
+        metadata = {
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "expert_dtype": "int8",
+            "hidden_size": 4096,
+            "num_hidden_layers": 43,
+            "num_attention_heads": 64,
+        }
+        (model / "config.json").write_text(json.dumps(metadata))
+        serve.check_model(model)
+        metadata["expert_dtype"] = "bf16"
+        (model / "config.json").write_text(json.dumps(metadata))
+        with self.assertRaises(ValueError):
+            serve.check_model(model)
+
+    def test_provider_selection_is_scoped(self):
+        source = ROOT / "vllm_fl/dispatch/backends/flaggems/register_ops.py"
+        tree = ast.parse(source.read_text())
+        function = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "register_builtins"
+        )
+        selection = []
+        for node in function.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "impls" for t in node.targets
+            ):
+                break
+            selection.append(node)
+
+        class Generic:
+            def is_available(self):
+                return True
+
+        class DSV4(Generic):
+            pass
+
+        for enabled in (False, True):
+            root = types.ModuleType("vllm_fl")
+            root.dsv4_config = types.SimpleNamespace(
+                is_enabled=lambda enabled=enabled: enabled
+            )
+            generic = types.ModuleType("vllm_fl.dispatch.backends.flaggems.flaggems")
+            generic.FlagGemsBackend = Generic
+            optimized = types.ModuleType(
+                "vllm_fl.dispatch.backends.flaggems.deepseek_v4_metax"
+            )
+            optimized.DeepseekV4MetaXBackend = DSV4
+            with patch.dict(
+                sys.modules,
+                {
+                    "vllm_fl": root,
+                    generic.__name__: generic,
+                    optimized.__name__: optimized,
+                },
+            ):
+                namespace = {"__package__": "vllm_fl.dispatch.backends.flaggems"}
+                exec(
+                    compile(
+                        ast.Module(body=selection, type_ignores=[]),
+                        "<provider>",
+                        "exec",
+                    ),
+                    namespace,
+                )
+                self.assertIs(type(namespace["backend"]), DSV4 if enabled else Generic)
+
+    def test_bind_preserves_dispatch_epochs(self):
+        tree = ast.parse((ROOT / "vllm_fl/dispatch/__init__.py").read_text())
+        cls = next(
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "CachedOp"
+        )
+        manager = types.SimpleNamespace(
+            policy_epoch=5,
+            ensure_initialized=lambda: None,
+            _resolve_impl=lambda name: types.SimpleNamespace(fn=lambda: name),
+            _record_first_use=lambda *args: None,
+        )
+        ns = {
+            "get_default_manager": lambda: manager,
+            "get_policy": lambda: None,
+            "get_policy_epoch": lambda: 7,
+            "_CACHED_OPS": [],
+        }
+        exec(compile(ast.Module(body=[cls], type_ignores=[]), "<CachedOp>", "exec"), ns)
+        op = ns["CachedOp"]("mhc_pre")
+        result = op.bind()
+        self.assertEqual(result.fn(), "mhc_pre")
+        self.assertEqual(op._manager_epoch, 5)
+        self.assertEqual(op._policy_epoch, 7)
+        self.assertFalse(op._frozen)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,166 @@
+{
+  "prefer": "flagos",
+  "strict": false,
+  "op_backends": {
+    "attention_backend": [
+      "vendor:metax"
+    ],
+    "silu_and_mul": [
+      "flagos",
+      "reference"
+    ],
+    "rms_norm": [
+      "reference"
+    ],
+    "rotary_embedding": [
+      "flagos",
+      "reference"
+    ],
+    "topk_softmax": [
+      "flagos",
+      "reference"
+    ]
+  },
+  "flagos_blacklist": [
+    "topk",
+    "masked_fill",
+    "masked_fill_"
+  ],
+  "oot_blacklist": [
+    "masked_fill",
+    "masked_fill_"
+  ],
+  "deepseek_v4_metax": {
+    "schema_version": 1,
+    "release": "dsv4-clean-20261016-r2",
+    "framework": {
+      "decode_hq16": true,
+      "real_query_heads": 8,
+      "prefill_headpack": true,
+      "indexer_graphsafe": true,
+      "indexer_paged_logits": true,
+      "indexer_row_sharding": true,
+      "indexer_query_shards": 4,
+      "indexer_min_keys": 4096,
+      "prefill_native_topk": false,
+      "single_stream": true
+    },
+    "kernels": {
+      "decode_split_topk": true,
+      "decode_splits": 4,
+      "decode_block_k": 16,
+      "decode_block_h": 16,
+      "decode_warps": 4,
+      "decode_stages": 1,
+      "decode_max_batch": 64,
+      "decode_half_d": true,
+      "decode_qkfold": true,
+      "prefill_half_d": true,
+      "prefill_blockdiag": true,
+      "prefill_staged": true,
+      "mhc_split_tail": true,
+      "mhc_small_m": true,
+      "mhc_max_m": 128,
+      "mhc_splits": 8,
+      "mhc_block_m": 16,
+      "mhc_block_k": 64,
+      "mhc_warps": 4,
+      "mhc_stages": 1,
+      "mhc_pad_n": 32,
+      "mhc_tail_block_h": 8192,
+      "mhc_tail_warps": 4,
+      "mhc_tail_stages": 1,
+      "enable_metax_gdn_compiler_patch": false
+    },
+    "moe": {
+      "use_mctlass": true,
+      "python_api": true,
+      "chunk_size": 16384,
+      "hidden_size": 4096,
+      "tuned_config_folder": "tuned_configs"
+    },
+    "service": {
+      "served_model_name": "deepseek-v4-flash-w8a8-int8",
+      "port": 18001,
+      "tensor_parallel_size": 8,
+      "kv_cache_dtype": "fp8",
+      "block_size": 256,
+      "max_model_len": 66560,
+      "max_num_seqs": 64,
+      "max_num_batched_tokens": 4096,
+      "long_prefill_token_threshold": 0,
+      "gpu_memory_utilization": 0.85,
+      "disable_custom_all_reduce": true,
+      "compilation_config": {
+        "cudagraph_mode": "FULL_DECODE_ONLY",
+        "custom_ops": [
+          "all"
+        ],
+        "cudagraph_capture_sizes": [
+          1,
+          2,
+          4,
+          8,
+          16,
+          32,
+          64
+        ],
+        "max_cudagraph_capture_size": 64,
+        "cudagraph_num_of_warmups": 0
+      }
+    },
+    "rms": {
+      "rank_warps": {
+        "attention": [
+          8,
+          8,
+          8,
+          8,
+          4,
+          4,
+          4,
+          4
+        ],
+        "shared_moe": [
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ],
+        "output": [
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ]
+      },
+      "xblock": 1,
+      "rblock": 2048,
+      "stages": 1,
+      "body_fingerprints": {
+        "b9e6087ae37955cc773c20ab0689263a5a423bcf0c23bd5ce53d21200413992e": "attention",
+        "4023e8885007223cfb264bb2c869be6568cebf3fa40aa964043879abe31ffade": "shared_moe",
+        "6c5259efe8fca8eca771edcd6a5d34f6c6a08400a67dac2e08068a18665feb5c": "output"
+      }
+    },
+    "infrastructure_env": {
+      "GEMS_VENDOR": "metax",
+      "VLLM_PLUGINS": "fl",
+      "VLLM_NO_USAGE_STATS": "1",
+      "PYTHONDONTWRITEBYTECODE": "1",
+      "VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD": "0",
+      "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE": "1"
+    },
+    "compatibility": {
+      "multi_stream_source_sha256": "e1c2ec3fcf031d95ca5e115142e2f0be9707085d654b4d1666d63bc0354c9178"
+    }
+  }
+}

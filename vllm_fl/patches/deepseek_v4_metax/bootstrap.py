@@ -7,7 +7,7 @@ import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from .profile import load
+from .config import load
 from .compat import install_vendor_guard, install_serial_execution
 
 _initialized = False
