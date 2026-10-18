@@ -1,100 +1,81 @@
 # Copyright (c) 2025 BAAI. All rights reserved.
-#
-# Register torch.ops._C op schemas so that vllm compilation passes can
-# reference them for pattern matching even when the native vllm._C extension
-# is not compiled for this platform.
+# SPDX-License-Identifier: Apache-2.0
+"""Schema-only declarations for empty vLLM builds; no model-kernel fallback.
+
+The FL native extension owns the real weak-reference runtime wrapper. Missing
+model kernels remain unsupported. A schema exists for compilation matching,
+not as a claim that a CPU or accelerator implementation has been installed.
+"""
 
 import logging
+import threading
 
 import torch
 
+from vllm_fl.ops._C_ops_schemas import SCHEMAS
+
 logger = logging.getLogger(__name__)
+_LIBRARY: torch.library.Library | None = None
+_REGISTRATION_LOCK = threading.Lock()
+_QUERY_OPS = (
+    "cutlass_scaled_mm_supports_fp8",
+    "cutlass_scaled_mm_supports_block_fp8",
+    "cutlass_group_gemm_supported",
+    "cutlass_scaled_mm_supports_fp4",
+)
 
 
-# Fallback implementations for query ops
-_QUERY_OP_IMPLS = [
-    ("cutlass_scaled_mm_supports_fp8", lambda cap: cap >= 89),
-    ("cutlass_scaled_mm_supports_block_fp8", lambda cap: cap >= 100),
-    ("cutlass_group_gemm_supported", lambda cap: cap >= 90),
-    ("cutlass_scaled_mm_supports_fp4", lambda cap: cap >= 100),
-    ("weak_ref_tensor", lambda t: t),
-    ("get_cuda_view_from_cpu_tensor", lambda t: t),
-]
+def _unavailable_cutlass(cuda_device_capability: int) -> bool:
+    """Device capability alone cannot make an absent CUTLASS kernel available."""
+    return False
 
 
-def _apply_repetition_penalties_impl(
-    logits: torch.Tensor,
-    prompt_mask: torch.Tensor,
-    output_mask: torch.Tensor,
-    repetition_penalties: torch.Tensor,
-) -> None:
-    """Pure-torch fallback for _C::apply_repetition_penalties_."""
-    rp = repetition_penalties.unsqueeze(dim=1).repeat(1, logits.size(1))
-    penalties = torch.where(prompt_mask | output_mask, rp, 1.0)
-    scaling = torch.where(logits > 0, 1.0 / penalties, penalties)
-    logits.mul_(scaling)
+def register_op_schemas() -> None:
+    """Define missing schemas exactly once and preserve real implementations."""
+    global _LIBRARY
+    with _REGISTRATION_LOCK:
+        if _LIBRARY is not None:
+            return
+        if not SCHEMAS:
+            raise RuntimeError("The pinned vLLM _C schema list is empty")
 
+        parsed = [torch._C.parse_schema("_C::" + schema) for schema in SCHEMAS]
+        full_names = [
+            schema.name + ("." + schema.overload_name if schema.overload_name else "")
+            for schema in parsed
+        ]
+        if len(full_names) != len(set(full_names)):
+            raise RuntimeError("Duplicate names in the pinned vLLM _C schema list")
+        existing_ops = set(torch._C._dispatch_get_all_op_names())
 
-# Ops that need a CUDA dispatch because vLLM calls them directly
-# (not routed through FL's call_op) and only has _C kernel + torch fallback
-# gated behind is_cuda checks.
-_CUDA_FALLBACK_IMPLS = [
-    ("apply_repetition_penalties_", _apply_repetition_penalties_impl),
-]
+        # Check every existing declaration before adding any new definition.
+        for expected, full_name in zip(parsed, full_names):
+            if full_name in existing_ops:
+                actual = torch._C._dispatch_find_schema_or_throw(
+                    expected.name, expected.overload_name
+                ).schema()
+                if str(actual) != str(expected):
+                    raise RuntimeError(
+                        f"Schema mismatch for {full_name}: "
+                        f"loaded={actual}; pinned={expected}"
+                    )
 
+        lib = torch.library.Library("_C", "FRAGMENT")
+        registered = 0
+        for schema, full_name in zip(SCHEMAS, full_names):
+            if full_name not in existing_ops:
+                lib.define(schema)
+                registered += 1
 
-def register_op_schemas():
-    """Register _C op schemas if not already present."""
-    if getattr(register_op_schemas, "_lib", None) is not None:
-        return
+        for name in _QUERY_OPS:
+            op_name = "_C::" + name
+            has_native_query = any(
+                torch._C._dispatch_has_kernel_for_dispatch_key(op_name, key)
+                for key in ("CompositeExplicitAutograd", "CompositeImplicitAutograd",
+                            "CPU", "CUDA")
+            )
+            if not has_native_query:
+                lib.impl(name, _unavailable_cutlass, "CompositeExplicitAutograd")
 
-    try:
-        import vllm._C  # noqa: F401
-        return
-    except (ImportError, OSError):
-        pass
-
-    # Pre-load mcoplib._C (MetaX) so its TORCH_LIBRARY registrations land
-    # before our FRAGMENT definitions.  The hasattr check below will then
-    # skip any ops already registered by mcoplib, avoiding c10::Error.
-    import importlib.util
-    if importlib.util.find_spec("mcoplib") is not None:
-        try:
-            import mcoplib._C  # noqa: F401
-        except ImportError:
-            logger.warning("Failed to import mcoplib._C")
-
-    from vllm_fl.ops._C_ops_schemas import SCHEMAS as schemas
-
-    if not schemas:
-        logger.warning("No op schemas found; torch.compile may not work.")
-        return
-
-    lib = torch.library.Library("_C", "FRAGMENT")
-
-    for schema in schemas:
-        full_name = schema.split("(")[0]
-        op_name = full_name.split(".")[0]
-        overload = full_name.split(".")[1] if "." in full_name else "default"
-        if hasattr(torch.ops._C, op_name) and hasattr(
-            getattr(torch.ops._C, op_name), overload
-        ):
-            continue
-        try:
-            lib.define(schema)
-        except Exception as e:
-            logger.debug("Failed to register _C op schema '%s': %s", full_name, e)
-
-    for name, fn in _QUERY_OP_IMPLS:
-        try:
-            lib.impl(name, fn, "CompositeImplicitAutograd")
-        except Exception:
-            pass
-
-    for name, fn in _CUDA_FALLBACK_IMPLS:
-        try:
-            lib.impl(name, fn, "CUDA")
-        except Exception:
-            pass
-
-    register_op_schemas._lib = lib
+        _LIBRARY = lib
+        logger.info("Registered %d schema-only _C declarations", registered)

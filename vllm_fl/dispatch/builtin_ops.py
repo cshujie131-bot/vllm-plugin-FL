@@ -134,6 +134,23 @@ def register_builtins(registry: OpRegistry) -> None:
     Args:
         registry: Registry to register into
     """
+    from vllm_fl.utils import DeviceInfo
+
+    if DeviceInfo().vendor_name == "metax":
+        if os.environ.get("VLLM_FL_PLUGIN_MODULES", "").strip():
+            raise RuntimeError(
+                "K3 MetaX uses canonical FL registrations; external plugin "
+                "modules require explicit integration and review"
+            )
+        # The K3 MetaX path has a single set of open operator registrations.
+        # Import or registration errors must not select a vendor fallback.
+        from .backends.flaggems.register_ops import register_builtins as register_flaggems
+        from .backends.reference.register_ops import register_builtins as register_reference
+
+        register_flaggems(registry)
+        register_reference(registry)
+        return
+
     # Register FlagGems (DEFAULT) implementations
     try:
         from .backends.flaggems.register_ops import register_builtins as register_flaggems

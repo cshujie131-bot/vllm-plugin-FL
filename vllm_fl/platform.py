@@ -4,26 +4,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-# Import custom ops and trigger registration on both legacy and stable-ABI
-# vLLM wheels. Keep the attempts independent: official vLLM 0.28 wheels have
-# only the stable-ABI module, so failure of the legacy import must not skip it.
-import importlib
+# Native runtime wrappers are registered by vllm_fl.register before this module.
 import os
+import importlib
 from contextlib import suppress
 from typing import TYPE_CHECKING, TypeVar
 
 import torch
 from typing_extensions import ParamSpec
 
-for _extension in (
-    "vllm._C",
-    "vllm._C_stable_libtorch",
-    "vllm._moe_C_stable_libtorch",
-    "vllm._qutlass_C",
-):
-    # Non-CUDA platforms may not ship either extension.
-    with suppress(ImportError, OSError):
-        importlib.import_module(_extension)
+# MetaX empty builds use the explicit runtime registration above.
+if getattr(torch.version, "maca", None) is None:
+    for _extension in (
+        "vllm._C",
+        "vllm._C_stable_libtorch",
+        "vllm._moe_C_stable_libtorch",
+        "vllm._qutlass_C",
+    ):
+        # Non-CUDA platforms may not ship either extension.
+        with suppress(ImportError, OSError):
+            importlib.import_module(_extension)
 
 from vllm.logger import init_logger
 from vllm.platforms import Platform, PlatformEnum
@@ -188,20 +188,9 @@ class PlatformFL(Platform):
         logger.info(f"current vendor_name is: {cls.vendor_name}")
 
         if cls.vendor_name == "metax":
-            try:
-                import mcoplib._C  # noqa: F401
-            except ImportError:
-                logger.warning("Failed to import mcoplib._C")
+            from vllm_fl.dispatch.backends.vendor.metax.metax import register_runtime
 
-            try:
-                import mcoplib._moe_C  # noqa: F401
-            except ImportError:
-                logger.warning("Failed to import mcoplib._moe_C")
-
-            try:
-                import vllm_fl.dispatch.backends.vendor.metax.patches  # noqa: F401
-            except Exception as e:
-                logger.warning(f"Failed to import maca patches: {e}")
+            register_runtime()
         else:
             super().import_kernels()
 
@@ -370,8 +359,12 @@ class PlatformFL(Platform):
             compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
         # --------------------------------------------------------
-        # maca specific config updates
+        # MetaX uses the open kernels and MCCL, without a vendor custom all-reduce.
         if cls.vendor_name == "metax":
+            if not parallel_config.disable_custom_all_reduce:
+                raise NotImplementedError(
+                    "K3 MetaX requires --disable-custom-all-reduce; use MCCL"
+                )
             if model_config is not None:
                 model_config.disable_cascade_attn = True
             if attention_config := vllm_config.attention_config:

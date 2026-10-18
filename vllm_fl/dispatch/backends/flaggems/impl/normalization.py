@@ -27,6 +27,13 @@ def rms_norm_flaggems(
     Returns:
         Normalized tensor, or tuple of (normalized, residual) if residual is provided
     """
+    from vllm.platforms import current_platform
+
+    if residual is not None and getattr(current_platform, "vendor_name", None) == "metax":
+        raise NotImplementedError(
+            "MetaX fused residual RMSNorm is pending strict validation against "
+            "the pinned vLLM rounding/mutation contract"
+        )
     from flag_gems.modules.normalization import gems_rms_forward
 
     # Get weight and epsilon from obj
