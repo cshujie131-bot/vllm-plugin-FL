@@ -2,7 +2,6 @@
 
 import json
 import os
-from typing import Optional, Tuple
 
 import flag_gems
 
@@ -14,7 +13,7 @@ except (ImportError, FileNotFoundError):
     from flag_gems.runtime.backend.device_finder import DeviceDetector
 from flag_gems.runtime import backend
 
-_OP_CONFIG: Optional[dict[str, str]] = None
+_OP_CONFIG: dict[str, str] | None = None
 
 # Mapping used by dispatch registration to resolve the current runtime platform
 # into a backend directory under dispatch/backends/vendor.
@@ -58,6 +57,24 @@ VENDOR_DEVICE_MAP: dict[str, dict[str, str]] = {
     "enflame": {"device_type": "gcu", "device_name": "gcu"},
     # Registered backend: vendor/kunlunxin
     "kunlunxin": {"device_type": "cuda", "device_name": "kunlunxin"},
+    # Registered backend: vendor/supa
+    "biren": {"device_type": "cuda", "device_name": "supa"},
+}
+
+# Extra graph-partition boundaries required by a device runtime. vLLM's
+# default attention/KV-cache splitting ops are still installed first.
+SPLITTING_OPS: dict[str, tuple[str, ...]] = {
+    # MCCL collectives cannot run while a MUSA stream is being captured.
+    "musa": (
+        "vllm::all_reduce",
+        "vllm::all_gather",
+        "vllm::reduce_scatter",
+        "vllm::patched_fused_scaled_matmul_reduce_scatter",
+        "_c10d_functional::all_reduce",
+        "_c10d_functional::all_gather_into_tensor",
+        "_c10d_functional::reduce_scatter_tensor",
+        "_c10d_functional::wait_tensor",
+    ),
 }
 
 # Keep the vLLM base-class no-op for platforms not validated by this change.
@@ -127,9 +144,7 @@ def use_flaggems(default: bool = True) -> bool:
     return value.lower() in ("true", "1")
 
 
-def get_flag_gems_whitelist_blacklist() -> Tuple[
-    Optional[list[str]], Optional[list[str]]
-]:
+def get_flag_gems_whitelist_blacklist() -> tuple[list[str] | None, list[str] | None]:
     """
     Get FlagGems operator whitelist and blacklist.
 
@@ -253,7 +268,7 @@ def _load_op_config_from_env() -> None:
     _OP_CONFIG = normalized
 
 
-def get_op_config() -> Optional[dict[str, str]]:
+def get_op_config() -> dict[str, str] | None:
     return _OP_CONFIG
 
 
@@ -273,6 +288,7 @@ class DeviceInfo:
             "gcu",
             "enflame",
             "kunlunxin",
+            "biren",
         ]
         backend.set_torch_backend_device_fn(self.device.vendor_name)
 
@@ -320,6 +336,7 @@ def get_flaggems_all_ops() -> list[str]:
 # OOT operator names as registered in custom_ops.py (op_name lowercase)
 OOT_OP_NAMES = [
     "silu_and_mul",
+    "silu_and_mul_with_clamp",
     "gelu_and_mul",
     "rms_norm",
     "rotary_embedding",
@@ -328,7 +345,7 @@ OOT_OP_NAMES = [
 ]
 
 
-def get_oot_whitelist() -> Optional[list[str]]:
+def get_oot_whitelist() -> list[str] | None:
     """
     Get OOT operator whitelist from VLLM_FL_OOT_WHITELIST environment variable.
 
@@ -344,7 +361,7 @@ def get_oot_whitelist() -> Optional[list[str]]:
     return [op.strip() for op in whitelist_str.split(",") if op.strip()]
 
 
-def get_oot_blacklist() -> Optional[list[str]]:
+def get_oot_blacklist() -> list[str] | None:
     """
     Get OOT operator blacklist from environment variable or platform config.
 
