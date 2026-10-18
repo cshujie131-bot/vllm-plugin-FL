@@ -19,11 +19,14 @@ pytestmark = [
 def metax_runtime():
     import flag_gems
 
-    from vllm_fl.ops.minimax_m3.integration import install
+    from vllm_fl.minimax_m3_config import is_enabled
+    if not is_enabled():
+        pytest.skip("requires the explicit MiniMax M3 profile")
+    from vllm_fl.patches.minimax_m3_metax.bootstrap import initialize
     from vllm_fl.utils import get_flag_gems_whitelist_blacklist, use_flaggems
 
     assert use_flaggems()
-    install()
+    initialize()
     _, blacklist = get_flag_gems_whitelist_blacklist()
     old_threads = torch.get_num_threads()
     try:

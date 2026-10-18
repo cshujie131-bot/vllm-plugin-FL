@@ -32,7 +32,7 @@ In theory, vllm-plugin-FL can support all models available in vLLM, as long as n
 | Qwen3.5-35B-A3B | Supported | [example](./examples/qwen3_5_offline_inference.py)  |
 | BAAI/bge-m3 | Supported | [implementation](./vllm_fl/models/bge_m3.py) |
 | MiniMax-M2.7 | Supported | [implementation](./examples/minimax_m27_offline_inference.py) |
-| MiniMax-M3 | Initial MetaX support | [example](examples/minimax_m3/README.md) |
+| MiniMax-M3 | MetaX BF16 TP16 | [example](examples/minimax_m3_metax/README.md) |
 
 ### Supported Chips
 
