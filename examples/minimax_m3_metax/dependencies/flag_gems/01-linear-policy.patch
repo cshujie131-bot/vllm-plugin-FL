@@ -1,0 +1,462 @@
+diff --git a/src/flag_gems/ops/_linear_ordered.py b/src/flag_gems/ops/_linear_ordered.py
+new file mode 100644
+index 0000000..640d88f
+--- /dev/null
++++ b/src/flag_gems/ops/_linear_ordered.py
+@@ -0,0 +1,125 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 FlagOS Contributors
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def linear_scheduled(
++    input_ptr,
++    weight_ptr,
++    bias_ptr,
++    output_ptr,
++    M,
++    N,
++    K,
++    stride_im,
++    stride_ik,
++    stride_wn,
++    stride_wk,
++    stride_om,
++    stride_on,
++    stride_bn,
++    # Bias is present or not
++    BIAS: tl.constexpr,
++    BLOCK_SIZE_M: tl.constexpr,
++    BLOCK_SIZE_N: tl.constexpr,
++    BLOCK_SIZE_K: tl.constexpr,
++    ORDER: tl.constexpr,
++    GROUP_M: tl.constexpr,
++    EVEN: tl.constexpr,
++    CACHE_A: tl.constexpr,
++    CACHE_B: tl.constexpr,
++):
++    """
++    Linear kernel: y = x @ W^T + b
++    - input: (M, K) where M is batch size (flattened), K is in_features
++    - weight: (N, K) where N is out_features
++    - bias: (N,) optional
++    - output: (M, N)
++    """
++    if ORDER == 0:
++        pid_m = tl.program_id(0)
++        pid_n = tl.program_id(1)
++    elif ORDER == 1:
++        pid = tl.program_id(0)
++        nn = tl.cdiv(N, BLOCK_SIZE_N)
++        pid_m = pid // nn
++        pid_n = pid % nn
++    else:
++        pid = tl.program_id(0)
++        nm = tl.cdiv(M, BLOCK_SIZE_M)
++        nn = tl.cdiv(N, BLOCK_SIZE_N)
++        group = pid // (GROUP_M * nn)
++        first_m = group * GROUP_M
++        group_size = tl.minimum(nm - first_m, GROUP_M)
++        pid_m = first_m + (pid % (GROUP_M * nn)) % group_size
++        pid_n = (pid % (GROUP_M * nn)) // group_size
++
++    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
++    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
++    offs_k = tl.arange(0, BLOCK_SIZE_K)
++
++    input_ptrs = input_ptr + (offs_m[:, None] * stride_im + offs_k[None, :] * stride_ik)
++
++    weight_ptrs = weight_ptr + (
++        offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
++    )
++
++    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
++
++    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
++        # Load input block
++        input_mask_m = offs_m < M
++        input_mask_k = offs_k < (K - k * BLOCK_SIZE_K)
++        input_mask = input_mask_m[:, None] & input_mask_k[None, :]
++
++        if EVEN:
++            a = tl.load(input_ptrs, cache_modifier=CACHE_A)
++        else:
++            a = tl.load(input_ptrs, mask=input_mask, other=0.0, cache_modifier=CACHE_A)
++
++        # Load weight block
++        weight_mask_k = offs_k < (K - k * BLOCK_SIZE_K)
++        weight_mask_n = offs_n < N
++        weight_mask = weight_mask_k[:, None] & weight_mask_n[None, :]
++
++        if EVEN:
++            b = tl.load(weight_ptrs, cache_modifier=CACHE_B)
++        else:
++            b = tl.load(
++                weight_ptrs, mask=weight_mask, other=0.0, cache_modifier=CACHE_B
++            )
++
++        # Compute dot product
++        accumulator += tl.dot(a, b, allow_tf32=False)
++
++        # Move to next block
++        input_ptrs += BLOCK_SIZE_K * stride_ik
++        weight_ptrs += BLOCK_SIZE_K * stride_wk
++
++    # Compute output offset
++    offs_om = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
++    offs_on = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
++    output_ptrs = output_ptr + (
++        offs_om[:, None] * stride_om + offs_on[None, :] * stride_on
++    )
++
++    output_mask_m = offs_m < M
++    output_mask_n = offs_n < N
++    output_mask = output_mask_m[:, None] & output_mask_n[None, :]
++
++    # Add bias if present
++    if BIAS:
++        bias_ptrs = bias_ptr + offs_on
++        bias = tl.load(bias_ptrs, mask=output_mask_n, other=0.0)
++        accumulator = accumulator + bias
++
++    # Store result
++    output = accumulator.to(output_ptr.dtype.element_ty)
++    if EVEN:
++        tl.store(output_ptrs, output)
++    else:
++        tl.store(output_ptrs, output, mask=output_mask)
+diff --git a/src/flag_gems/ops/_linear_tile.py b/src/flag_gems/ops/_linear_tile.py
+new file mode 100644
+index 0000000..b137cf2
+--- /dev/null
++++ b/src/flag_gems/ops/_linear_tile.py
+@@ -0,0 +1,94 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 FlagOS Contributors
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def linear_kernel(
++    input_ptr,
++    weight_ptr,
++    bias_ptr,
++    output_ptr,
++    M,
++    N,
++    K,
++    stride_im,
++    stride_ik,
++    stride_wn,
++    stride_wk,
++    stride_om,
++    stride_on,
++    stride_bn,
++    # Bias is present or not
++    BIAS: tl.constexpr,
++    BLOCK_SIZE_M: tl.constexpr,
++    BLOCK_SIZE_N: tl.constexpr,
++    BLOCK_SIZE_K: tl.constexpr,
++):
++    """
++    Linear kernel: y = x @ W^T + b
++    - input: (M, K) where M is batch size (flattened), K is in_features
++    - weight: (N, K) where N is out_features
++    - bias: (N,) optional
++    - output: (M, N)
++    """
++    pid_m = tl.program_id(0)
++    pid_n = tl.program_id(1)
++
++    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
++    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
++    offs_k = tl.arange(0, BLOCK_SIZE_K)
++
++    input_ptrs = input_ptr + (offs_m[:, None] * stride_im + offs_k[None, :] * stride_ik)
++
++    weight_ptrs = weight_ptr + (
++        offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
++    )
++
++    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
++
++    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
++        # Load input block
++        input_mask_m = offs_m < M
++        input_mask_k = offs_k < (K - k * BLOCK_SIZE_K)
++        input_mask = input_mask_m[:, None] & input_mask_k[None, :]
++
++        a = tl.load(input_ptrs, mask=input_mask, other=0.0)
++
++        # Load weight block
++        weight_mask_k = offs_k < (K - k * BLOCK_SIZE_K)
++        weight_mask_n = offs_n < N
++        weight_mask = weight_mask_k[:, None] & weight_mask_n[None, :]
++
++        b = tl.load(weight_ptrs, mask=weight_mask, other=0.0)
++
++        # Compute dot product
++        accumulator += tl.dot(a, b, allow_tf32=False)
++
++        # Move to next block
++        input_ptrs += BLOCK_SIZE_K * stride_ik
++        weight_ptrs += BLOCK_SIZE_K * stride_wk
++
++    # Compute output offset
++    offs_om = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
++    offs_on = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
++    output_ptrs = output_ptr + (
++        offs_om[:, None] * stride_om + offs_on[None, :] * stride_on
++    )
++
++    output_mask_m = offs_m < M
++    output_mask_n = offs_n < N
++    output_mask = output_mask_m[:, None] & output_mask_n[None, :]
++
++    # Add bias if present
++    if BIAS:
++        bias_ptrs = bias_ptr + offs_on
++        bias = tl.load(bias_ptrs, mask=output_mask_n, other=0.0)
++        accumulator = accumulator + bias
++
++    # Store result
++    output = accumulator.to(output_ptr.dtype.element_ty)
++    tl.store(output_ptrs, output, mask=output_mask)
+diff --git a/src/flag_gems/ops/_linear_vector.py b/src/flag_gems/ops/_linear_vector.py
+new file mode 100644
+index 0000000..a0f460b
+--- /dev/null
++++ b/src/flag_gems/ops/_linear_vector.py
+@@ -0,0 +1,44 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 FlagOS Contributors
++
++"""Small-M local Linear kernels. FP32 products/accumulation; TF32 never enabled."""
++
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def linear_gemv(
++    X,
++    W,
++    Y,
++    M: tl.constexpr,
++    N: tl.constexpr,
++    K: tl.constexpr,
++    BM: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++):
++    mi = tl.program_id(0) * BM + tl.arange(0, BM)
++    ni = tl.program_id(1) * BN + tl.arange(0, BN)
++    ki = tl.arange(0, BK)
++    acc = tl.zeros((BM, BN), tl.float32)
++    for start in range(tl.cdiv(K, BK)):
++        k = start * BK + ki
++        a = tl.load(
++            X + mi[:, None] * K + k[None, :],
++            (mi[:, None] < M) & (k[None, :] < K),
++            other=0,
++        ).to(tl.float32)
++        b = tl.load(
++            W + ni[:, None] * K + k[None, :],
++            (ni[:, None] < N) & (k[None, :] < K),
++            other=0,
++        ).to(tl.float32)
++        products = a[:, None, :] * b[None, :, :]
++        acc += tl.sum(products, axis=2)
++    tl.store(
++        Y + mi[:, None] * N + ni[None, :],
++        acc.to(Y.dtype.element_ty),
++        (mi[:, None] < M) & (ni[None, :] < N),
++    )
+diff --git a/src/flag_gems/ops/linear.py b/src/flag_gems/ops/linear.py
+index ca67937..91760bd 100644
+--- a/src/flag_gems/ops/linear.py
++++ b/src/flag_gems/ops/linear.py
+@@ -23,6 +23,8 @@ from flag_gems import runtime
+ from flag_gems.runtime import torch_device_fn
+ from flag_gems.utils import libentry, libtuner
+ 
++from flag_gems.runtime.linear_launch import launch
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -170,7 +172,7 @@ def linear(input, weight, bias=None):
+     )
+ 
+     with torch_device_fn.device(input.device):
+-        linear_kernel[grid](
++        launch(linear_kernel, grid,
+             input_flat,
+             weight,
+             bias if bias is not None else weight,  # Pass dummy ptr if no bias
+diff --git a/src/flag_gems/runtime/linear_launch.py b/src/flag_gems/runtime/linear_launch.py
+new file mode 100644
+index 0000000..a9b4fe7
+--- /dev/null
++++ b/src/flag_gems/runtime/linear_launch.py
+@@ -0,0 +1,153 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 FlagOS Contributors
++
++"""Shape-scoped launch policy; no runtime function replacement or framework imports."""
++
++import torch, triton
++from copy import deepcopy
++from collections.abc import Mapping
++from flag_gems.ops._linear_ordered import linear_scheduled
++from flag_gems.ops._linear_vector import linear_gemv
++from flag_gems.ops._linear_tile import linear_kernel as legacy_kernel
++
++_POLICY = None
++_SMALL = {}
++_LEGACY = {}
++_ORDERED = {}
++
++
++def thaw(value):
++    if isinstance(value, Mapping):
++        return {k: thaw(v) for k, v in value.items()}
++    if isinstance(value, (tuple, list)):
++        return [thaw(v) for v in value]
++    return value
++
++
++def configure(policy):
++    """Install explicit shape rules before serving; no model/parallel imports."""
++    global _POLICY, _SMALL, _LEGACY, _ORDERED
++    policy = deepcopy(thaw(policy))
++    if _POLICY is not None and policy != _POLICY:
++        raise RuntimeError("Linear launch policy is already configured")
++    _POLICY = policy
++    _SMALL = {
++        (r["M"], r["N"], r["K"], r["dtype"]): r["candidate"] for r in policy["small"]
++    }
++    _LEGACY = {
++        (r["M"], r["N"], r["K"], r["dtype"]): r["config"] for r in policy["legacy"]
++    }
++    _ORDERED = {
++        (r["M"], r["N"], r["K"]): {k: r[k] for k in ("ORDER", "GROUP_M")}
++        for r in policy["ordered_shapes"]
++    }
++
++
++def is_configured():
++    return _POLICY is not None
++
++
++_COUNTS = {"small": 0, "ordered": 0, "legacy": 0, "fallback": 0}
++
++
++def snapshot():
++    return dict(_COUNTS)
++
++
++def launch(native, grid, a, w, bias, out, M, N, K, *strides, **kwargs):
++    if _POLICY is None:
++        return native[grid](a, w, bias, out, M, N, K, *strides, **kwargs)
++    dtype = str(a.dtype).split(".")[-1]
++    key = (M, N, K, dtype)
++    small = _SMALL.get(key)
++    small_ok = (
++        all(isinstance(v, int) for v in (M, N, K))
++        and not (set(kwargs) - {"BIAS"})
++        and not kwargs.get("BIAS", False)
++        and all(isinstance(x, torch.Tensor) for x in (a, w, out))
++        and a.is_cuda
++        and a.device == w.device == out.device
++        and a.dtype == w.dtype == out.dtype
++        and not any(x.requires_grad for x in (a, w, out))
++        and a.shape == (M, K)
++        and w.shape == (N, K)
++        and out.shape == (M, N)
++        and all(x.is_contiguous() for x in (a, w, out))
++        and tuple(strides) == (K, 1, K, 1, N, 1, 0)
++    )
++    if small is not None and small_ok:
++        _COUNTS["small"] += 1
++        cfg = thaw(small["config"])
++        if small["kind"] == "gemv":
++            return linear_gemv[(triton.cdiv(M, cfg["BM"]), triton.cdiv(N, cfg["BN"]))](
++                a, w, out, M, N, K, **cfg
++            )
++        order = small.get("order", 0)
++        gm, gn = (
++            triton.cdiv(M, cfg["BLOCK_SIZE_M"]),
++            triton.cdiv(N, cfg["BLOCK_SIZE_N"]),
++        )
++        return linear_scheduled[(gm * gn,) if order else (gm, gn)](
++            a,
++            w,
++            bias,
++            out,
++            M,
++            N,
++            K,
++            *strides,
++            BIAS=False,
++            ORDER=order,
++            GROUP_M=small.get("group_m", 4),
++            EVEN=False,
++            CACHE_A="",
++            CACHE_B="",
++            **cfg,
++        )
++    order = _ORDERED.get((M, N, K))
++    if (
++        order is not None
++        and not kwargs.get("BIAS", False)
++        and a.dtype == w.dtype == out.dtype == torch.bfloat16
++        and a.is_cuda
++        and a.device == w.device == out.device
++        and all(x.is_contiguous() for x in (a, w, out))
++        and tuple(strides[:6]) == (K, 1, K, 1, N, 1)
++        and not (set(kwargs) - {"BIAS"})
++    ):
++        _COUNTS["ordered"] += 1
++        cfg = thaw(_POLICY["ordered_config"])
++        count = (M // cfg["BLOCK_SIZE_M"]) * (N // cfg["BLOCK_SIZE_N"])
++        return linear_scheduled[(count,)](
++            a,
++            w,
++            bias,
++            out,
++            M,
++            N,
++            K,
++            *strides,
++            **kwargs,
++            **cfg,
++            **order,
++            EVEN=False,
++            CACHE_A="",
++            CACHE_B="",
++        )
++    config = _LEGACY.get(key)
++    if (
++        config is not None
++        and not kwargs.get("BIAS", False)
++        and a.is_contiguous()
++        and w.is_contiguous()
++        and out.is_contiguous()
++        and w.dtype == a.dtype
++        and out.dtype == a.dtype
++    ):
++        _COUNTS["legacy"] += 1
++        cfg = thaw(config)
++        return legacy_kernel[
++            (triton.cdiv(M, cfg["BLOCK_SIZE_M"]), triton.cdiv(N, cfg["BLOCK_SIZE_N"]))
++        ](a, w, bias, out, M, N, K, *strides, **kwargs, **cfg)
++    _COUNTS["fallback"] += 1
++    return native[grid](a, w, bias, out, M, N, K, *strides, **kwargs)

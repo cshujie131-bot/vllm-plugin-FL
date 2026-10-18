@@ -1,0 +1,38 @@
+diff --git a/src/flaggems_vllm/runtime/backend/_metax/ops/__init__.py b/src/flaggems_vllm/runtime/backend/_metax/ops/__init__.py
+index d07c518..3040e2c 100644
+--- a/src/flaggems_vllm/runtime/backend/_metax/ops/__init__.py
++++ b/src/flaggems_vllm/runtime/backend/_metax/ops/__init__.py
+@@ -27,7 +27,12 @@ from flaggems_vllm.runtime.backend._metax.ops.per_token_group_quant_fp8 import (
+     SUPPORTED_FP8_DTYPE,
+     per_token_group_quant_fp8,
+ )
+-from flaggems_vllm.runtime.backend._metax.ops.persistent_topk import persistent_topk
++try:
++    from flaggems_vllm.runtime.backend._metax.ops.persistent_topk import persistent_topk
++except ImportError as error:
++    if not (error.name or "").startswith("triton.experimental"):
++        raise
++
+ from flaggems_vllm.runtime.backend._metax.ops.ple_state import ple_state_scatter_
+ from flaggems_vllm.runtime.backend._metax.ops.qsa import qwen4_store_qsa_kv_rows
+ from flaggems_vllm.runtime.backend._metax.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
+@@ -47,3 +52,6 @@ __all__ = [
+     "inplace_fused_experts",
+     "outplace_fused_experts",
+ ]
++
++if "persistent_topk" not in globals():
++    __all__.remove("persistent_topk")
+diff --git a/src/flaggems_vllm/utils/code_cache.py b/src/flaggems_vllm/utils/code_cache.py
+index 325e351..522e320 100644
+--- a/src/flaggems_vllm/utils/code_cache.py
++++ b/src/flaggems_vllm/utils/code_cache.py
+@@ -21,7 +21,7 @@ from pathlib import Path
+ @functools.lru_cache(maxsize=None)  # this is the same as functools.cache in Python 3.9+
+ def cache_dir_path() -> Path:
+     """Return the cache directory for generated files in flagdnn."""
+-    _cache_dir = os.environ.get("FLAGGEMS_CACHE_DIR")
++    _cache_dir = os.environ.get("FLAGGEMS_VLLM_CACHE_DIR") or os.environ.get("FLAGGEMS_CACHE_DIR")
+     if _cache_dir is None:
+         _cache_dir = Path.home() / ".flagdnn"  # type: ignore[assignment]
+     else:

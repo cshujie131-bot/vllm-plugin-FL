@@ -1,0 +1,2 @@
+# Unified-diff context uses significant spaces; applied sources are checked separately.
+examples/minimax_m3_metax/dependencies/**/*.patch -whitespace

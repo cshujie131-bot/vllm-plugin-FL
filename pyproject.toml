@@ -96,6 +96,7 @@ include = ["vllm_fl*"]
 
 [tool.setuptools.package-data]
 "vllm_fl.dispatch.config" = ["*.yaml"]
+"vllm_fl.patches.minimax_m3_metax" = ["compatibility.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -178,7 +179,7 @@ docstring-code-format = true
 
 [tool.typos.files]
 # these files may be written in non english words
-extend-exclude = ["tests/**", "vllm_fl/**"]
+extend-exclude = ["tests/**", "vllm_fl/**", "examples/minimax_m3_metax/dependencies/**/*.patch"]
 ignore-hidden = true
 ignore-files = true
 ignore-dot = true
