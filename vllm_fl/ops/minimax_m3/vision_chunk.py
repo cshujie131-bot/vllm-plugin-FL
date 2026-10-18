@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 FlagOS Contributors
+
 """Bound memory by batching independent M3 vision attention segments.
 No frames, patches, attention edges, projection weights or output rows are removed.
 """
 
-import os
-
+from vllm_fl.minimax_m3_config import load
 import torch
 
 
 def vision_forward(model, pixel_values, grid_thw):
-    limit = int(os.environ.get("M3_VISION_CHUNK_PATCHES", "8192"))
+    limit = load().framework.vision_chunk_patches
     if limit <= 0 or pixel_values.shape[0] <= limit:
         return model._m3_forward_unbounded(pixel_values, grid_thw)
     if torch.is_grad_enabled():

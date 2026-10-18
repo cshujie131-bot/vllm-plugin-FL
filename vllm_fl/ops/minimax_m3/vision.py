@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-import flag_gems
-import torch
+# Copyright 2026 FlagOS Contributors
 
+import torch
+import flag_gems
+from vllm_fl.dispatch import CachedOp
 from vllm.model_executor.layers.attention.mm_encoder_attention import (
     MMEncoderAttention as _MMEncoderBase,
 )
-
-from vllm_fl.dispatch import CachedOp
 
 vision_rope_op = CachedOp("m3_vision_rope")
 vision_attention_op = CachedOp("m3_vision_attention")
@@ -72,23 +72,4 @@ class M3VisionAttentionFL(_MMEncoderBase):
     ):
         return vision_attention_op(
             query, key, value, cu_seqlens, max_seqlen, self.scale
-        )
-
-
-def register(registry):
-    from . import torch_ops
-    from vllm_fl.dispatch import BackendImplKind, OpImpl
-
-    for name, fn in [
-        ("vision_rope", vision_rope),
-        ("vision_attention", vision_attention),
-    ]:
-        registry.register_impl(
-            OpImpl(
-                op_name="m3_" + name,
-                impl_id="m3.flagos." + name,
-                kind=BackendImplKind.DEFAULT,
-                fn=getattr(torch_ops, name),
-                priority=150,
-            )
         )

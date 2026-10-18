@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 FlagOS Contributors
+
 """M3 custom operators exposed as torch.ops.vllm_fl, with honest mutation schemas."""
 
 import torch
-
-from . import ops as _raw, qkv as _qkv
+from flaggems_vllm.ops.minimax_m3 import norm_activation as _raw
+from . import attention as _attention
+from flaggems_vllm.ops.minimax_m3 import qkv as _qkv
 
 _LIB = torch.library.Library("vllm_fl", "FRAGMENT")
 
@@ -85,7 +88,7 @@ def _fake_score(
 
 _register(
     "m3_index_score(Tensor idx_q, Tensor index_kv_cache, Tensor block_table, Tensor cu_seqlens_q, Tensor seq_lens, Tensor prefix_lens, int max_query_len, int max_seq_len, int num_kv_heads) -> Tensor",
-    _raw.index_score,
+    _attention.index_score,
     _fake_score,
 )
 
@@ -100,7 +103,7 @@ def _index_topk_out(
     local_blocks,
     out,
 ):
-    _raw.index_topk(
+    _attention.index_topk(
         score,
         cu_seqlens_q,
         prefix_lens,
@@ -133,7 +136,7 @@ def _index_decode_out(
     max_decode_query_len,
     out,
 ):
-    _raw.index_decode(
+    _attention.index_decode(
         idx_q,
         index_kv_cache,
         block_table,
@@ -157,12 +160,12 @@ _register(
 
 _register(
     "m3_sparse_attn_out_(Tensor q, Tensor kv_cache, Tensor topk_idx, Tensor block_table, Tensor cu_seqlens_q, Tensor seq_lens, Tensor prefix_lens, int max_query_len, int num_kv_heads, float sm_scale, Tensor(a!) output) -> ()",
-    _raw.sparse_attn,
+    _attention.sparse_attn,
     lambda *a: None,
 )
 _register(
     "m3_sparse_decode_out_(Tensor q, Tensor kv_cache, Tensor topk_idx, Tensor block_table, Tensor seq_lens, int num_kv_heads, float sm_scale, Tensor(a!) output, int decode_query_len) -> ()",
-    _raw.sparse_decode,
+    _attention.sparse_decode,
     lambda *a: None,
 )
 

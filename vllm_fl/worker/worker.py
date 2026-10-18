@@ -350,6 +350,13 @@ class WorkerFL(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
+    def model_runner_type(self):
+        from vllm_fl.worker.model_runner import ModelRunnerFL
+        return ModelRunnerFL
+
+    def warmup_kernels(self):
+        kernel_warmup(self)
+
     def init_device(self):
         # Iluvatar: patch sampler ops to disable torch.compile (flagtree triton
         # does not support cuda inductor target). Must run in Worker process,
@@ -490,7 +497,7 @@ class WorkerFL(WorkerBase):
         from vllm_fl.worker.model_runner import ModelRunnerFL
 
         # Construct the model runner
-        self.model_runner = ModelRunnerFL(self.vllm_config, self.device)
+        self.model_runner = self.model_runner_type()(self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
@@ -786,7 +793,7 @@ class WorkerFL(WorkerBase):
             )
         else:
             try:
-                kernel_warmup(self)
+                self.warmup_kernels()
             except ImportError as e:
                 # vllm 0.24.0's kernel_warmup unconditionally imports
                 # minimax_m3_msa_warmup, whose chain reaches torchvision.

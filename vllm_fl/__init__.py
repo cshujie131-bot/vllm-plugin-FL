@@ -133,6 +133,11 @@ def _init_vendor_device():
 
 def register():
     """Register the FL platform."""
+    from vllm_fl.minimax_m3_config import is_enabled
+    if is_enabled():
+        from vllm_fl.patches.minimax_m3_metax.startup import register_platform
+        return register_platform()
+
     _init_vendor_device()
 
     # PlatformFL is accelerator-shaped. For the standard FlagGems ARM target,
@@ -203,15 +208,16 @@ def _register_gdn_packed_decode_patch() -> bool:
 
 def register_model():
     """Register FL-specific models not yet upstream."""
+    from vllm_fl.minimax_m3_config import is_enabled
+    if is_enabled():
+        from vllm_fl.patches.minimax_m3_metax.startup import register_models
+        return register_models()
+
     # General plugins are loaded independently in spawned model-inspection and
     # worker processes, so all runtime compatibility hooks must be idempotent.
     from vllm_fl.patches.qwen3_5_text import apply_qwen3_5_text_patches
 
     apply_qwen3_5_text_patches()
-
-    from vllm_fl.patches.minimax_m3 import register_metax_models
-
-    register_metax_models()
 
     from vllm.platforms import current_platform
     if current_platform.device_type == "cpu" and _arm_cpu_platform() is not None:

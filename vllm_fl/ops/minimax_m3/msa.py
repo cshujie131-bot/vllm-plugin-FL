@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 FlagOS Contributors
+
 from vllm_fl.dispatch import CachedOp
 
 minimax_m3_index_score = CachedOp("m3_index_score")
