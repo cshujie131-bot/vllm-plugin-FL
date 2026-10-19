@@ -666,16 +666,6 @@ class WorkerFL(WorkerBase):
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
-        if (self.k3_execution.enabled
-                and self.parallel_config.enable_expert_parallel
-                and self.parallel_config.data_parallel_size > 1):
-            warmup_ep_collectives = resolve_obj_by_qualname("vllm_fl.k3.collective_warmup.warmup_ep_collectives")
-            with set_current_vllm_config(self.vllm_config):
-                text_config = self.model_config.hf_text_config
-                warmup_ep_collectives(self.device,
-                    self.vllm_config.scheduler_config.max_num_batched_tokens,
-                    text_config.routed_expert_hidden_size, text_config.num_experts)
-
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
                 self.vllm_config.weight_transfer_config,

@@ -8,7 +8,7 @@ paths, including existing library calls and fixed decorator-time tuning.
 | --- | --- | --- |
 | 01 | K3 backend-lowering baseline: default component factories in K3 model/MLA/KDA/ViT | Carried here; no separate K3 PR yet |
 | 02 | Accepted PP host feedback, input-copy hook, Graph metadata and CUSTOM prefill selection | Carried here; scheduler unchanged |
-| 03 | Accepted MetaX addmm tiles and K3 qualified dense path | Not claimed merged |
+| 03 | Legal MetaX addmm configuration and shared TP8 arithmetic handle | Not claimed merged |
 | 04 | Accepted argmax NaN/tie/index and shape corrections | Not claimed merged |
 | 05 | Accepted grouped-topk implementation using the existing FlagGems route | Not replaced by a different fusion |
 | 06 | Accepted MLA tiles and explicit dense-backend callable | No library-to-plugin import |
@@ -30,3 +30,6 @@ The fixed MetaX parameters are intentionally retained rather than adding a new
 autotune sweep. Existing Torch/FlagGems fallback computations and precision
 boundaries are preserved, as required for this publication-only task. They are
 not presented as new universally portable operator-library acceptance.
+
+EP/TP32-only entry points and kernels have been removed. Shared packed FP4
+decode/scheduling primitives used by TP8 retain their accepted mathematical bodies.

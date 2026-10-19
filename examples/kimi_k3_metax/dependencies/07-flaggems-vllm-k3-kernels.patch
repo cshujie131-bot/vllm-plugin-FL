@@ -410,7 +410,7 @@
 +    )
 --- /dev/null
 +++ b/src/flaggems_vllm/ops/kimi_k3_metax/grouped_moe.py
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,280 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Graph-capturable MXFP4/BF16 grouped experts for Kimi K3.
 +
@@ -422,7 +422,6 @@
 +import torch
 +import triton
 +import triton.language as tl
-+from flag_gems import runtime
 +from flag_gems.utils import tl_extra_shim
 +from flaggems_vllm.ops.moe_align_block_size import (
 +    moe_align_block_size_no_tle,
@@ -431,7 +430,6 @@
 +
 +from flaggems_vllm.ops.kimi_k3_metax.mxfp4_kernels import _signed_bf16
 +from flaggems_vllm.ops.kimi_k3_metax.decode_bits import decode_bits
-+from flaggems_vllm.ops.kimi_k3_metax.expert_tail_gemv import _packed_gemv
 +
 +_tanh = tl_extra_shim.tanh
 +_exp2 = tl_extra_shim.exp2
@@ -616,23 +614,6 @@
 +        raise ValueError("This K3 candidate supports topk 1..16")
 +    block_m = 16 if tokens < 256 else (32 if tokens < 2048 else 64)
 +    block_n1 = block_k1 = block_n2 = block_k2 = 32
-+    # Measured TP32 shapes only. Other batches, layouts and models keep B0.
-+    if runtime.device.vendor_name == "metax" and (
-+        hidden,
-+        intermediate,
-+        experts,
-+        topk,
-+    ) == (3584, 96, 896, 16):
-+        if tokens == 1:
-+            block_n1 = 16
-+        elif tokens in (3553, 4096):
-+            block_n1, block_k1, block_n2 = 64, 64, 64
-+    # Fixed, independently validated decode bins only. Prefill retains old math.
-+    decode_optimized = (
-+        runtime.device.vendor_name == "metax"
-+        and (hidden, intermediate, experts, topk) == (3584, 96, 896, 16)
-+        and tokens in (1, 2, 4, 8, 16, 32, 64)
-+    )
 +    sorted_ids, expert_ids, padded = _alignment(topk_ids, block_m, experts)
 +    routes = tokens * topk
 +    # Gate/up is dead before stage 2 reuses its storage. No full BF16 weights
@@ -647,50 +628,26 @@
 +    )
 +    output = torch.empty_like(x)
 +    row_blocks = triton.cdiv(sorted_ids.numel(), block_m)
-+    if decode_optimized:
-+        active_cap = min(experts, routes)
-+        row_blocks = min(row_blocks, active_cap + (routes - active_cap) // block_m)
-+    if decode_optimized and tokens in (1, 2) and beta == 4.0 and linear_beta == 25.0:
-+        # Tail-batch G1: BF16 values with FP32 vector products/reduction.
-+        # G2 below retains the existing grouped BF16 MMA and materialization.
-+        _packed_gemv[(routes, twice_intermediate)](
-+            x,
-+            w13,
-+            s13,
-+            gate_up,
-+            topk_ids,
-+            routes,
-+            twice_intermediate,
-+            hidden,
-+            topk,
-+            1,
-+            1,
-+            512,
-+            num_warps=4,
-+            num_stages=1,
-+            enable_fp_fusion=False,
-+        )
-+    else:
-+        _grouped_mm[(row_blocks, triton.cdiv(twice_intermediate, block_n1))](
-+            x,
-+            w13,
-+            s13,
-+            gate_up,
-+            sorted_ids,
-+            expert_ids,
-+            padded,
-+            routes,
-+            twice_intermediate,
-+            hidden,
-+            experts,
-+            topk,
-+            block_m,
-+            block_n1,
-+            block_k1,
-+            BIT_DECODE=decode_optimized,
-+            num_warps=4,
-+            num_stages=1,
-+        )
++    _grouped_mm[(row_blocks, triton.cdiv(twice_intermediate, block_n1))](
++        x,
++        w13,
++        s13,
++        gate_up,
++        sorted_ids,
++        expert_ids,
++        padded,
++        routes,
++        twice_intermediate,
++        hidden,
++        experts,
++        topk,
++        block_m,
++        block_n1,
++        block_k1,
++        BIT_DECODE=False,
++        num_warps=4,
++        num_stages=1,
++    )
 +    _situ[(triton.cdiv(routes * intermediate, 256),)](
 +        gate_up,
 +        activated,
@@ -718,7 +675,7 @@
 +        block_m,
 +        block_n2,
 +        block_k2,
-+        BIT_DECODE=decode_optimized,
++        BIT_DECODE=False,
 +        num_warps=4,
 +        num_stages=1,
 +    )
@@ -1278,70 +1235,6 @@
 +        triton.next_power_of_2(splits),
 +        num_warps=4,
 +        enable_fp_fusion=False,
-+    )
---- /dev/null
-+++ b/src/flaggems_vllm/ops/kimi_k3_metax/expert_tail_gemv.py
-@@ -0,0 +1,61 @@
-+"""Exact-bit G1 GEMV for the validated K3 TP32 M1/M2 tail batches."""
-+
-+import triton
-+import triton.language as tl
-+from flaggems_vllm.ops.kimi_k3_metax.decode_bits import decode_bits
-+
-+
-+@triton.jit
-+def _packed_gemv(
-+    X,
-+    W,
-+    S,
-+    Y,
-+    IDS,
-+    R: tl.constexpr,
-+    N: tl.constexpr,
-+    K: tl.constexpr,
-+    INPUT_TOPK: tl.constexpr,
-+    RP: tl.constexpr,
-+    BN: tl.constexpr,
-+    BK: tl.constexpr,
-+):
-+    routes = tl.program_id(0) * RP + tl.arange(0, RP)
-+    cols = tl.program_id(1) * BN + tl.arange(0, BN)
-+    kk = tl.arange(0, BK)
-+    expert = tl.load(IDS + routes, routes < R, 0).to(tl.int64)
-+    acc = tl.zeros((RP, BN), tl.float32)
-+    for block in range(tl.cdiv(K, BK)):
-+        k = block * BK + kk
-+        a = tl.load(
-+            X + (routes[:, None] // INPUT_TOPK) * K + k[None, :],
-+            (routes[:, None] < R) & (k[None, :] < K),
-+            0,
-+        ).to(tl.float32)
-+        mask = (
-+            (routes[:, None, None] < R)
-+            & (cols[None, :, None] < N)
-+            & (k[None, None, :] < K)
-+        )
-+        packed = tl.load(
-+            W
-+            + (expert[:, None, None] * N + cols[None, :, None]) * (K // 2)
-+            + k[None, None, :] // 2,
-+            mask,
-+            0,
-+        ).to(tl.int32)
-+        scale = tl.load(
-+            S
-+            + (expert[:, None, None] * N + cols[None, :, None]) * (K // 32)
-+            + k[None, None, :] // 32,
-+            mask,
-+            127,
-+        ).to(tl.int32)
-+        code = (packed >> ((k[None, None, :] & 1) * 4)) & 15
-+        w = decode_bits(code, scale).to(tl.float32)
-+        acc += tl.sum(a[:, None, :] * w, 2)
-+    tl.store(
-+        Y + routes[:, None] * N + cols[None, :],
-+        acc.to(tl.bfloat16),
-+        (routes[:, None] < R) & (cols[None, :] < N),
 +    )
 --- /dev/null
 +++ b/src/flaggems_vllm/ops/kimi_k3_metax/mla_staged_packing.py
@@ -1961,7 +1854,7 @@
 +    return True
 --- /dev/null
 +++ b/src/flaggems_vllm/ops/kimi_k3_metax/marlin_mxfp4.py
-@@ -0,0 +1,398 @@
+@@ -0,0 +1,165 @@
 +# Copyright 2026 FlagOS Contributors
 +# SPDX-License-Identifier: Apache-2.0
 +"""Portable FGV/Marlin-style MXFP4 layout and K3 expert chain.
@@ -1975,7 +1868,6 @@
 +import triton
 +import triton.language as tl
 +from flaggems_vllm.ops.kimi_k3_metax.decode_bits import decode_bits
-+from flaggems_vllm.ops.kimi_k3_metax.grouped_moe import _alignment, _situ, _weighted_sum
 +
 +
 +@triton.jit
@@ -2070,81 +1962,6 @@
 +
 +
 +@triton.jit
-+def _marlin_portable_mxfp4(
-+    X,
-+    W,
-+    S,
-+    Y,
-+    Sorted,
-+    Experts,
-+    Total,
-+    N: tl.constexpr,
-+    K: tl.constexpr,
-+    EM: tl.constexpr,
-+    R: tl.constexpr,
-+    IT: tl.constexpr,
-+    BM: tl.constexpr,
-+    BN: tl.constexpr,
-+    BK: tl.constexpr,
-+    GM: tl.constexpr,
-+    PACK_K: tl.constexpr = 0,
-+):
-+    PK: tl.constexpr = BK if PACK_K == 0 else PACK_K
-+    tl.static_assert(PK == BK or (PK == 128 and BK == 64))
-+    pid = tl.program_id(0)
-+    nm = tl.cdiv(EM, BM)
-+    nn = tl.cdiv(N, BN)
-+    ng = GM * nn
-+    group = pid // ng
-+    first = group * GM
-+    size = tl.minimum(nm - first, GM)
-+    rm = first + pid % ng % size
-+    cn = pid % ng // size
-+    if rm * BM >= tl.load(Total):
-+        return
-+    routes = tl.load(Sorted + rm * BM + tl.arange(0, BM)).to(tl.int64)
-+    valid = routes < R
-+    expert = tl.load(Experts + rm).to(tl.int64)
-+    if (expert < 0) | (expert >= 896):
-+        return
-+    cols = (cn * BN + tl.arange(0, BN).to(tl.int64)) % N
-+    kp = tl.arange(0, PK // 8)
-+    kk = tl.arange(0, BK)
-+    bp = W + (expert * (K // 8) + kp[:, None]) * N + cols[None, :]
-+    sp = S + expert * (K // 32) * N + cols
-+    acc = tl.zeros((BM, BN), tl.float32)
-+    for block in range(K // BK):
-+        packed = tl.load(bp).to(tl.uint32)
-+        sg = block * (BK // 32)
-+        s0 = tl.load(sp + sg * N).to(tl.int32)
-+        s1 = tl.load(sp + (sg + 1) * N, BK >= 64, 127).to(tl.int32)
-+        s2 = tl.load(sp + (sg + 2) * N, BK >= 128, 127).to(tl.int32)
-+        s3 = tl.load(sp + (sg + 3) * N, BK >= 128, 127).to(tl.int32)
-+        if PK == BK:
-+            parts = _decode_words(
-+                packed, s0[None, :], s1[None, :], s2[None, :], s3[None, :], BK
-+            )
-+            b = _concat_k(parts, BN, BK)
-+        else:
-+            parts = _decode_half_words(packed, s0[None, :], s1[None, :], block % 2)
-+            b = _concat_half(parts, BN)
-+        a = tl.load(
-+            X + routes[:, None] // IT * K + block * BK + kk[None, :], valid[:, None], 0
-+        )
-+        acc = tl.dot(a, b, acc)
-+        if PK == BK:
-+            bp += BK // 8 * N
-+        else:
-+            bp += tl.where(block % 2 == 1, PK // 8 * N, 0)
-+    outcols = cn * BN + tl.arange(0, BN)
-+    tl.store(
-+        Y + routes[:, None] * N + outcols[None, :],
-+        acc.to(tl.bfloat16),
-+        valid[:, None] & (outcols[None, :] < N),
-+    )
-+
-+
-+@triton.jit
 +def _marlin_tail_gemv(
 +    X,
 +    W,
@@ -2203,198 +2020,22 @@
 +    b = tl.join(bs[2], bs[3])
 +    q = tl.join(a, b)
 +    return tl.reshape(tl.trans(q, 3, 2, 0, 1), (64, BN))
-+
-+
-+def repack_experts(w13, s13, w2, s2):
-+    """Startup-only lossless byte rearrangement; replacement tensors have equal bytes."""
-+    tensors = (w13, s13, w2, s2)
-+    shapes = ((896, 192, 1792), (896, 192, 112), (896, 3584, 48), (896, 3584, 3))
-+    if any((tuple(t.shape) != shape for (t, shape) in zip(tensors, shapes))):
-+        raise ValueError("The packed expert backend requires the verified TP32 shapes")
-+    if any(
-+        (
-+            t.dtype != torch.uint8 or not t.is_contiguous() or t.device != w13.device
-+            for t in tensors
-+        )
-+    ):
-+        raise ValueError(
-+            "Expected contiguous checkpoint-native U8 weights/scales on one GPU"
-+        )
-+    (a, sa) = pack_matrix(w13, s13, 128)
-+    (b, sb) = pack_matrix(w2, s2, 32)
-+    result = (a, sa, b, sb)
-+    assert sum((t.numel() * t.element_size() for t in tensors)) == sum(
-+        (t.numel() * t.element_size() for t in result)
-+    )
-+    return result
-+
-+
-+def configs_for_tokens(tokens):
-+    """Fixed tested bins; no data-dependent autotuning or host reads of GPU routes."""
-+    block_m = 16 if tokens < 256 else 32 if tokens < 2048 else 64
-+    block_k1 = 128 if tokens < 2048 else 64
-+    warps1 = 8 if tokens == 4096 else 4
-+    return (block_m, block_k1, warps1)
-+
-+
-+def grouped_experts_packed(
-+    x, w13, s13, w2, s2, weights, ids, *, beta=4.0, linear_beta=25.0
-+):
-+    """Original BF16 materialization/FP32 SiTU+route order with one packed weight format."""
-+    if x.ndim != 2 or x.shape[1] != 3584 or x.dtype != torch.bfloat16:
-+        raise ValueError("Expected BF16 [tokens,3584] K3 expert inputs")
-+    m = x.shape[0]
-+    if (
-+        ids.shape != (m, 16)
-+        or weights.shape != ids.shape
-+        or weights.dtype != torch.float32
-+        or (ids.dtype not in (torch.int32, torch.int64))
-+    ):
-+        raise ValueError("Expected top16 integer routes and FP32 weights")
-+    shapes = ((896, 448, 192), (896, 112, 192), (896, 12, 3584), (896, 3, 3584))
-+    if any((tuple(t.shape) != shape for (t, shape) in zip((w13, s13, w2, s2), shapes))):
-+        raise ValueError("Invalid packed expert tensor shapes")
-+    if (
-+        w13.dtype != torch.int32
-+        or w2.dtype != torch.int32
-+        or s13.dtype != torch.uint8
-+        or (s2.dtype != torch.uint8)
-+    ):
-+        raise TypeError(
-+            "Expected U32 bit payload in int32 tensors and raw E8M0 U8 scales"
-+        )
-+    if not x.is_cuda or not all(
-+        (
-+            t.is_contiguous() and t.device == x.device
-+            for t in (x, w13, s13, w2, s2, weights, ids)
-+        )
-+    ):
-+        raise ValueError("Packed expert tensors must be contiguous on one GPU")
-+    if beta != 4.0 or linear_beta != 25.0:
-+        raise ValueError("Only K3 SiTU beta4/up25 is validated for this backend")
-+    if m == 0:
-+        return torch.empty_like(x)
-+    r = m * 16
-+    (bm, bk1, warps1) = configs_for_tokens(m)
-+    (sorted_ids, expert_ids, padded) = _alignment(ids, bm, 896)
-+    row_blocks = min(
-+        triton.cdiv(sorted_ids.numel(), bm), min(896, r) + (r - min(896, r)) // bm
-+    )
-+    scratch = torch.empty(r * 3584, dtype=torch.bfloat16, device=x.device)
-+    gate_up = scratch[: r * 192].view(r, 192)
-+    down = scratch.view(r, 3584)
-+    activated = torch.empty((r, 96), dtype=torch.bfloat16, device=x.device)
-+    output = torch.empty_like(x)
-+    if m <= 2:
-+        _marlin_tail_gemv[r, 48](
-+            x,
-+            w13,
-+            s13,
-+            gate_up,
-+            ids,
-+            r,
-+            192,
-+            3584,
-+            128,
-+            4,
-+            512,
-+            num_warps=4,
-+            num_stages=1,
-+            enable_fp_fusion=False,
-+        )
-+    else:
-+        _marlin_portable_mxfp4[row_blocks * 3,](
-+            x,
-+            w13,
-+            s13,
-+            gate_up,
-+            sorted_ids,
-+            expert_ids,
-+            padded,
-+            192,
-+            3584,
-+            row_blocks * bm,
-+            r,
-+            16,
-+            bm,
-+            64,
-+            bk1,
-+            1,
-+            PACK_K=128,
-+            num_warps=warps1,
-+            num_stages=2,
-+        )
-+    _situ[triton.cdiv(r * 96, 256),](
-+        gate_up,
-+        activated,
-+        r * 96,
-+        96,
-+        beta,
-+        linear_beta,
-+        256,
-+        num_warps=4,
-+        enable_fp_fusion=False,
-+    )
-+    _marlin_portable_mxfp4[row_blocks * 56,](
-+        activated,
-+        w2,
-+        s2,
-+        down,
-+        sorted_ids,
-+        expert_ids,
-+        padded,
-+        3584,
-+        96,
-+        row_blocks * bm,
-+        r,
-+        1,
-+        bm,
-+        64,
-+        32,
-+        1,
-+        PACK_K=32,
-+        num_warps=4,
-+        num_stages=2,
-+    )
-+    _weighted_sum[m, 14](
-+        down, weights, output, 3584, 16, 16, 256, num_warps=4, enable_fp_fusion=False
-+    )
-+    return output
 --- /dev/null
 +++ b/src/flaggems_vllm/ops/kimi_k3_metax/decode_experts.py
-@@ -0,0 +1,382 @@
-+"""K3 TP32 decode experts with startup-checked exact normal-scale decoding.
+@@ -0,0 +1,140 @@
++"""Shared packed-expert decode scheduling kernels used by TP8.
 +Uses exact arithmetic FP4 decoding with a startup-checked normal-scale specialization,
 +and DeepGEMM-inspired GPU-count-driven SM-strided G2 work scheduling.
 +Baseline MXFP4/E8M0 storage, BF16 boundaries and FP32 SiTU/route remain unchanged.
 +"""
 +
-+from flaggems_vllm.ops.kimi_k3_metax.prefill_experts import grouped_experts_prefill
 +
-+from flaggems_vllm.ops.kimi_k3_metax.expert_gemm import (
-+    _decode_math,
-+    _decode_normal_pair,
-+    _decode_words_math,
-+    _decode_half_words_math,
-+    _paired_arithmetic_mm,
-+    meta,
-+)
++from flaggems_vllm.ops.kimi_k3_metax.expert_gemm import _decode_words_math
 +
 +# SPDX-License-Identifier: Apache-2.0
-+import torch
 +import triton
 +import triton.language as tl
-+from flaggems_vllm.ops.kimi_k3_metax.decode_bits import decode_bits
-+from flaggems_vllm.ops.kimi_k3_metax.marlin_mxfp4 import (
-+    grouped_experts_packed,
-+    _decode_words,
-+    _concat_k,
-+    _decode_half_words,
-+    _concat_half,
-+    _marlin_tail_gemv,
-+)
-+from flaggems_vllm.ops.kimi_k3_metax.grouped_moe import _situ, _weighted_sum
-+from flaggems_vllm.ops.kimi_k3_metax.small_alignment import align_small as _alignment
++from flaggems_vllm.ops.kimi_k3_metax.marlin_mxfp4 import _decode_words, _concat_k
 +
 +
 +@triton.jit
@@ -2522,229 +2163,6 @@
 +            x = tl.load(X + route * K + block * 32 + kk).to(tl.float32)
 +            acc += tl.sum(x[:, None] * b, 0)
 +        tl.store(Y + route * N + cols, acc.to(tl.bfloat16), cols < N)
-+
-+
-+@triton.jit
-+def _adaptive_g2(
-+    X,
-+    W,
-+    S,
-+    Y,
-+    Ids,
-+    Sorted,
-+    Experts,
-+    Total,
-+    R: tl.constexpr,
-+    PROGRAMS: tl.constexpr,
-+    NORMAL: tl.constexpr,
-+):
-+    blocks = tl.load(Total) // 16
-+    if blocks * 4 >= R * 3:
-+        _route_gemv_g2(X, W, S, Y, Ids, R, 3584, 128, PROGRAMS, NORMAL)
-+    else:
-+        _paired_scheduled_mm(
-+            X,
-+            W,
-+            S,
-+            Y,
-+            Sorted,
-+            Experts,
-+            Total,
-+            3584,
-+            96,
-+            R,
-+            1,
-+            16,
-+            64,
-+            32,
-+            1,
-+            PROGRAMS,
-+            False,
-+            0,
-+            2 if NORMAL else 1,
-+        )
-+
-+
-+def prepare_decode_experts(packed):
-+    """Run once after immutable weights are prepared, outside timed execution/Graph."""
-+    if torch.cuda.is_current_stream_capturing():
-+        raise RuntimeError("prepare must run before Graph capture")
-+    w13, s13, w2, s2 = packed
-+    expected = ((896, 448, 192), (896, 112, 192), (896, 12, 3584), (896, 3, 3584))
-+    if any(tuple(t.shape) != shape for t, shape in zip(packed, expected)):
-+        raise ValueError("Only current TP32 packed shapes are supported")
-+    if (
-+        w13.dtype != torch.int32
-+        or w2.dtype != torch.int32
-+        or s13.dtype != torch.uint8
-+        or s2.dtype != torch.uint8
-+    ):
-+        raise TypeError("Expected packed int32 payload and raw E8M0 U8 scales")
-+    ranges = []
-+    for scale in (s13, s2):
-+        lo = int(scale.min().item())
-+        hi = int(scale.max().item())
-+        if hi == 255:
-+            raise ValueError("Non-finite E8M0 scale")
-+        ranges.append((lo, hi))
-+    return {
-+        "normal_flags": tuple(lo >= 2 and hi <= 252 for lo, hi in ranges),
-+        "scale_ranges": ranges,
-+        "sms": torch.cuda.get_device_properties(w13.device).multi_processor_count,
-+        "pointers": tuple(t.data_ptr() for t in packed),
-+        "weight_contract": "immutable packed weights; rerun prepare after any weight changes",
-+    }
-+
-+
-+def grouped_experts_decode(x, packed, weights, ids, prepared, record=None):
-+    m = x.shape[0]
-+    if m == 0 or m > 4096:
-+        return grouped_experts_packed(x, *packed, weights, ids)
-+    if (
-+        x.shape != (m, 3584)
-+        or x.dtype != torch.bfloat16
-+        or ids.shape != (m, 16)
-+        or weights.shape != (m, 16)
-+        or weights.dtype != torch.float32
-+    ):
-+        raise ValueError("Expected BF16 H3584 inputs and FP32 top16 routing")
-+    if ids.dtype not in (torch.int32, torch.int64) or not all(
-+        t.is_contiguous() and t.device == x.device for t in (x, weights, ids, *packed)
-+    ):
-+        raise ValueError("Expected contiguous tensors on the same GPU")
-+    if tuple(t.data_ptr() for t in packed) != prepared["pointers"]:
-+        raise ValueError("Prepared state does not belong to these weights")
-+    if m > 64:
-+        return grouped_experts_prefill(x, packed, weights, ids, prepared, record)
-+    w13, s13, w2, s2 = packed
-+    r = m * 16
-+    bm = 16
-+    fast_g2 = prepared["normal_flags"][1]
-+    if m > 2 or not fast_g2:
-+        si, ei, total = _alignment(ids, bm, 896)
-+        cap = min(triton.cdiv(si.numel(), bm), min(896, r) + (r - min(896, r)) // bm)
-+    scratch = torch.empty(r * 3584, dtype=torch.bfloat16, device=x.device)
-+    gu = scratch[: r * 192].view(r, 192)
-+    down = scratch.view(r, 3584)
-+    act = torch.empty((r, 96), dtype=torch.bfloat16, device=x.device)
-+    out = torch.empty_like(x)
-+    mode1 = 2 if prepared["normal_flags"][0] else 1
-+    mode2 = 2 if prepared["normal_flags"][1] else 1
-+    if m <= 2:
-+        first = _marlin_tail_gemv[(r, 48)](
-+            x,
-+            w13,
-+            s13,
-+            gu,
-+            ids,
-+            r,
-+            192,
-+            3584,
-+            128,
-+            4,
-+            512,
-+            num_warps=4,
-+            num_stages=1,
-+            enable_fp_fusion=False,
-+        )
-+    else:
-+        first = _paired_arithmetic_mm[(cap * 3,)](
-+            x,
-+            w13,
-+            s13,
-+            gu,
-+            si,
-+            ei,
-+            total,
-+            192,
-+            3584,
-+            cap * bm,
-+            r,
-+            16,
-+            bm,
-+            64,
-+            128,
-+            1,
-+            PACK_K=128,
-+            MODE=mode1,
-+            num_warps=4,
-+            num_stages=2,
-+        )
-+    _situ[(triton.cdiv(r * 96, 256),)](
-+        gu, act, r * 96, 96, 4.0, 25.0, 256, num_warps=4, enable_fp_fusion=False
-+    )
-+    if m <= 2 and fast_g2:
-+        # At most two token rows per expert: skip alignment and all BM16 padding.
-+        programs = min(r * 56, prepared["sms"] * 16)
-+        second = _route_gemv_g2[(programs,)](
-+            act,
-+            w2,
-+            s2,
-+            down,
-+            ids,
-+            r,
-+            3584,
-+            64,
-+            programs,
-+            prepared["normal_flags"][1],
-+            num_warps=1,
-+            num_stages=1,
-+            enable_fp_fusion=False,
-+        )
-+    elif m in (4, 8, 16, 32) and fast_g2:
-+        # One uniform GPU branch reuses the existing padded-block count.
-+        # Sparse batches use route GEMV; concentrated batches retain MMA reuse.
-+        programs = min(cap * 56, prepared["sms"] * 16)
-+        second = _adaptive_g2[(programs,)](
-+            act,
-+            w2,
-+            s2,
-+            down,
-+            ids,
-+            si,
-+            ei,
-+            total,
-+            r,
-+            programs,
-+            prepared["normal_flags"][1],
-+            num_warps=2,
-+            num_stages=1,
-+            enable_fp_fusion=False,
-+        )
-+    else:
-+        programs = min(cap * 28, prepared["sms"] * 16)
-+        second = _paired_scheduled_mm[(programs,)](
-+            act,
-+            w2,
-+            s2,
-+            down,
-+            si,
-+            ei,
-+            total,
-+            3584,
-+            96,
-+            r,
-+            1,
-+            bm,
-+            128,
-+            32,
-+            1,
-+            programs,
-+            DECODE_MODE=mode2,
-+            num_warps=4,
-+            num_stages=2,
-+        )
-+    _weighted_sum[(m, 14)](
-+        down, weights, out, 3584, 16, 16, 256, num_warps=4, enable_fp_fusion=False
-+    )
-+    if record is not None:
-+        record.update(
-+            G1=meta(first),
-+            G2=meta(second),
-+            normal_flags=prepared["normal_flags"],
-+            programs_G2=programs,
-+        )
-+    return out
 --- /dev/null
 +++ b/src/flaggems_vllm/ops/kimi_k3_metax/small_alignment.py
 @@ -0,0 +1,85 @@
@@ -3726,177 +3144,6 @@
 +        )
 +    return o, l
 --- /dev/null
-+++ b/src/flaggems_vllm/ops/kimi_k3_metax/prefill_experts.py
-@@ -0,0 +1,105 @@
-+"""K3 TP32 BF16 prefill experts, qualified shape tiles and exact FP32 combine.
-+
-+Original compressed weights, SiTU and BF16 materialization boundaries remain.
-+"""
-+
-+import torch
-+import triton
-+from flag_gems import runtime
-+from flaggems_vllm.ops.kimi_k3_metax.expert_gemm import _paired_arithmetic_mm, meta
-+from flaggems_vllm.ops.kimi_k3_metax.marlin_mxfp4 import configs_for_tokens
-+from flaggems_vllm.ops.kimi_k3_metax.grouped_moe import _alignment, _situ, _weighted_sum
-+from flaggems_vllm.ops.kimi_k3_metax.prefill_combine import combine_prefill
-+
-+
-+def grouped_experts_prefill(x, packed, weights, ids, prepared, record=None):
-+    m = x.shape[0]
-+    bm, bk1, _ = configs_for_tokens(m)
-+    warps1 = 8 if m >= 2048 else 4
-+    if m == 1024 and prepared["normal_flags"][0]:
-+        bk1, warps1 = 64, 8
-+    bn2 = 256 if m in (3553, 4096) and prepared["normal_flags"][1] else 128
-+    warps2 = 8 if bn2 == 256 else 4
-+    r = m * 16
-+    w13, s13, w2, s2 = packed
-+    sorted_ids, expert_ids, total = _alignment(ids, bm, 896)
-+    cap = min(
-+        triton.cdiv(sorted_ids.numel(), bm), min(896, r) + (r - min(896, r)) // bm
-+    )
-+    down = torch.empty((r, 3584), dtype=torch.bfloat16, device=x.device)
-+    gate_up = down.view(-1)[: r * 192].view(r, 192)
-+    activated = torch.empty((r, 96), dtype=torch.bfloat16, device=x.device)
-+    out = torch.empty_like(x)
-+    first = _paired_arithmetic_mm[(cap * 3,)](
-+        x,
-+        w13,
-+        s13,
-+        gate_up,
-+        sorted_ids,
-+        expert_ids,
-+        total,
-+        192,
-+        3584,
-+        cap * bm,
-+        r,
-+        16,
-+        bm,
-+        64,
-+        bk1,
-+        1,
-+        PACK_K=128,
-+        MODE=2 if prepared["normal_flags"][0] else 1,
-+        num_warps=warps1,
-+        num_stages=2,
-+    )
-+    _situ[(triton.cdiv(r * 96, 256),)](
-+        gate_up,
-+        activated,
-+        r * 96,
-+        96,
-+        4.0,
-+        25.0,
-+        256,
-+        num_warps=4,
-+        enable_fp_fusion=False,
-+    )
-+    second = _paired_arithmetic_mm[(cap * triton.cdiv(3584, bn2),)](
-+        activated,
-+        w2,
-+        s2,
-+        down,
-+        sorted_ids,
-+        expert_ids,
-+        total,
-+        3584,
-+        96,
-+        cap * bm,
-+        r,
-+        1,
-+        bm,
-+        bn2,
-+        32,
-+        1,
-+        PACK_K=32,
-+        MODE=2 if prepared["normal_flags"][1] else 1,
-+        num_warps=warps2,
-+        num_stages=2,
-+    )
-+    if 512 <= m <= 4096 and runtime.device.vendor_name == "metax":
-+        combine_prefill(down, weights, out)
-+    else:
-+        _weighted_sum[(m, 14)](
-+            down, weights, out, 3584, 16, 16, 256, num_warps=4, enable_fp_fusion=False
-+        )
-+    if record is not None:
-+        record.update(
-+            G1=meta(first),
-+            G2=meta(second),
-+            bm=bm,
-+            bk1=bk1,
-+            bn2=bn2,
-+            normal_flags=prepared["normal_flags"],
-+            programs_G2=cap * triton.cdiv(3584, bn2),
-+            persistent=False,
-+        )
-+    return out
---- /dev/null
-+++ b/src/flaggems_vllm/ops/kimi_k3_metax/prefill_combine.py
-@@ -0,0 +1,60 @@
-+"""Preserve the inspected C256/W4 reduction tree while widening the output tile.
-+The frozen reference first adds row-bit3, then0, then2, then1.
-+Explicit FP32 adds avoid a layout-dependent tl.sum rewrite.
-+"""
-+
-+import triton, triton.language as tl
-+from triton.language.extra import libdevice
-+
-+
-+@triton.jit
-+def _term(X, W, t, col, s, H: tl.constexpr):
-+    v = tl.load(X + (t * 16 + s) * H + col, col < H, 0).to(tl.float32)
-+    w = tl.load(W + t * 16 + s).to(tl.float32)
-+    product = libdevice.mul_rn(v, w)
-+    return tl.where(product == 0, 0.0, product)
-+
-+
-+@triton.jit
-+def _four(X, W, t, col, s, H: tl.constexpr, B0: tl.constexpr, B1: tl.constexpr):
-+    return (_term(X, W, t, col, s, H) + _term(X, W, t, col, s + (1 << B0), H)) + (
-+        _term(X, W, t, col, s + (1 << B1), H)
-+        + _term(X, W, t, col, s + (1 << B0) + (1 << B1), H)
-+    )
-+
-+
-+@triton.jit
-+def _combine_prefill(
-+    X,
-+    W,
-+    Y,
-+    H: tl.constexpr,
-+    C: tl.constexpr,
-+    B0: tl.constexpr = 3,
-+    B1: tl.constexpr = 0,
-+    B2: tl.constexpr = 2,
-+    B3: tl.constexpr = 1,
-+):
-+    t = tl.program_id(0)
-+    col = tl.program_id(1) * C + tl.arange(0, C)
-+    a = _four(X, W, t, col, 0, H, B0, B1) + _four(X, W, t, col, 1 << B2, H, B0, B1)
-+    b = _four(X, W, t, col, 1 << B3, H, B0, B1) + _four(
-+        X, W, t, col, (1 << B2) + (1 << B3), H, B0, B1
-+    )
-+    z = a + b
-+    tl.store(Y + t * H + col, z.to(tl.bfloat16), col < H)
-+
-+
-+def combine_prefill(route_output, weights, output):
-+    """Caller guarantees current K3 BF16 route output, FP32 weights and H3584/top16."""
-+    m = output.shape[0]
-+    return _combine_prefill[(m, 1)](
-+        route_output,
-+        weights,
-+        output,
-+        3584,
-+        4096,
-+        num_warps=8,
-+        num_stages=1,
-+        enable_fp_fusion=False,
-+    )
---- /dev/null
 +++ b/src/flaggems_vllm/ops/kimi_k3_metax/mla_decode_b2.py
 @@ -0,0 +1,404 @@
 +"""Selective B2 split-K decode; old arithmetic retained outside257..4096KV."""
@@ -4304,137 +3551,6 @@
 +        )
 +    return True
 --- /dev/null
-+++ b/src/flaggems_vllm/ops/kimi_k3_metax/ep_experts.py
-@@ -0,0 +1,128 @@
-+"""Device-side routing, SiTU and FP32 combine for the packed EP expert path."""
-+
-+import torch
-+import triton
-+import triton.language as tl
-+from flag_gems.utils import tl_extra_shim
-+from flaggems_vllm.ops.moe_align_block_size import (
-+    moe_align_block_size_no_tle,
-+    moe_align_block_size_singleton,
-+)
-+
-+_tanh = tl_extra_shim.tanh
-+_exp2 = tl_extra_shim.exp2
-+
-+
-+@triton.jit
-+def _weighted_sum(
-+    ROUTE_OUTPUT,
-+    WEIGHTS,
-+    OUTPUT,
-+    IDS,
-+    EXPERT_MAP,
-+    USE_EP: tl.constexpr,
-+    H: tl.constexpr,
-+    TOPK: tl.constexpr,
-+    RT: tl.constexpr,
-+    BLOCK: tl.constexpr,
-+):
-+    token = tl.program_id(0)
-+    columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-+    slots = tl.arange(0, RT)
-+    valid_slot = slots < TOPK
-+    if USE_EP:
-+        expert = tl.load(IDS + token * TOPK + slots, valid_slot, 0).to(tl.int64)
-+        local_expert = tl.load(EXPERT_MAP + expert, valid_slot, -1)
-+        valid_slot = valid_slot & (local_expert >= 0)
-+    values = tl.load(
-+        ROUTE_OUTPUT + (token * TOPK + slots[:, None]) * H + columns[None, :],
-+        valid_slot[:, None] & (columns[None, :] < H),
-+        0,
-+    ).to(tl.float32)
-+    weights = tl.load(WEIGHTS + token * TOPK + slots, slots < TOPK, 0).to(tl.float32)
-+    result = tl.sum(values * weights[:, None], axis=0)
-+    # EP keeps partial route sums in FP32 until the cross-rank combine.
-+    tl.store(OUTPUT + token * H + columns, result, columns < H)
-+
-+
-+def _alignment(ids, block_m, experts):
-+    if ids.shape[0] == 1:
-+        return moe_align_block_size_singleton(ids, block_m)
-+    # Padding is for routing metadata only. It lets the existing vectorized
-+    # prefix-scan run for E=896; no weight matrix or model expert is added.
-+    metadata_experts = triton.next_power_of_2(experts)
-+    return moe_align_block_size_no_tle(ids, block_m, metadata_experts)
-+
-+
-+@triton.jit
-+def _map_local_experts(
-+    IDS,
-+    EXPERT_MAP,
-+    LOCAL_IDS,
-+    ROUTES: tl.constexpr,
-+    REMOTE_EXPERT: tl.constexpr,
-+    BLOCK: tl.constexpr,
-+):
-+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-+    experts = tl.load(IDS + offsets, offsets < ROUTES, 0).to(tl.int64)
-+    local = tl.load(EXPERT_MAP + experts, offsets < ROUTES, -1)
-+    tl.store(
-+        LOCAL_IDS + offsets,
-+        tl.where(local >= 0, local, REMOTE_EXPERT),
-+        offsets < ROUTES,
-+    )
-+
-+
-+@triton.jit
-+def _situ_local(
-+    GATE_UP,
-+    ACTIVATED,
-+    SORTED,
-+    EXPERTS,
-+    TOTAL,
-+    ROUTES: tl.constexpr,
-+    LOCAL_EXPERTS: tl.constexpr,
-+    I: tl.constexpr,
-+    BM: tl.constexpr,
-+    BN: tl.constexpr,
-+    BETA: tl.constexpr,
-+    LINEAR_BETA: tl.constexpr,
-+):
-+    row_block = tl.program_id(0)
-+    if row_block * BM >= tl.load(TOTAL):
-+        return
-+    expert = tl.load(EXPERTS + row_block)
-+    if expert < 0 or expert >= LOCAL_EXPERTS:
-+        return
-+    rows = tl.load(SORTED + row_block * BM + tl.arange(0, BM))
-+    columns = tl.program_id(1) * BN + tl.arange(0, BN)
-+    valid = (rows[:, None] < ROUTES) & (columns[None, :] < I)
-+    gate = tl.load(GATE_UP + rows[:, None] * (2 * I) + columns[None, :], valid, 0).to(
-+        tl.float32
-+    )
-+    up = tl.load(GATE_UP + rows[:, None] * (2 * I) + I + columns[None, :], valid, 0).to(
-+        tl.float32
-+    )
-+    sigmoid = 1.0 / (1.0 + _exp2(-gate * 1.4426950408889634))
-+    gate = BETA * _tanh(gate / BETA) * sigmoid
-+    if LINEAR_BETA > 0:
-+        up = LINEAR_BETA * _tanh(up / LINEAR_BETA)
-+    result = tl.fma(gate, up, 0.0).to(tl.bfloat16)
-+    tl.store(ACTIVATED + rows[:, None] * I + columns[None, :], result, valid)
-+
-+
-+def _local_alignment(ids, expert_map, block_m, local_experts):
-+    # FGV's four-stage aligner requires nonnegative IDs. Consolidate all
-+    # remote routes into one final metadata-only bucket; no extra weight exists.
-+    metadata_experts = triton.next_power_of_2(local_experts + 1)
-+    local_ids = torch.empty_like(ids, dtype=torch.int32)
-+    _map_local_experts[(triton.cdiv(ids.numel(), 256),)](
-+        ids,
-+        expert_map,
-+        local_ids,
-+        ids.numel(),
-+        metadata_experts - 1,
-+        256,
-+        num_warps=4,
-+    )
-+    return _alignment(local_ids, block_m, metadata_experts)
---- /dev/null
 +++ b/src/flaggems_vllm/ops/kimi_k3_metax/mla_tp8.py
 @@ -0,0 +1,252 @@
 +"""TP8 MLA decode:12query heads,page768,staged BF16QK/PV and FP32merge."""
@@ -4690,198 +3806,6 @@
 +        )
 +    return out, lse
 --- /dev/null
-+++ b/src/flaggems_vllm/ops/kimi_k3_metax/ep_packed.py
-@@ -0,0 +1,189 @@
-+"""Lossless EP14 word packing and the already-qualified paired BF16 decoder."""
-+
-+import torch, triton
-+from flaggems_vllm.ops.kimi_k3_metax.marlin_mxfp4 import pack_matrix
-+from flaggems_vllm.ops.kimi_k3_metax.expert_gemm import _paired_arithmetic_mm
-+from flaggems_vllm.ops.kimi_k3_metax.ep_experts import (
-+    _local_alignment,
-+    _situ_local,
-+    _weighted_sum,
-+)
-+from flaggems_vllm.ops.kimi_k3_metax.ep_decode_routes import align as align_decode
-+
-+
-+def prepare(w13, s13, w2, s2):
-+    if torch.cuda.is_current_stream_capturing():
-+        raise RuntimeError("Pack immutable expert weights before Graph capture")
-+    shapes = ((14, 6144, 1792), (14, 6144, 112), (14, 3584, 1536), (14, 3584, 96))
-+    tensors = (w13, s13, w2, s2)
-+    if any(
-+        tuple(t.shape) != shape
-+        or t.dtype != torch.uint8
-+        or not t.is_contiguous()
-+        or t.device != w13.device
-+        for t, shape in zip(tensors, shapes)
-+    ):
-+        raise ValueError("Expected checkpoint-native EP14 full experts")
-+    ranges = [(int(s.min().item()), int(s.max().item())) for s in (s13, s2)]
-+    if any(hi == 255 for lo, hi in ranges):
-+        raise ValueError("Non-finite E8M0 scale")
-+    a, sa = pack_matrix(w13, s13, 32)
-+    b, sb = pack_matrix(w2, s2, 32)
-+    packed = (a, sa, b, sb)
-+    before = sum(t.numel() * t.element_size() for t in tensors)
-+    after = sum(t.numel() * t.element_size() for t in packed)
-+    assert before == after
-+    return packed, {
-+        "normal_flags": [lo >= 2 and hi <= 252 for lo, hi in ranges],
-+        "scale_ranges": ranges,
-+        "resident_bytes": after,
-+        "storage_tile": 32,
-+    }
-+
-+
-+def run(
-+    x, packed, weights, ids, expert_map, prepared, *, bn=128, warps=8, gm=8, record=None
-+):
-+    m, h = x.shape
-+    e = 14
-+    i = 3072
-+    r = m * 16
-+    if h != 3584 or x.dtype != torch.bfloat16 or not x.is_cuda or not x.is_contiguous():
-+        raise ValueError("Expected BF16 EP latent tokens")
-+    if (
-+        tuple(ids.shape) != (m, 16)
-+        or ids.dtype not in (torch.int32, torch.int64)
-+        or weights.shape != ids.shape
-+        or weights.dtype != torch.float32
-+    ):
-+        raise ValueError("Expected top16 routes")
-+    if expert_map.dtype != torch.int32 or tuple(expert_map.shape) != (896,):
-+        raise ValueError("Expected canonical global-to-local map")
-+    w13, s13, w2, s2 = packed
-+    if any(
-+        tuple(t.shape) != shape
-+        for t, shape in zip(
-+            packed, ((14, 448, 6144), (14, 112, 6144), (14, 384, 3584), (14, 96, 3584))
-+        )
-+    ):
-+        raise ValueError("Incorrect packed EP14 dimensions")
-+    if (
-+        w13.dtype != torch.int32
-+        or w2.dtype != torch.int32
-+        or any(
-+            t.device != x.device or not t.is_contiguous()
-+            for t in (*packed, weights, ids, expert_map)
-+        )
-+    ):
-+        raise ValueError("Packed tensors must be contiguous on one device")
-+    if bn not in (32, 64, 128) or warps not in (4, 8) or gm not in (1, 4, 8, 16):
-+        raise ValueError("Unqualified tile option")
-+    if m == 0:
-+        return torch.empty_like(x, dtype=torch.float32)
-+    bm = 16 if m < 256 else 32 if m < 2048 else 64
-+    if m <= 128:
-+        # EP decode has few token rows per full expert. Smaller N tiles and
-+        # compact local blocks avoid using the prefill launch layout here.
-+        bn, warps, gm = 64, 4, 1
-+        sorted_ids, expert_ids, total = align_decode(ids, expert_map, bm, e)
-+    else:
-+        # Keep M tiles unchanged: smaller M tiles lost badly on skewed routes.
-+        # These prefill N/warp choices improved both uniform and skewed cases.
-+        if 256 <= m < 2048:
-+            bn, warps, gm = 64, 4, 8
-+        elif 2048 <= m <= 4096:
-+            bn, warps, gm = 128, 4, 8
-+        sorted_ids, expert_ids, total = _local_alignment(ids, expert_map, bm, e)
-+    blocks = triton.cdiv(sorted_ids.numel(), bm)
-+    scratch = torch.empty(r * 6144, dtype=torch.bfloat16, device=x.device)
-+    up = scratch.view(r, 6144)
-+    down = scratch[: r * h].view(r, h)
-+    activated = torch.empty((r, i), dtype=torch.bfloat16, device=x.device)
-+    out = torch.empty_like(x, dtype=torch.float32)
-+    first = _paired_arithmetic_mm[(blocks * triton.cdiv(6144, bn),)](
-+        x,
-+        w13,
-+        s13,
-+        up,
-+        sorted_ids,
-+        expert_ids,
-+        total,
-+        6144,
-+        3584,
-+        blocks * bm,
-+        r,
-+        16,
-+        bm,
-+        bn,
-+        32,
-+        gm,
-+        PACK_K=32,
-+        MODE=2 if prepared["normal_flags"][0] else 1,
-+        EXPERT_LIMIT=e,
-+        num_warps=warps,
-+        num_stages=1,
-+    )
-+    _situ_local[(blocks, triton.cdiv(i, 128))](
-+        up,
-+        activated,
-+        sorted_ids,
-+        expert_ids,
-+        total,
-+        r,
-+        e,
-+        i,
-+        bm,
-+        128,
-+        4.0,
-+        25.0,
-+        num_warps=4,
-+        enable_fp_fusion=False,
-+    )
-+    second = _paired_arithmetic_mm[(blocks * triton.cdiv(h, bn),)](
-+        activated,
-+        w2,
-+        s2,
-+        down,
-+        sorted_ids,
-+        expert_ids,
-+        total,
-+        h,
-+        i,
-+        blocks * bm,
-+        r,
-+        1,
-+        bm,
-+        bn,
-+        32,
-+        gm,
-+        PACK_K=32,
-+        MODE=2 if prepared["normal_flags"][1] else 1,
-+        EXPERT_LIMIT=e,
-+        num_warps=warps,
-+        num_stages=1,
-+    )
-+    _weighted_sum[(m, triton.cdiv(h, 256))](
-+        down,
-+        weights,
-+        out,
-+        ids,
-+        expert_map,
-+        True,
-+        h,
-+        16,
-+        16,
-+        256,
-+        num_warps=4,
-+        enable_fp_fusion=False,
-+    )
-+    if record is not None:
-+        record.update(
-+            bm=bm,
-+            G1={"n_regs": first.n_regs, "n_spills": first.n_spills},
-+            G2={"n_regs": second.n_regs, "n_spills": second.n_spills},
-+            bn=bn,
-+            warps=warps,
-+            gm=gm,
-+            **prepared,
-+        )
-+    return out
---- /dev/null
 +++ b/src/flaggems_vllm/ops/kimi_k3_metax/mla_bmm.py
 @@ -0,0 +1,85 @@
 +"""TP8 MLA Q absorption; original V restoration is retained."""
@@ -5066,91 +3990,9 @@
 +        )
 +    return outputs
 --- /dev/null
-+++ b/src/flaggems_vllm/ops/kimi_k3_metax/ep_decode_routes.py
-@@ -0,0 +1,79 @@
-+"""Stable local expert alignment, GPU counts, no remote padding bucket."""
-+
-+import torch, triton
-+import triton.language as tl
-+
-+
-+@triton.jit
-+def _count(IDS, MAP, COUNTS, R: tl.constexpr, B: tl.constexpr):
-+    e = tl.program_id(0)
-+    rr = tl.arange(0, B)
-+    g = tl.load(IDS + rr, rr < R, 0).to(tl.int64)
-+    local = tl.load(MAP + g, rr < R, -1)
-+    count = tl.sum(((rr < R) & (local == e)).to(tl.int32), 0)
-+    tl.store(COUNTS + e, count)
-+
-+
-+@triton.jit
-+def _scatter(
-+    IDS,
-+    MAP,
-+    COUNTS,
-+    SORTED,
-+    EXPERTS,
-+    TOTAL,
-+    R: tl.constexpr,
-+    CAP: tl.constexpr,
-+    BM: tl.constexpr,
-+    B: tl.constexpr,
-+    E: tl.constexpr,
-+):
-+    e = tl.program_id(0)
-+    ee = tl.arange(0, 16)
-+    counts = tl.load(COUNTS + ee, ee < E, 0)
-+    padded = tl.cdiv(counts, BM) * BM
-+    offset = tl.sum(tl.where(ee < e, padded, 0), 0)
-+    count = tl.load(COUNTS + e)
-+    size = tl.cdiv(count, BM) * BM
-+    if e == 0:
-+        tl.store(TOTAL, tl.sum(padded, 0))
-+    cc = tl.arange(0, triton.next_power_of_2(CAP))
-+    tl.store(SORTED + offset + cc, R, cc < size)
-+    tl.debug_barrier()
-+    rr = tl.arange(0, B)
-+    g = tl.load(IDS + rr, rr < R, 0).to(tl.int64)
-+    local = tl.load(MAP + g, rr < R, -1)
-+    keep = (rr < R) & (local == e)
-+    pos = tl.cumsum(keep.to(tl.int32), 0) - 1
-+    tl.store(SORTED + offset + pos, rr, keep)
-+    bb = tl.arange(0, triton.next_power_of_2(CAP // BM))
-+    tl.store(EXPERTS + offset // BM + bb, e, bb < size // BM)
-+
-+
-+def align(ids, expert_map, bm, e):
-+    m = ids.shape[0]
-+    r = ids.numel()
-+    if ids.shape != (m, 16) or not 1 <= m <= 128:
-+        raise ValueError("decode unique top16, 1..128 token rows required")
-+    # Unique top-k IDs bound each expert to at most M rows. Counts stay on GPU.
-+    cap = triton.cdiv(m, bm) * bm
-+    si = torch.empty(e * cap, dtype=torch.int32, device=ids.device)
-+    ei = torch.empty(e * cap // bm, dtype=torch.int32, device=ids.device)
-+    total = torch.empty(1, dtype=torch.int32, device=ids.device)
-+    counts = torch.empty(e, dtype=torch.int32, device=ids.device)
-+    _count[e,](ids, expert_map, counts, r, triton.next_power_of_2(r), num_warps=4)
-+    _scatter[e,](
-+        ids,
-+        expert_map,
-+        counts,
-+        si,
-+        ei,
-+        total,
-+        r,
-+        cap,
-+        bm,
-+        triton.next_power_of_2(r),
-+        e,
-+        num_warps=4,
-+    )
-+    return (si, ei, total)
---- /dev/null
 +++ b/src/flaggems_vllm/ops/kimi_k3_metax/tp8_experts.py
-@@ -0,0 +1,301 @@
-+"""Ordinary TP8 experts: reuse the TP32 lossless layout and paired FP4 kernels.
+@@ -0,0 +1,300 @@
++"""Ordinary TP8 experts: use the lossless packed layout and paired FP4 kernels.
 +
 +TP8 keeps all 896 experts with I384. BF16 GEMM boundaries, FP32 SiTU
 +and the existing top16 reduction remain unchanged.
@@ -5159,11 +4001,10 @@
 +import torch
 +import triton
 +from flaggems_vllm.ops.kimi_k3_metax.marlin_mxfp4 import pack_matrix, _marlin_tail_gemv
++from flaggems_vllm.ops.kimi_k3_metax.expert_gemm import _paired_arithmetic_mm, meta
 +from flaggems_vllm.ops.kimi_k3_metax.decode_experts import (
-+    _paired_arithmetic_mm,
 +    _paired_scheduled_mm,
 +    _route_gemv_g2,
-+    meta,
 +)
 +from flaggems_vllm.ops.kimi_k3_metax.grouped_moe import _alignment, _situ, _weighted_sum
 +from flaggems_vllm.ops.kimi_k3_metax.small_alignment import align_small
@@ -5463,7 +4304,7 @@
 +
 +import triton
 +import triton.language as tl
-+from flaggems_vllm.ops.kimi_k3_metax.decode_experts import _decode_words_math
++from flaggems_vllm.ops.kimi_k3_metax.expert_gemm import _decode_words_math
 +from flaggems_vllm.ops.kimi_k3_metax.marlin_mxfp4 import _concat_k
 +from flaggems_vllm.ops.kimi_k3_metax.grouped_moe import _tanh, _exp2
 +
@@ -5818,14 +4659,3 @@
 +        )
 +        return
 +    out.copy_(situ(x, beta, linear_beta if linear_beta > 0 else None))
---- /dev/null
-+++ b/src/flaggems_vllm/ops/kimi_k3_metax/attn_res_padding.py
-@@ -0,0 +1,8 @@
-+from vllm.triton_utils import triton, tl
-+
-+
-+@triton.jit
-+def _bf16_pad(X, Y, N: tl.constexpr, P: tl.constexpr, BLOCK: tl.constexpr):
-+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-+    value = tl.load(X + i, i < N, other=0)
-+    tl.store(Y + i, value, i < P)

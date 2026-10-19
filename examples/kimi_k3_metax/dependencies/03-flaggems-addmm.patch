@@ -22,7 +22,7 @@
      key=["M", "N", "K", "stride_am", "stride_bk"],
      strategy=["align32", "align32", "align32", "align32", "align32"],
      warmup=5,
-@@ -131,11 +144,60 @@
+@@ -131,11 +144,26 @@
      tl.store(c_ptrs, result.to(c_ptr.dtype.element_ty), mask=mask)
  
  
@@ -37,42 +37,8 @@
 +
 +
 +_K3_ADDMM_KERNEL = _raw_addmm_kernel()
-+_K3_TP32_U_TILES = {
-+    1: (32, 64, 64, 4, 2),
-+    64: (32, 64, 64, 4, 2),
-+    1024: (32, 64, 64, 4, 2),
-+    3553: (64, 128, 32, 4, 1),
-+    4096: (64, 128, 32, 4, 1),
-+}
 +
 +
-+def _k3_tp32_addmm_config(mat1, mat2, bias, out, alpha, beta):
-+    """Measured U tiles for temporary-output or disjoint-input direct-write calls."""
-+    M, K = mat1.shape
-+    N = mat2.shape[1]
-+    if not (
-+        runtime.device.vendor_name == "metax"
-+        and isinstance(M, int) and M in _K3_TP32_U_TILES
-+        and (N, K) == (224, 3584)
-+        and mat1.dtype == mat2.dtype == bias.dtype == out.dtype == torch.bfloat16
-+        and tuple(mat1.stride()) == (3584, 1)
-+        and tuple(mat2.stride()) == (1, 3584)
-+        and bias.ndim == 2 and bias.stride(1) == 1
-+        and (M == 1 or bias.stride(0) == 7168)
-+        and ((tuple(out.stride()) == (N, 1) and bias.data_ptr() != out.data_ptr())
-+             or (out.data_ptr() == bias.data_ptr() and out.stride(1) == bias.stride(1)
-+                 and (M == 1 or out.stride(0) == bias.stride(0))
-+                 and out.untyped_storage().data_ptr() not in
-+                 (mat1.untyped_storage().data_ptr(), mat2.untyped_storage().data_ptr())))
-+        and isinstance(alpha, (int, float)) and isinstance(beta, (int, float))
-+        and alpha == 1 and beta == 1
-+    ):
-+        return None
-+    bm, bn, bk, warps, stages = _K3_TP32_U_TILES[M]
-+    return {
-+        "BLOCK_SIZE_M": bm, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk,
-+        "num_warps": warps, "num_stages": stages,
-+    }
 +
 +
  def _addmm_impl(bias, mat1, mat2, out, beta, alpha):
@@ -85,24 +51,4 @@
 +    )
      M, K = mat1.shape
      _, N = mat2.shape
- 
-@@ -166,8 +228,10 @@
-         triton.cdiv(M, META["BLOCK_SIZE_M"]),
-         triton.cdiv(N, META["BLOCK_SIZE_N"]),
-     )
-+    fixed_config = _k3_tp32_addmm_config(mat1, mat2, bias, out, alpha, beta)
-+    kernel = _K3_ADDMM_KERNEL if fixed_config is not None else addmm_kernel
-     with torch_device_fn.device(mat1.device):
--        addmm_kernel[grid](
-+        kernel[grid](
-             mat1,
-             mat2,
-             bias,
-@@ -189,6 +253,7 @@
-             BIAS_IS_SCALAR=bias_is_scalar,
-             HAS_K=K > 0,
-             IS_FP64=mat1.dtype == torch.float64,
-+            **(fixed_config or {}),
-         )
-     return out
  

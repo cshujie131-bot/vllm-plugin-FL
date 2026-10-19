@@ -8,8 +8,6 @@ class K3ExecutionConfig:
     enabled: bool = False
     tp8_compute: bool = False
     host_pp_feedback: bool = False
-    ep_allreduce: bool = False
-    feature_striped: bool = False
 
     @classmethod
     def from_vllm(cls, config, *, vendor):
@@ -26,24 +24,16 @@ class K3ExecutionConfig:
             return cls()
         p = config.parallel_config
         options = config.additional_config.get("k3", {})
-        unknown = set(options) - {"expert_transport"}
-        if unknown:
-            raise ValueError(f"Unknown K3 execution options: {sorted(unknown)}")
-        transport = options.get("expert_transport", "native")
-        if transport not in ("native", "tp8_dp8_allreduce", "feature_striped"):
-            raise ValueError(f"Unknown K3 expert transport: {transport}")
-        ep_allreduce = transport != "native"
-        if ep_allreduce and not (
-            p.tensor_parallel_size == 8
-            and p.data_parallel_size == 8
-            and p.pipeline_parallel_size == 1
-            and p.enable_expert_parallel
+        if options:
+            raise ValueError(f"Unknown K3 execution options: {sorted(options)}")
+        if (
+            p.tensor_parallel_size != 8
+            or p.data_parallel_size != 1
+            or p.enable_expert_parallel
         ):
-            raise ValueError("K3 explicit EP transport requires TP8/DP8/PP1/EP64")
+            raise ValueError("K3 MetaX requires TP8/DP1 with EP disabled")
         return cls(
             enabled=True,
             tp8_compute=p.tensor_parallel_size == 8,
             host_pp_feedback=p.pipeline_parallel_size > 1,
-            ep_allreduce=ep_allreduce,
-            feature_striped=transport == "feature_striped",
         )

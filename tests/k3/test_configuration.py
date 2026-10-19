@@ -26,7 +26,6 @@ class ConfigurationTests(unittest.TestCase):
         self.assertTrue(
             policy.enabled and policy.tp8_compute and policy.host_pp_feedback
         )
-        self.assertFalse(policy.ep_allreduce or policy.feature_striped)
 
     def test_other_vendor_does_not_activate_k3(self):
         self.assertEqual(
@@ -57,8 +56,8 @@ class ConfigurationTests(unittest.TestCase):
                 config(options={"enable_fast": True}), vendor="metax"
             )
 
-    def test_unknown_transport_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "Unknown K3 expert transport"):
+    def test_removed_transport_option_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unknown K3 execution"):
             K3ExecutionConfig.from_vllm(
                 config(options={"expert_transport": "other"}), vendor="metax"
             )
@@ -69,6 +68,26 @@ class ConfigurationTests(unittest.TestCase):
                 K3ExecutionConfig.from_vllm(
                     config(options={"expert_transport": transport}), vendor="metax"
                 )
+
+    def test_removed_topologies_are_rejected(self):
+        for topology in (
+            dict(tp=32, pp=1),
+            dict(tp=8, pp=1, dp=8, ep=True),
+            dict(tp=8, pp=4, ep=True),
+            dict(tp=8, pp=4, dp=2),
+        ):
+            with (
+                self.subTest(topology=topology),
+                self.assertRaisesRegex(ValueError, "TP8/DP1 with EP disabled"),
+            ):
+                K3ExecutionConfig.from_vllm(config(**topology), vendor="metax")
+
+    def test_pipeline_depth_preserves_tp8_policy(self):
+        for pp in (2, 4, 8):
+            with self.subTest(pp=pp):
+                policy = K3ExecutionConfig.from_vllm(config(pp=pp), vendor="metax")
+                self.assertTrue(policy.enabled and policy.tp8_compute)
+                self.assertTrue(policy.host_pp_feedback)
 
     def test_single_pipeline_stage_has_no_feedback(self):
         self.assertFalse(

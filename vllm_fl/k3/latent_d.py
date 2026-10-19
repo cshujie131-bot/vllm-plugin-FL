@@ -82,21 +82,18 @@ def project_grouped(x, weight, *, group_rows=4096, out_dtype=None):
         and x.dtype == weight.dtype == torch.bfloat16
         and (out_dtype is None or out_dtype == torch.bfloat16)
         and x.ndim == weight.ndim == 2
-        and tuple(weight.shape) in ((112, 7168), (448, 7168), (896, 3584))
+        and tuple(weight.shape) in ((448, 7168), (896, 3584))
         and x.shape[1] == weight.shape[1]
         and weight.is_contiguous()
         and x.stride(1) == 1
         and 65 <= m <= 4096
     ):
         return old_project(x, weight, out_dtype=out_dtype)
-    if weight.shape[0] != 112 and m < 128:
+    if m < 128:
         return old_project(x, weight, out_dtype=out_dtype)
     assert group_rows in (64, 128, 256, 512, 1024, 4096)
     n, k = weight.shape
-    if n != 112:
-        group_rows = min(
-            group_rows, 256
-        )  # Qualified eager TP8 path; D partials <=7MiB.
+    group_rows = min(group_rows, 256)  # Qualified eager TP8 path; D partials <=7MiB.
     full_rows = m // 64 * 64
     out = torch.empty((m, n), device=x.device, dtype=torch.bfloat16)
     wt = weight.t()

@@ -32,8 +32,8 @@ Paths without a prefix in the table are under `vllm_fl/k3/`.
 The patches in `dependencies/` are incremental, grouped by function; no full
 operator library, deployment tree or private binary is included.
 Unchanged model loading, processors, metadata and execution skeletons are reused
-from public vLLM. The two longer forward overrides and KDA wrappers whose globals
-resolve changed kernels are retained to preserve accepted semantics.
+from public vLLM. The model forward methods are inherited from the pinned public vLLM factories.
+KDA wrappers whose globals resolve changed kernels preserve accepted semantics.
 Existing SDK wrappers are amended in place, not duplicated.
 
 ## Version contract
@@ -143,8 +143,9 @@ Remaining explicit boundaries:
 - `flagos_mm.py` uses pinned FlagGems MetaX kernel/tuner internals.
 - Runner-owned workspace is budgeted before KV sizing; receive storage is
   released only after the fixed-input copy. Math kernels do not own those policies.
-- Imported historical EP/TP32 helpers remain; integrated qualification here is
-  TP8/PP4/DP1, EP/SP off.
+- Historical EP/TP32 dispatch and dedicated helpers are removed. The K3 policy
+  accepts TP8/DP1 with EP off; PP feedback is selected by pipeline depth.
+  Shared packed-expert arithmetic used by TP8 is retained.
 - Lint found a missing `_decode_half_words` import in an existing non-normal-scale
   fallback. The existing same-library helper is now imported; its math is unchanged.
 - Controllers, GPU eviction guards, benchmarks, profiles, logs, weights and caches
