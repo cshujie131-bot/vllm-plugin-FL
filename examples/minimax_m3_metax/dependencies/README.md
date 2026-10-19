@@ -1,14 +1,23 @@
 # Operator dependencies
 
-Apply these patches in the order in manifest.json. They are incremental source
-changes, not copies of either operator library.
+Use prepare_dependencies.py rather than applying the patches to an unprepared
+tree. It first imports two source files from pinned public vLLM into the FGV
+copy, then applies the patches in manifest order. The import paths and hashes
+are explicit in manifest.json; the source checkouts remain read-only.
 
 | Library | Public base | Patch group |
 |---|---|---|
 | FlagGems | a7620cc191a0b42e040194622c5758b22a7a25dc (v5.3.5) | 01 Linear kernels/policy; 02 generic masked_fill_ selection; 03 explicit alignment policy |
 | FlagGems-vllm | b5c2c2249319277ccda4d41aa0f65164bd9b2a19 (release v0.2.0) | 01 MSA; 02 norm/activation/QKV; 03 MoE/router; 04 cache/import compatibility |
 
-The implementations originate from the accepted MiniMax M3 adaptation and
+For index_native.py and sparse_native.py, the baseline is vLLM
+ee0da84ab9e04ac7610e28580af62c365e898389, respectively
+vllm/models/minimax_m3/common/ops/index_topk.py and sparse_attn.py.
+Their unchanged computation is not counted as a new optimization. Patch 01
+shows only the changes to these imported files, plus the genuinely additional
+MSA paths. FGV does not import vLLM at runtime.
+
+The remaining implementations originate from the accepted MiniMax M3 adaptation and
 optimization work. vLLM and FlagGems copyright/license attribution is retained.
 This packaging preserves the MetaX launch choices and numerical contract; it does
 not run a new NVIDIA autotuning search or present migration as a new kernel

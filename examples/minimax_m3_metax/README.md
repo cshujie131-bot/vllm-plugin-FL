@@ -50,13 +50,16 @@ git -C /work/FlagGems-vllm checkout b5c2c2249319277ccda4d41aa0f65164bd9b2a19
 python examples/minimax_m3_metax/prepare_dependencies.py \
   --flag-gems-source /work/FlagGems \
   --fgv-source /work/FlagGems-vllm \
+  --vllm-source /work/vllm \
   --output /work/m3-dependencies --install
 
 python -m pip install --no-deps --no-build-isolation -e .
 ~~~
 
-Preparation checks the public commits, creates separate copies and applies the
-patches in manifest order. It refuses a dirty source or an existing output
+Preparation checks the public commits, creates separate copies, and reads two
+MSA kernel files from the pinned vLLM source into the FGV copy. Their exact
+hashes are checked before applying the incremental patches in manifest order.
+No installed vLLM source is modified, and FGV has no runtime dependency on vLLM. It refuses a dirty source or an existing output
 directory. It does not modify the supplied checkouts. An empty-target wheel labeled 0.24.0+flagos is accepted only when its guarded
 APIs and M3 model files match the public v0.24.0 sources. Old vendor images with
 locally modified M3 files must install the clean source above.
@@ -82,6 +85,8 @@ attention shape rules, dispatch policy and standard runtime/communication
 variables. The launcher clears obsolete optimization switches before starting a
 fresh Python process.
 
+The migrated vLLM kernels are compiled with FlagTree; source reuse does not
+change their compiler or switch them to native binary operators.
 Supply the installed FlagTree root containing triton/; it is used as the compiler
 import prefix. The example prints its command by default. Add --execute only when
 the GPUs and ports are available.
@@ -119,6 +124,10 @@ and port counters during the smoke.
 
 ## Review map
 
+[Changes against pinned upstream sources](UPSTREAM_DIFF.md) identifies reused
+code, source imports and the actual M3 deltas. It does not use an older PR as
+the comparison baseline.
+
 | Area | Main files or patches | What to review |
 |---|---|---|
 | Configuration/startup | vllm_fl/minimax_m3_config.py; patches/minimax_m3_metax/ | Typed immutable policy, effective blacklists, scoped initialization and cache identity |
@@ -126,7 +135,7 @@ and port counters during the smoke.
 | MSA orchestration | ops/minimax_m3/attention.py; base_index.py; base_sparse.py; *_policy.py; attention_launch.py | TP/owner checks, local query/head packing, length/shape selection and output slicing |
 | MSA kernels | dependencies/flaggems_vllm/01-msa-kernels.patch | Exact block top-k, packed prefill, subtile/split decode and long-context computation |
 | Linear | dependencies/flag_gems/01-linear-policy.patch | Retained 35 configurations, small-M dot/GEMV and M8192 program ordering; explicit policy supplied by FL |
-| Gate and MoE | ops/minimax_m3/router.py; routing.py; expert_layer.py; experts.py; moe.py; dependencies/flaggems_vllm/03-moe-router.patch | BF16-load/FP32 gate, sigmoid-bias routing, G1/G2 parameters, explicit legacy-library routing and routed GEMV |
+| Gate and MoE | ops/fused_moe/fused_moe_utils.py; ops/minimax_m3/experts.py; expert_layer.py; moe.py; router.py; routing.py; dependencies/flaggems_vllm/03-moe-router.patch | Small shared extension points; M3 overrides only GEMM context, activation and bindings; retained BF16-load/FP32 gate and routed GEMV |
 | Norm/activation/QKV | dependencies/flaggems_vllm/02-norm-activation-qkv.patch | Gemma residual semantics, clamped SwiGLU and BF16 rounding between QK normalization and RoPE/cache insertion |
 | Vision and library runtime | ops/minimax_m3/vision.py; vision_chunk.py; dependencies/flaggems_vllm/04-launch-runtime.patch | Partial RoPE, patch chunking, retained FlagGems varlen call, isolated FGV cache |
 | In-place mask | dependencies/flag_gems/02-generic-masked-fill.patch | Select the existing generic masked_fill_ function; non-inplace masked_fill stays excluded |
