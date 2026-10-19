@@ -32,7 +32,7 @@ class MiniMaxWorkerFL(WorkerFL):
         return result
 
     def warmup_kernels(self):
-        from vllm_fl.ops.minimax_m3.warmup import kernel_warmup
+        from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 
         kernel_warmup(self)
         print("M3_KERNEL_WARMUP_COMPLETE", flush=True)

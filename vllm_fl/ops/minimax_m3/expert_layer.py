@@ -15,14 +15,15 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
-from .experts import select_unquantized_moe_backend_oot
+from vllm_fl.ops.fused_moe.fused_moe_utils import select_unquantized_moe_backend_oot
+from .experts import TritonExpertsFL
 
 
 class UnquantizedFusedMoEMethodFL(UnquantizedFusedMoEMethod):
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
         self.unquantized_backend, self.experts_cls = select_unquantized_moe_backend_oot(
-            moe_config=self.moe
+            moe_config=self.moe, triton_experts_cls=TritonExpertsFL
         )
 
     @property

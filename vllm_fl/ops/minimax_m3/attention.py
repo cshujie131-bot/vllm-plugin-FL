@@ -266,8 +266,11 @@ def sparse_decode(
 def initialize_consumer_contract():
     """Capture the approved caller identities once; kernels never inspect this context."""
     global _STATE
-    from vllm_fl.models.minimax_m3.common import sparse_attention as caller, indexer
-    from vllm_fl.models.minimax_m3.nvidia.model import MiniMaxM3SparseAttention
+    from vllm_fl.models.minimax_m3.bindings import install
+
+    install()
+    from vllm.models.minimax_m3.common import sparse_attention as caller, indexer
+    from vllm_fl.models.minimax_m3.model import MiniMaxM3SparseAttention
 
     wanted = dict(
         caller=caller,
