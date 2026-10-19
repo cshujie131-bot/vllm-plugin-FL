@@ -16,6 +16,22 @@
       "flaggems_vllm/02-norm-activation-qkv.patch",
       "flaggems_vllm/03-moe-router.patch",
       "flaggems_vllm/04-launch-runtime.patch"
-    ]
+    ],
+    "source_import": {
+      "repository": "https://github.com/vllm-project/vllm",
+      "commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
+      "files": [
+        {
+          "source": "vllm/models/minimax_m3/common/ops/index_topk.py",
+          "destination": "src/flaggems_vllm/ops/minimax_m3/index_native.py",
+          "sha256": "08a1ecfee1a8890dbca7934fdd474cb19f8f38d475c1cced938145d1a177d874"
+        },
+        {
+          "source": "vllm/models/minimax_m3/common/ops/sparse_attn.py",
+          "destination": "src/flaggems_vllm/ops/minimax_m3/sparse_native.py",
+          "sha256": "fefbbcb4ab1e6c4d40538d515e8bf7c247a4cc3ceb8682587b2909b3f0619460"
+        }
+      ]
+    }
   }
 }

@@ -222,6 +222,8 @@ class LauncherTests(unittest.TestCase):
         self.assertNotIn("VLLM_FL_FLAGOS_BLACKLIST_APPEND", env)
         self.assertNotEqual(env["FLAGGEMS_CACHE_DIR"], env["FLAGGEMS_VLLM_CACHE_DIR"])
         self.assertEqual(env["VLLM_PLUGINS"], "fl")
+        self.assertEqual(env["FLAGTREE_ROOT"], str(self.compiler))
+        self.assertEqual(env["PYTHONPATH"], str(self.compiler))
 
     def test_other_model_is_rejected_before_launch(self):
         (self.model / "config.json").write_text(
@@ -254,6 +256,70 @@ class LauncherTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.run_main(self.args + ["--execute"])
             run.assert_not_called()
+
+
+class SourceImportTests(unittest.TestCase):
+    def setUp(self):
+        import hashlib
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.file = self.root / "vllm/kernel.py"
+        self.file.parent.mkdir()
+        self.content = b"# upstream kernel fixture\n"
+        self.file.write_bytes(self.content)
+        self.preparer = load_file(
+            EXAMPLE / "prepare_dependencies.py", "_m3_prepare_test"
+        )
+        self.spec = {
+            "source_import": {
+                "commit": "pinned",
+                "files": [
+                    {
+                        "source": "vllm/kernel.py",
+                        "destination": "src/flaggems_vllm/ops/kernel.py",
+                        "sha256": hashlib.sha256(self.content).hexdigest(),
+                    }
+                ],
+            }
+        }
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_exact_source_import_keeps_source_read_only(self):
+        result = self.preparer.source_imports(self.spec, self.root)
+        self.assertEqual(
+            result, [(Path("src/flaggems_vllm/ops/kernel.py"), self.content)]
+        )
+        self.assertEqual(self.file.read_bytes(), self.content)
+        self.assertFalse((self.root / "src").exists())
+
+    def test_changed_upstream_source_is_rejected(self):
+        self.file.write_bytes(b"locally modified")
+        with self.assertRaisesRegex(ValueError, "source differs"):
+            self.preparer.source_imports(self.spec, self.root)
+
+    def test_paths_cannot_escape_the_checkout(self):
+        for field in ("source", "destination"):
+            with self.subTest(field=field):
+                spec = copy.deepcopy(self.spec)
+                spec["source_import"]["files"][0][field] = "../outside.py"
+                with self.assertRaisesRegex(ValueError, "inside their checkouts"):
+                    self.preparer.source_imports(spec, self.root)
+
+    def test_missing_source_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "vLLM source is required"):
+            self.preparer.source_imports(self.spec, None)
+
+    def test_wrong_checkout_revision_is_rejected(self):
+        (self.root / ".git").mkdir()
+        with patch.object(self.preparer, "git", return_value="wrong-revision"):
+            with self.assertRaisesRegex(ValueError, "commit does not match"):
+                self.preparer.source_imports(self.spec, self.root)
+
+    def test_other_dependencies_do_not_require_source_imports(self):
+        self.assertEqual(self.preparer.source_imports({}, None), [])
 
 
 if __name__ == "__main__":
