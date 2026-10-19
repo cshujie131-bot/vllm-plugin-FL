@@ -7,7 +7,7 @@ import torch
 from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
 
 from .context import execution_config
-from flaggems_vllm.ops.kimi_k3_metax.mla_bmm import project_query
+from vllm_fl.ops.kimi_k3_metax.mla_bmm import project_query
 from .tp8_gate_projection import Tp8GateProjection
 
 

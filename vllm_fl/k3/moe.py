@@ -3,8 +3,8 @@
 import json
 
 from flag_gems import runtime
-from flaggems_vllm.ops.kimi_k3_metax.grouped_moe import grouped_experts
-from flaggems_vllm.ops.kimi_k3_metax.tp8_experts import (
+from vllm_fl.ops.kimi_k3_metax.grouped_moe import grouped_experts
+from vllm_fl.ops.kimi_k3_metax.tp8_experts import (
     prepare as prepare_tp8_experts,
     run as run_tp8_experts,
 )

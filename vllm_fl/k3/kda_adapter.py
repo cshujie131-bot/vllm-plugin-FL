@@ -5,7 +5,7 @@
 
 from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
 
-from flaggems_vllm.ops.kimi_k3_metax.kda import chunk_kda_with_fused_gate
+from vllm_fl.ops.kimi_k3_metax.kda import chunk_kda_with_fused_gate
 
 
 class K3DeltaAttention(KimiK3DeltaAttention):

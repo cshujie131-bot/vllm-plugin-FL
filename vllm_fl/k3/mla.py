@@ -1,6 +1,6 @@
 """Reuse vLLM MLA metadata with verified open decode and FP32 prefill kernels."""
 
-from flaggems_vllm.ops.kimi_k3_metax.prefill_mma import can_use, run
+from vllm_fl.ops.kimi_k3_metax.prefill_mma import can_use, run
 
 
 import torch
@@ -11,8 +11,8 @@ from .mla_dispatch import (
 )
 from vllm.v1.attention.backends.mla.triton_mla import TritonMLABackend, TritonMLAImpl
 from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
-from flaggems_vllm.ops.kimi_k3_metax.prefill_kernel import attention
-from flaggems_vllm.ops.kimi_k3_metax import mla_tp8
+from vllm_fl.ops.kimi_k3_metax.prefill_kernel import attention
+from vllm_fl.ops.kimi_k3_metax import mla_tp8
 
 
 class K3MLAImpl(TritonMLAImpl):
@@ -82,6 +82,8 @@ class K3MLABackend(TritonMLABackend):
 
 
 class K3PrefillBackend(MLAPrefillBackend):
+    supports_missing_device_capability = True
+
     @staticmethod
     def get_name():
         return "K3_FP32_PREFILL"

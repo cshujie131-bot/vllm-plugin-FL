@@ -159,6 +159,7 @@ def _initialize_fl_runtime(rank: int, config=None) -> None:
     }
     policy = execution_config(config) if config is not None else None
     if policy is not None and policy.enabled:
+        resolve_obj_by_qualname("vllm_fl.k3.routing.register")()
         common["registrar"] = partial(
             resolve_obj_by_qualname("vllm_fl.k3.op_registrar.K3OpRegistrar"),
             execution_config=policy,

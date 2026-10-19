@@ -1,5 +1,5 @@
 from vllm.model_executor.layers.activation import SituAndMul
-from flaggems_vllm.ops.kimi_k3_metax.activations import _can_fuse_situ_input, situ_out
+from vllm_fl.ops.kimi_k3_metax.activations import _can_fuse_situ_input, situ_out
 
 
 class K3SituAndMul(SituAndMul):

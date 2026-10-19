@@ -1,13 +1,8 @@
 """MetaX execution adapters; native vLLM defaults remain unchanged."""
 
 import torch
-from vllm.v1.worker.gpu.pp_utils import PPHandler
+from .pp_feedback import HostPackedPPHandler
 from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
-
-
-class HostPackedPPHandler(PPHandler):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, feedback_mode="host_packed", **kwargs)
 
 
 class MetaXModelCudaGraphManager(ModelCudaGraphManager):

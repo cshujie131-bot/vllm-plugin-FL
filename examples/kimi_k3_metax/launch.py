@@ -4,6 +4,8 @@ import argparse
 import json
 import os
 import sys
+from importlib.metadata import distribution
+from importlib.util import find_spec
 from pathlib import Path
 
 
@@ -47,6 +49,7 @@ def build_launch(args):
             environment[prefix + "_" + suffix] = value
     command = [
         sys.executable,
+        "-I",
         "-m",
         "vllm.entrypoints.cli.main",
         "serve",
@@ -71,6 +74,30 @@ def build_launch(args):
     return command, environment
 
 
+def verify_dependencies():
+    """Reject same-version packages installed from another source revision."""
+    lock = json.loads(Path(__file__).with_name("dependency-lock.json").read_text())
+    for name, item in lock["dependencies"].items():
+        installed = distribution(item["distribution"])
+        provenance = json.loads(installed.read_text("direct_url.json") or "{}")
+        vcs = provenance.get("vcs_info", {})
+        if vcs.get("vcs") != "git" or vcs.get("commit_id") != item["commit"]:
+            raise RuntimeError(
+                f"{name}: install the pinned Git source in requirements.txt"
+            )
+        package = item["import_package"]
+        spec = find_spec(package)
+        expected = Path(installed.locate_file(package + "/__init__.py")).resolve()
+        if (
+            spec is None
+            or spec.origin is None
+            or Path(spec.origin).resolve() != expected
+        ):
+            raise RuntimeError(
+                f"{name}: import path shadows the pinned installed package"
+            )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
@@ -91,6 +118,7 @@ def main():
     if args.dry_run:
         print(json.dumps({"command": command, "environment": environment}, indent=2))
         return
+    verify_dependencies()
     for name in ("K3_CACHE_ROOT", "VLLM_CACHE_ROOT", "HF_HOME", "TMPDIR"):
         Path(environment[name]).mkdir(parents=True, exist_ok=True)
     os.execve(command[0], command, {**os.environ, **environment})

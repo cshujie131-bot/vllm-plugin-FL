@@ -1,14 +1,15 @@
 """Model-specific MLA selection; the general FlagGems-vllm entry stays independent."""
 
+from vllm_fl.ops.kimi_k3_metax.mla_dense_fallback import dense_decode_fallback
 from typing import Optional, Tuple
 import torch
 from flaggems_vllm.ops.flash_mla_with_kvcache import (
     FlashMLASchedMeta,
     flash_mla_with_kvcache as flagos_decode,
 )
-from flaggems_vllm.ops.kimi_k3_metax.mla4k_long import supported, run
+from vllm_fl.ops.kimi_k3_metax.mla4k_long import supported, run
 
-from flaggems_vllm.ops.kimi_k3_metax import (
+from vllm_fl.ops.kimi_k3_metax import (
     mla_decode,
     mla_decode_b2,
     mla_staged_packing,
@@ -19,10 +20,29 @@ def try_dense_decode(
     q, kv_cache, block_table, cache_seqlens, out, lse, *, softmax_scale, causal
 ):
     """Return False for unsupported shapes; no allocation or fallback on failure."""
+    if kv_cache.stride(-1) != 1 or block_table.stride(-1) != 1:
+        raise NotImplementedError("Dense MLA requires contiguous entry/table columns")
     if not mla_decode.can_use(
         q, kv_cache, block_table, cache_seqlens, out, lse, softmax_scale
     ):
-        return False
+        b, sq, heads, width = q.shape
+        dense_decode_fallback(
+            q,
+            kv_cache,
+            block_table,
+            cache_seqlens,
+            out,
+            lse,
+            b,
+            sq,
+            heads,
+            width,
+            out.shape[-1],
+            kv_cache.shape[1],
+            softmax_scale,
+            causal,
+        )
+        return True
     if mla_decode_b2.try_run(
         q,
         kv_cache,

@@ -2,7 +2,8 @@
 
 import torch
 from flag_gems import runtime
-from flag_gems.ops.addmm import _K3_ADDMM_KERNEL
+from flag_gems.ops.addmm import addmm_kernel
+from .flagos_mm import raw_kernel
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     tensor_model_parallel_all_gather,
@@ -12,6 +13,8 @@ from vllm.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
 from vllm.models.kimi_k3.nvidia.latent_moe_runner import LatentMoERunner, LatentTailTier
 
 from .latent_d import project_grouped
+
+_LATENT_UP_KERNEL = raw_kernel(addmm_kernel)
 
 
 def accumulate_latent_up(hidden_shard, latent, weight):
@@ -41,7 +44,7 @@ def accumulate_latent_up(hidden_shard, latent, weight):
             (32, 64, 64, 4, 2) if m == 512 else (16, 32, 32, 4, 4)
         )
         wt = weight.t()
-        _K3_ADDMM_KERNEL[((m + bm - 1) // bm, (896 + bn - 1) // bn)](
+        _LATENT_UP_KERNEL[((m + bm - 1) // bm, (896 + bn - 1) // bn)](
             latent,
             wt,
             hidden_shard,

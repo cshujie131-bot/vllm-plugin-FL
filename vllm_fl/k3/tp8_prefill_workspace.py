@@ -1,4 +1,4 @@
-from flaggems_vllm.ops.kimi_k3_metax.workspace_contract import (
+from vllm_fl.ops.kimi_k3_metax.workspace_contract import (
     MIN_PREFILL_TOKENS,
     MAX_PREFILL_TOKENS,
     TOP_K,

@@ -13,7 +13,7 @@ from vllm.v1.attention.backends.mla.prefill import (
 
 from . import cache_ops
 from .activations import situ_out
-from flaggems_vllm.ops.kimi_k3_metax.cache_gather import gather
+from vllm_fl.ops.kimi_k3_metax.cache_gather import gather
 from .moe import K3Mxfp4Config
 from .vision_attention import K3MMEncoderAttention
 

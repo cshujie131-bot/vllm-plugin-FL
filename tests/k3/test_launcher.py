@@ -1,9 +1,11 @@
 """Example CLI contracts: inspect commands without importing accelerator libraries."""
 
 import importlib.util
+import json
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = ROOT / "examples" / "kimi_k3_metax" / "launch.py"
@@ -28,6 +30,59 @@ def arguments(rank):
 
 
 class LauncherTests(unittest.TestCase):
+    def test_child_uses_isolated_installed_packages(self):
+        command, _ = launch.build_launch(arguments(0))
+        self.assertEqual(command[1], "-I")
+
+    def test_dependency_provenance_rejects_wrong_revision_and_import_shadow(self):
+        lock = json.loads(LAUNCHER.with_name("dependency-lock.json").read_text())
+        items = {x["distribution"]: x for x in lock["dependencies"].values()}
+
+        class Installed:
+            def __init__(self, item, wrong=False):
+                self.item, self.wrong = item, wrong
+
+            def read_text(self, name):
+                return json.dumps(
+                    {
+                        "vcs_info": {
+                            "vcs": "git",
+                            "commit_id": "0" * 40
+                            if self.wrong
+                            else self.item["commit"],
+                        }
+                    }
+                )
+
+            def locate_file(self, path):
+                return Path("/installed") / path
+
+        for wrong, shadow in ((False, False), (True, False), (False, True)):
+            with (
+                self.subTest(wrong=wrong, shadow=shadow),
+                patch.object(
+                    launch,
+                    "distribution",
+                    side_effect=lambda name, wrong=wrong: Installed(items[name], wrong),
+                ),
+                patch.object(
+                    launch,
+                    "find_spec",
+                    side_effect=lambda name, shadow=shadow: SimpleNamespace(
+                        origin=str(
+                            Path("/shadow" if shadow else "/installed")
+                            / name
+                            / "__init__.py"
+                        )
+                    ),
+                ),
+            ):
+                if wrong or shadow:
+                    with self.assertRaises(RuntimeError):
+                        launch.verify_dependencies()
+                else:
+                    launch.verify_dependencies()
+
     def test_primary_node_has_one_api_server(self):
         command, _ = launch.build_launch(arguments(0))
         self.assertNotIn("--headless", command)
