@@ -1,7 +1,9 @@
 """Example CLI contracts: inspect commands without importing accelerator libraries."""
 
+import argparse
 import importlib.util
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +32,35 @@ def arguments(rank):
 
 
 class LauncherTests(unittest.TestCase):
+    def test_native_root_parser_preserves_disabled_prefix_cache(self):
+        import yaml
+
+        from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+        config = yaml.safe_load(LAUNCHER.with_name("serve.yaml").read_text())
+        selected = {
+            key: value
+            for key, value in config.items()
+            if key
+            in ("enable-prefix-caching", "no-enable-prefix-caching", "mamba-cache-mode")
+        }
+        parser = FlexibleArgumentParser()
+        commands = parser.add_subparsers(dest="command", required=True)
+        serve = commands.add_parser("serve")
+        serve.add_argument("model_tag")
+        serve.add_argument(
+            "--enable-prefix-caching",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+        )
+        serve.add_argument("--mamba-cache-mode", default="none")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "serve.yaml"
+            path.write_text(yaml.safe_dump(selected))
+            args = parser.parse_args(["serve", "unused", "--config", str(path)])
+        self.assertIs(args.enable_prefix_caching, False)
+        self.assertEqual(args.mamba_cache_mode, "none")
+
     def test_child_uses_isolated_installed_packages(self):
         command, _ = launch.build_launch(arguments(0))
         self.assertEqual(command[1], "-I")

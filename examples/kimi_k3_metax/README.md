@@ -33,7 +33,7 @@ numerical contract and is outside this cleanup.
 
 ## Public source dependencies
 
-`requirements.txt` and `dependency-lock.json` pin complete source commits. No
+The requirements files and `dependency-lock.json` pin complete source commits. No
 source patch, source snapshot or patch installer is required at installation.
 
 | Package | Pinned source | Review |
@@ -74,13 +74,18 @@ No proprietary binary or weights are distributed here. The profile uses no
 
 ## Install and launch
 
-Use a fresh environment or image with the matching vendor runtime. Force
-reinstallation prevents an existing same-version package from hiding a source
-change. Build-only version override identifies the empty vLLM package; Git
+Use a fresh environment or image with the matching vendor runtime. A legacy
+installation with untracked source overlays should be replaced by a clean
+environment. Force reinstallation prevents a same-version package from hiding
+a source change. FlagGems uses build isolation to honor its `setuptools<77` requirement;
+vLLM uses the matching vendor build environment with setuptools 80.10.2, which
+supports its PEP 639 metadata. Do not downgrade the shared build environment.
+The build-only version override identifies the empty vLLM package; Git
 provenance independently checks the exact source commit.
 
 ```sh
-python -I -m pip install setuptools==76.1.0 setuptools-scm==9.2.2 wheel==0.46.2
+python -I -m pip install --force-reinstall --no-deps \
+  -r examples/kimi_k3_metax/requirements-flaggems.txt
 VLLM_TARGET_DEVICE=empty VLLM_VERSION_OVERRIDE=0.28.0+empty \
   python -I -m pip install --force-reinstall --no-deps --no-build-isolation \
   -r examples/kimi_k3_metax/requirements.txt
@@ -112,7 +117,8 @@ and 1 MiB buffers. Use a private writable compilation-cache directory per node.
 
 Context 69,632; GPU memory 0.95; max sequences 64; MBT4096; PP layers
 24/24/24/21; eager prefill; full decode Graph sizes 1/2/4/8/12/16/24/32/64;
-prefix caching off. Containers require `/dev/dri`, `/dev/mxcd`,
+prefix caching off (the YAML uses the explicit `no-enable-prefix-caching` flag).
+Containers require `/dev/dri`, `/dev/mxcd`,
 `/dev/infiniband`, host networking, sufficient shared memory and unlimited memlock.
 
 ## Validation

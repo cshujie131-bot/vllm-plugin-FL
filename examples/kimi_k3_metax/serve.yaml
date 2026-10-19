@@ -8,7 +8,8 @@ max-model-len: 69632
 gpu-memory-utilization: 0.95
 max-num-seqs: 64
 max-num-batched-tokens: 4096
-enable-prefix-caching: false
+# The root CLI parser cannot resolve a subcommand's false boolean option.
+no-enable-prefix-caching: true
 mamba-cache-mode: none
 dtype: bfloat16
 load-format: safetensors
