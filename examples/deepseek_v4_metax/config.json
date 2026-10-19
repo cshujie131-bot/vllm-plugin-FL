@@ -42,22 +42,15 @@
       "indexer_row_sharding": true,
       "indexer_query_shards": 4,
       "indexer_min_keys": 4096,
-      "prefill_native_topk": false,
       "single_stream": true
     },
     "kernels": {
-      "decode_split_topk": true,
       "decode_splits": 4,
       "decode_block_k": 16,
       "decode_block_h": 16,
       "decode_warps": 4,
       "decode_stages": 1,
-      "decode_max_batch": 64,
-      "decode_half_d": true,
-      "decode_qkfold": true,
-      "prefill_half_d": true,
-      "prefill_blockdiag": true,
-      "prefill_staged": true
+      "decode_max_batch": 64
     },
     "moe": {
       "use_mctlass": true,

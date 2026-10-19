@@ -1,5 +1,5 @@
 """Exact per-chunk softmax state materialization, then two PV-half CTAs.
-Experimental only. No production dispatch, no precision changes or persistent cache."""
+Used after TP headpacking; probabilities retain the accepted BF16 rounding."""
 
 import torch
 import triton

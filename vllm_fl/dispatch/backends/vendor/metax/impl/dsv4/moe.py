@@ -18,7 +18,6 @@ from flaggems_vllm import moe_align_block_size_no_tle as moe_align_block_size
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.model_executor.layers.fused_moe.fused_moe import logger
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
 from vllm_fl import dsv4_config as _dsv4
 from . import mctlass_ops
 
@@ -232,131 +231,28 @@ def initialize_staged_config(
     return stage1_config, stage2_config
 
 
-def get_config_dtype_str(
-    dtype: torch.dtype,
-    use_int4_w4a16: bool | None = False,
-    # ┌------------------------  Metax Modification -------------------------┐
-    use_int4_w4a8: bool | None = False,
-    use_int8_w8a8: bool | None = False,
-    # └------------------------- Metax Modification -------------------------┘
-    use_int8_w8a16: bool | None = False,
-    use_fp8_w8a8: bool | None = False,
-    ocp_mx_scheme: str | None = None,
-) -> str | None:
-    if use_fp8_w8a8:
-        return "fp8_w8a8"
-    # ┌------------------------  Metax Modification -------------------------┐
-    elif use_int4_w4a8:
-        return "int4_w4a8"
-    elif use_int8_w8a8:
-        return "int8_w8a8"
-    # └------------------------- Metax Modification -------------------------┘
-    elif use_int8_w8a16:
-        return "int8_w8a16"
-    elif use_int4_w4a16:
-        return "int4_w4a16"
-    elif ocp_mx_scheme is not None:
-        # The output of this function is passed to `try_get_optimal_moe_config`,
-        # and as we only simulate OCP MX execution in fused_moe for now,
-        # we will NOT look for `*,dtype=w_mxfp4_a_mxfp4.json` for now.
-        return None
-    elif dtype == torch.float:
-        # avoiding cases where kernel fails when float32 MoE
-        # use fp16/bfloat16 configs
-        return "float32"
-    return None
-
-
-def _get_config_quant_dtype(
-    use_fp8_w8a8: bool,
-    use_int8_w8a8: bool,
-    use_int4_w4a8: bool,
-    ocp_mx_scheme: str | None,
-) -> None | torch.dtype | str:
-    """
-    Get the quantization type based on the quantization strategy flags.
-    We don't have a quant_config at this point so we need to work backwards.
-    A return type of None means no quantization is required because the
-    input is unquantized or has been quantized prior to calling
-    fused_experts_impl.
-    """
-    if use_fp8_w8a8:
-        return torch.float8_e4m3fn
-    # 这里我参照了上个版本的代码，但是我有点怀疑为什么这里return的是int8而不是int4
-    elif use_int4_w4a8 or use_int8_w8a8:
-        return torch.int8
-    elif ocp_mx_scheme == "w_mxfp4_a_mxfp4":
-        return "mxfp4"
-    elif ocp_mx_scheme in {"w_mxfp4_a_mxfp6_e3m2", "w_mxfp6_e3m2_a_mxfp6_e3m2"}:
-        return "mxfp6_e3m2"
-    elif ocp_mx_scheme in {"w_mxfp4_a_mxfp6_e2m3", "w_mxfp6_e2m3_a_mxfp6_e2m3"}:
-        return "mxfp6_e2m3"
-    elif ocp_mx_scheme in {"w_mxfp4", "w_mxfp6_e3m2", "w_mxfp6_e2m3"}:
-        return torch.bfloat16
-    elif ocp_mx_scheme in {"w_mxfp4_a_fp8", "w_mxfp6_e3m2_a_fp8", "w_mxfp6_e2m3_a_fp8"}:
-        return torch.float8_e4m3fn
-
-    return None
-
-
-def invoke_fused_moe_triton_kernel(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    A_scale: torch.Tensor | None,
-    B_scale: torch.Tensor | None,
-    topk_weights: torch.Tensor | None,
-    sorted_token_ids: torch.Tensor | None,
-    expert_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor,
-    mul_routed_weight: bool,
-    top_k: int,
-    config: dict[str, Any],
-    compute_type: tl.dtype,
-    use_fp8_w8a8: bool,
-    use_int8_w8a8: bool,
-    use_int8_w8a16: bool,
-    use_int4_w4a8: bool,
-    use_int4_w4a16: bool,
-    per_channel_quant: bool,
-    block_shape: list[int] | None = None,
-    B_bias: torch.Tensor | None = None,
+def dispatch_fused_moe_kernel(
+    A,
+    B,
+    C,
+    A_scale,
+    B_scale,
+    topk_weights,
+    sorted_token_ids,
+    expert_ids,
+    num_tokens_post_padded,
+    mul_routed_weight,
+    top_k,
+    config,
 ):
-    if not (use_int8_w8a8 and _dsv4.moe.use_mctlass):
-        raise NotImplementedError("only deployed W8A8 MCTlass dispatch is supported")
+    """Invoke the W8A8 GEMM with the accepted routing and padding contract."""
     assert topk_weights is not None or not mul_routed_weight
     assert topk_weights is None or topk_weights.stride(1) == 1
     assert sorted_token_ids is None or sorted_token_ids.stride(0) == 1
-    if use_fp8_w8a8 or use_int8_w8a8:
-        assert B_scale is not None
-        assert block_shape is None or triton.cdiv(
-            B.size(-2), block_shape[0]
-        ) == B_scale.size(-2)
-        assert block_shape is None or triton.cdiv(
-            B.size(-1), block_shape[1]
-        ) == B_scale.size(-1)
-    elif use_int8_w8a16 or use_int4_w4a16 or use_int4_w4a8:
-        assert B_scale is not None
-        assert block_shape is None or block_shape[0] == 0
-    else:
-        assert A_scale is None
-        assert B_scale is None
-    M = A.size(0)
-    num_tokens = M * top_k
-    if sorted_token_ids is not None:
-        EM = sorted_token_ids.size(0)
-        if A.size(0) < config["BLOCK_SIZE_M"]:
-            EM = min(
-                sorted_token_ids.size(0), A.size(0) * top_k * config["BLOCK_SIZE_M"]
-            )
-    else:
-        EM = num_tokens * config["BLOCK_SIZE_M"]
-    grid = lambda META: (
-        triton.cdiv(EM, META["BLOCK_SIZE_M"])
-        * triton.cdiv(B.size(1), META["BLOCK_SIZE_N"]),
-        META["SPLIT_K"],
-    )
-    HAS_BIAS = B_bias is not None
+    assert B_scale is not None
+    EM = sorted_token_ids.size(0)
+    if A.size(0) < config["BLOCK_SIZE_M"]:
+        EM = min(EM, A.size(0) * top_k * config["BLOCK_SIZE_M"])
     mctlass_ops.cutlass_moe_mm_w8a8(
         A,
         B,
@@ -371,67 +267,6 @@ def invoke_fused_moe_triton_kernel(
         top_k,
         mul_routed_weight,
     )
-
-
-def dispatch_fused_moe_kernel(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    A_scale: torch.Tensor | None,
-    B_scale: torch.Tensor | None,
-    B_zp: torch.Tensor | None,
-    topk_weights: torch.Tensor | None,
-    sorted_token_ids: torch.Tensor | None,
-    expert_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor,
-    mul_routed_weight: bool,
-    top_k: int,
-    config: dict[str, Any],
-    compute_type: tl.dtype,
-    use_fp8_w8a8: bool,
-    use_int8_w8a8: bool,
-    use_int8_w8a16: bool,
-    use_int4_w4a8: bool,
-    use_int4_w4a16: bool,
-    per_channel_quant: bool,
-    block_shape: list[int] | None = None,
-    B_bias: torch.Tensor | None = None,
-) -> None:
-    assert topk_weights is not None or not mul_routed_weight
-    assert topk_weights is None or topk_weights.stride(1) == 1
-    assert sorted_token_ids is None or sorted_token_ids.stride(0) == 1
-
-    M = A.size(0)
-    num_tokens = M * top_k
-
-    if (use_int8_w8a16 or use_int4_w4a16) and (
-        block_shape is not None and block_shape[1] > 0
-    ):
-        raise NotImplementedError("WNA16 is outside the DSV4 W8A8 adapter")
-    else:
-        invoke_fused_moe_triton_kernel(
-            A,
-            B,
-            C,
-            A_scale,
-            B_scale,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            mul_routed_weight,
-            top_k,
-            config,
-            compute_type,
-            use_fp8_w8a8,
-            use_int8_w8a8,
-            use_int8_w8a16,
-            use_int4_w4a8,
-            use_int4_w4a16,
-            per_channel_quant,
-            block_shape,
-            B_bias,
-        )
 
 
 def fused_experts_impl(
@@ -490,21 +325,9 @@ def fused_experts_impl(
     if hidden_states.dtype != torch.bfloat16:
         raise NotImplementedError("only deployed BF16 activations validated")
     activation_enum = MoEActivation.from_str(activation)
-    if use_int4_w4a8:
-        assert hidden_states.size(1) // 8 == w1.size(2), "hidden size mismatch"
-    elif use_int4_w4a16:
-        assert hidden_states.size(1) // 2 == w1.size(2), "Hidden size mismatch"
-    elif ocp_mx_scheme is not None:
-        if ocp_mx_scheme.startswith("w_mxfp4"):
-            assert hidden_states.size(1) == w1.size(2) * 2, "hidden size mismatch"
-        elif ocp_mx_scheme.startswith("w_mxfp6"):
-            assert hidden_states.size(1) == w1.size(2) * 4 // 3, "hidden size mismatch"
-        else:
-            raise NotImplementedError(f"Unsupported ocp_mx_scheme={ocp_mx_scheme}")
-    else:
-        assert hidden_states.size(1) == w1.size(2), (
-            f"Hidden size mismatch {hidden_states.size(1)} != {w1.size(2)}"
-        )
+    assert hidden_states.size(1) == w1.size(
+        2
+    ), f"Hidden size mismatch {hidden_states.size(1)} != {w1.size(2)}"
     assert topk_weights.size() == topk_ids.size(), "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
@@ -518,28 +341,15 @@ def fused_experts_impl(
     top_k_num = topk_ids.size(1)
     CHUNK_SIZE = _dsv4.moe.chunk_size
     M = min(num_tokens, CHUNK_SIZE)
-    config_dtype = get_config_dtype_str(
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_int4_w4a8=use_int4_w4a8,
-        use_int8_w8a8=use_int8_w8a8,
-        use_int8_w8a16=use_int8_w8a16,
-        use_int4_w4a16=use_int4_w4a16,
-        ocp_mx_scheme=ocp_mx_scheme,
-        dtype=hidden_states.dtype,
-    )
-    quant_dtype = _get_config_quant_dtype(
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8,
-        use_int4_w4a8=use_int4_w4a8,
-        ocp_mx_scheme=ocp_mx_scheme,
-    )
+    config_dtype = "int8_w8a8"
+    quant_dtype = torch.int8
     get_config_func = functools.partial(
         try_get_optimal_moe_config,
         w1.size(),
         w2.size(),
         top_k_num,
         config_dtype,
-        block_shape=block_shape,
+        block_shape=None,
     )
     config = get_config_func(M)
     (stage1_config, stage2_config) = initialize_staged_config(config)
@@ -558,16 +368,7 @@ def fused_experts_impl(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    if hidden_states.dtype == torch.bfloat16:
-        compute_type = tl.bfloat16
-    elif hidden_states.dtype == torch.float16:
-        compute_type = tl.float16
-    elif hidden_states.dtype == torch.float32:
-        compute_type = tl.float32
-    else:
-        raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
     out_hidden_states = hidden_states if inplace else torch.empty_like(hidden_states)
-
     for chunk in range(num_tokens // CHUNK_SIZE + 1):
         (begin_chunk_idx, end_chunk_idx) = (
             chunk * CHUNK_SIZE,
@@ -588,79 +389,21 @@ def fused_experts_impl(
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
         (qcurr_hidden_states, a1q_scale) = moe_kernel_quantize_input(
             A=curr_hidden_states,
-            A_scale=a1_scale,
+            A_scale=None,
             quant_dtype=quant_dtype,
-            per_act_token_quant=per_channel_quant,
-            block_shape=block_shape,
-            ocp_mx_scheme=ocp_mx_scheme,
+            per_act_token_quant=True,
+            block_shape=None,
+            ocp_mx_scheme=None,
         )
-        SPARSITY_FACTOR = 4
-        naive_block_assignment = (
-            expert_map is None
-            and tokens_in_chunk * top_k_num * SPARSITY_FACTOR <= global_num_experts
-            and (
-                not (
-                    (use_int8_w8a16 or use_int4_w4a16)
-                    and block_shape is not None
-                    and (block_shape[1] > 0)
-                )
-            )
-            and (not ((use_int8_w8a8 or use_int4_w4a8) and _dsv4.moe.use_mctlass))
+        kernel_m = mctlass_ops.cutlass_moe_mm_w8a8_get_kernel_m(
+            curr_hidden_states, w1, intermediate_cache1, top_k_num
         )
-        if not naive_block_assignment:
-            if use_int8_w8a8 and _dsv4.moe.use_mctlass:
-                kernel_m = mctlass_ops.cutlass_moe_mm_w8a8_get_kernel_m(
-                    curr_hidden_states, w1, intermediate_cache1, top_k_num
-                )
-                assert kernel_m > 0, (
-                    "cutlass_moe_w8a8 BLOCK_SIZE_M must greater than zero."
-                )
-                stage1_config["BLOCK_SIZE_M"] = kernel_m
-                stage2_config["BLOCK_SIZE_M"] = kernel_m
-            if use_int4_w4a8 and _dsv4.moe.python_api:
-                if block_shape is None:
-                    kernel_m = mctlass_ops.cutlass_moe_mm_w4a8_get_kernel_m_per_channel(
-                        a=curr_hidden_states,
-                        b=w1,
-                        c=intermediate_cache1,
-                        K=K,
-                        num_valid_tokens=curr_hidden_states.size(0) * top_k_num,
-                        topk=top_k_num,
-                    )
-                else:
-                    kernel_m = mctlass_ops.mctlassEx_fused_moe_w4a8_get_kernel_m(
-                        qcurr_hidden_states,
-                        w1.view(dtype=torch.quint4x2),
-                        intermediate_cache1,
-                        num_experts=w1.size(0),
-                        batch_size=qcurr_hidden_states.size(0),
-                        N=N,
-                        K=K,
-                        num_valid_tokens=num_tokens,
-                        topk=top_k_num,
-                        group_size=block_shape[1],
-                    )
-                assert kernel_m > 0, (
-                    "cutlass_fused_moe_w4a8 BLOCK_SIZE_M must greater than zero."
-                )
-                stage1_config["BLOCK_SIZE_M"] = kernel_m
-                stage2_config["BLOCK_SIZE_M"] = kernel_m
-            (sorted_token_ids, expert_ids, num_tokens_post_padded) = (
-                moe_align_block_size(
-                    curr_topk_ids,
-                    stage1_config["BLOCK_SIZE_M"],
-                    global_num_experts,
-                    expert_map,
-                )
-            )
-        else:
-            max_num_tokens_padded = topk_ids.numel() * stage1_config["BLOCK_SIZE_M"]
-            expert_ids = curr_topk_ids.view(-1)
-            num_tokens_post_padded = torch.empty(
-                1, dtype=torch.int32, device=topk_ids.device
-            )
-            num_tokens_post_padded.fill_(max_num_tokens_padded)
-            sorted_token_ids = None
+        assert kernel_m > 0, "cutlass_moe_w8a8 BLOCK_SIZE_M must greater than zero."
+        stage1_config["BLOCK_SIZE_M"] = kernel_m
+        stage2_config["BLOCK_SIZE_M"] = kernel_m
+        (sorted_token_ids, expert_ids, num_tokens_post_padded) = moe_align_block_size(
+            curr_topk_ids, stage1_config["BLOCK_SIZE_M"], global_num_experts, None
+        )
         if stage1_config.get("SPLIT_K", 1) > 1:
             intermediate_cache1.zero_()
         dispatch_fused_moe_kernel(
@@ -669,7 +412,6 @@ def fused_experts_impl(
             intermediate_cache1,
             a1q_scale,
             w1_scale,
-            w1_zp,
             curr_topk_weights,
             sorted_token_ids,
             expert_ids,
@@ -677,99 +419,43 @@ def fused_experts_impl(
             apply_router_weight_on_input,
             top_k_num,
             stage1_config,
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a8=use_int4_w4a8,
-            use_int4_w4a16=use_int4_w4a16,
-            per_channel_quant=per_channel_quant,
-            block_shape=block_shape,
-            B_bias=w1_bias,
         )
         apply_moe_activation(
             activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
         )
-        use_mctlass_moe_mm_on_stage2 = (
-            _dsv4.moe.use_mctlass
-            and use_int4_w4a8 is False
-            and (use_int8_w8a8 is False)
-            and (hidden_states.dtype == torch.bfloat16)
-            and (stage2_config["BLOCK_SIZE_M"] == 128)
-            and (stage2_config["BLOCK_SIZE_N"] == 128)
-            and (stage2_config["BLOCK_SIZE_K"] == 64)
-            and (stage2_config["SPLIT_K"] == 1)
-            and (w2.shape[1] % 128 == 0)
-            and (w2.shape[2] % 8 == 0)
+        (qintermediate_cache2, a2q_scale) = moe_kernel_quantize_input(
+            A=intermediate_cache2,
+            A_scale=None,
+            quant_dtype=quant_dtype,
+            per_act_token_quant=True,
+            block_shape=None,
+            ocp_mx_scheme=None,
         )
-        if use_mctlass_moe_mm_on_stage2:
-            mctlass_ops.cutlass_moe_bf16_mm(
-                intermediate_cache3,
-                intermediate_cache2,
-                w2,
-                curr_topk_weights,
-                sorted_token_ids,
-                expert_ids,
-                num_tokens_post_padded,
-                curr_topk_ids.numel(),
-                1,
-                True,
+        if stage2_config["BLOCK_SIZE_M"] != stage1_config["BLOCK_SIZE_M"]:
+            (sorted_token_ids, expert_ids, num_tokens_post_padded) = (
+                moe_align_block_size(
+                    curr_topk_ids,
+                    stage2_config["BLOCK_SIZE_M"],
+                    global_num_experts,
+                    None,
+                )
             )
-        else:
-            (qintermediate_cache2, a2q_scale) = moe_kernel_quantize_input(
-                A=intermediate_cache2,
-                A_scale=a2_scale,
-                quant_dtype=quant_dtype,
-                per_act_token_quant=per_channel_quant,
-                block_shape=block_shape,
-                ocp_mx_scheme=ocp_mx_scheme,
-            )
-            if stage2_config["BLOCK_SIZE_M"] != stage1_config["BLOCK_SIZE_M"]:
-                if not naive_block_assignment:
-                    (sorted_token_ids, expert_ids, num_tokens_post_padded) = (
-                        moe_align_block_size(
-                            curr_topk_ids,
-                            stage2_config["BLOCK_SIZE_M"],
-                            global_num_experts,
-                            expert_map,
-                        )
-                    )
-                else:
-                    max_num_tokens_padded = (
-                        topk_ids.numel() * stage2_config["BLOCK_SIZE_M"]
-                    )
-                    expert_ids = curr_topk_ids.view(-1)
-                    num_tokens_post_padded = torch.empty(
-                        1, dtype=torch.int32, device=topk_ids.device
-                    )
-                    num_tokens_post_padded.fill_(max_num_tokens_padded)
-                    sorted_token_ids = None
-            if expert_map is not None or stage2_config.get("SPLIT_K", 1) > 1:
-                intermediate_cache3.zero_()
-            dispatch_fused_moe_kernel(
-                qintermediate_cache2,
-                w2,
-                intermediate_cache3,
-                a2q_scale,
-                w2_scale,
-                w2_zp,
-                curr_topk_weights,
-                sorted_token_ids,
-                expert_ids,
-                num_tokens_post_padded,
-                not apply_router_weight_on_input,
-                1,
-                stage2_config,
-                compute_type=compute_type,
-                use_fp8_w8a8=use_fp8_w8a8,
-                use_int8_w8a8=use_int8_w8a8,
-                use_int8_w8a16=use_int8_w8a16,
-                use_int4_w4a8=use_int4_w4a8,
-                use_int4_w4a16=use_int4_w4a16,
-                per_channel_quant=per_channel_quant,
-                block_shape=block_shape,
-                B_bias=w2_bias,
-            )
+        if stage2_config.get("SPLIT_K", 1) > 1:
+            intermediate_cache3.zero_()
+        dispatch_fused_moe_kernel(
+            qintermediate_cache2,
+            w2,
+            intermediate_cache3,
+            a2q_scale,
+            w2_scale,
+            curr_topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            not apply_router_weight_on_input,
+            1,
+            stage2_config,
+        )
         ops.moe_sum(
             intermediate_cache3.view(*intermediate_cache3.size()),
             out_hidden_states[begin_chunk_idx:end_chunk_idx],

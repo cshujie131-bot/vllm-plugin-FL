@@ -11,18 +11,12 @@ from dataclasses import dataclass, fields
 
 @dataclass(frozen=True)
 class KernelPolicy:
-    decode_split_topk: bool = True
     decode_splits: int = 4
     decode_block_k: int = 16
     decode_block_h: int = 16
     decode_warps: int = 4
     decode_stages: int = 1
     decode_max_batch: int = 64
-    decode_half_d: bool = True
-    decode_qkfold: bool = True
-    prefill_half_d: bool = True
-    prefill_blockdiag: bool = True
-    prefill_staged: bool = True
 
 
 current = KernelPolicy()

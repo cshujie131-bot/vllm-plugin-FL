@@ -95,8 +95,8 @@ class PackagingTests(unittest.TestCase):
             policy["service"]["compilation_config"]["cudagraph_mode"],
             "FULL_DECODE_ONLY",
         )
-        self.assertTrue(policy["kernels"]["decode_qkfold"])
-        self.assertTrue(policy["kernels"]["prefill_staged"])
+        self.assertEqual(policy["kernels"]["decode_splits"], 4)
+        self.assertEqual(policy["kernels"]["decode_block_h"], 16)
 
     def test_thinking_changes_only_serving_limits(self):
         normal = self.config()["deepseek_v4_metax"]

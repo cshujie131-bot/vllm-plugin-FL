@@ -31,8 +31,6 @@ from vllm_fl.dispatch import CachedOp
 
 from vllm_fl import dsv4_config as _dsv4
 
-if _dsv4.is_enabled():
-    from vllm_fl.ops.deepseek_v4_metax import tuning as _tuning
 
 _fused_inv_rope_fp8_quant = CachedOp("fused_inv_rope_fp8_quant")
 _deepseek_v4_fp8_einsum = CachedOp("deepseek_v4_fp8_einsum")
@@ -623,9 +621,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             cache_config=cache_config,
             wo_a=None,
         )
-        qkfold_enabled = _dsv4.is_enabled() and (
-            _tuning.current.decode_qkfold or _tuning.current.prefill_blockdiag
-        )
+        qkfold_enabled = _dsv4.is_enabled()
         if hq16_enabled and (not qkfold_enabled or num_heads == 8):
             self.padded_heads = 16
         elif num_heads not in self.SUPPORTED_HEAD_COUNTS:

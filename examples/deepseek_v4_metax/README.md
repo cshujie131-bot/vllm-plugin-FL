@@ -105,15 +105,21 @@ unrecognized cache and never stops another service.
 
 ## Validation
 
-The clean installed-package TP8 smoke passed 78/78 requests: short prompts,
-1K/4K/16K/20K prefill, mixed batches and 64 concurrent distinct-string responses.
-All seven decode graph buckets were captured. The 345 installed Python source
-files matched this FL checkout with no extra legacy modules; dependency commit,
-Hash-table and RMS-policy checks passed. There are also 28 passing CPU checks.
+Before the redundancy-only cleanup, the clean installed-package TP8 smoke at
+`6903cb0` passed 78/78 requests: short prompts, 1K/4K/16K/20K prefill, mixed
+batches and 64 concurrent distinct-string responses. All seven decode graph
+buckets were captured; installed-source, dependency, Hash-table and RMS checks passed.
 
-This is a serving/packaging smoke, not a quality or throughput benchmark.
-Historical accuracy and performance below are retained, not newly measured
-results for the dependency-layout update.
+The cleanup removes retired attention variants, disabled native-prefill-topk,
+unreachable non-W8A8 vendor paths and duplicate backend adapters. Decode keeps
+blockdiag split/reduce. Prefill keeps staged headpacking **and** its short-query
+blockdiag path; one-token/native shape fallbacks are still needed. Hot kernel
+bodies and their accepted launch settings are unchanged. CPU differential call
+traces matched for 80 MoE and 71 attention cases; 31 CPU unit checks also pass.
+These are structural/host-call checks, not new GPU numerical or timing results.
+
+No serving, quality or performance benchmark was rerun for that cleanup.
+Historical accuracy and performance below are retained, not newly measured results.
 
 | Task | Reviewed accuracy |
 |---|---:|

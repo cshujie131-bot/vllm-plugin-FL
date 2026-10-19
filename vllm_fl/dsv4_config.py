@@ -14,7 +14,6 @@ class FrameworkPolicy:
     indexer_row_sharding: bool = True
     indexer_query_shards: int = 4
     indexer_min_keys: int = 4096
-    prefill_native_topk: bool = False
     single_stream: bool = True
 
 

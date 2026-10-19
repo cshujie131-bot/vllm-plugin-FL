@@ -21,7 +21,7 @@ def _try_headpack(
         SQ >= 8
         and HQ == 16
         and (HKV == 1)
-        and (DQK in (512, 576))
+        and DQK == 512
         and (DV == 512)
         and (TOPK > 0)
         and q.is_contiguous()

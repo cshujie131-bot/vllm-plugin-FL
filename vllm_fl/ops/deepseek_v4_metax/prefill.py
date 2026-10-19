@@ -8,145 +8,13 @@ import torch
 import triton
 import triton.language as tl
 from . import staged as _staged
-from . import tuning as _tuning
 from .launch import local_launch
 
 _native = importlib.import_module("flaggems_vllm.ops.flashmla_sparse")
-TLE_FLASHMLA_PREFILL_BH = 16
-TLE_FLASHMLA_PREFILL_BK = 16
-_can_use_tle_flash_mla_sparse_fwd = _native._can_use_tle_flash_mla_sparse_fwd
-_set_triton_descriptor_allocator = _native._set_triton_descriptor_allocator
-_tle_flashmla_prefill_fwd = getattr(_native, "_tle_flashmla_prefill_fwd", None)
-TLE_FLASHMLA_PREFILL_PAIR_BLOCKS = _native.TLE_FLASHMLA_PREFILL_PAIR_BLOCKS
-TLE_FLASHMLA_PREFILL_WORKER_NUM_WARPS = _native.TLE_FLASHMLA_PREFILL_WORKER_NUM_WARPS
 triton_flash_mla_sparse_fwd = local_launch(
     _native.triton_flash_mla_sparse_fwd,
     {"BK": 16, "BH": 16, "num_warps": 2, "num_stages": 2},
 )
-
-
-@triton.jit
-def triton_flash_mla_sparse_fwd_halfd_serial(
-    q,
-    kv,
-    indices,
-    attn_sink,
-    topk_length,
-    sm_scale: tl.constexpr,
-    output,
-    max_logits,
-    lse,
-    stride_qh,
-    stride_qm,
-    stride_kvg,
-    stride_kvn,
-    stride_tg,
-    stride_tm,
-    stride_oh,
-    stride_om,
-    stride_mm,
-    stride_lm,
-    SQ,
-    HQ: tl.constexpr,
-    DQK: tl.constexpr,
-    SKV,
-    TOPK: tl.constexpr,
-    HAVE_ATTN_SINK: tl.constexpr,
-    HAVE_TOPK_LENGTH: tl.constexpr,
-    BK: tl.constexpr,
-    BH: tl.constexpr,
-    V_START: tl.constexpr,
-    WRITE_STATS: tl.constexpr,
-):
-    num_head_blocks: tl.constexpr = (HQ + BH - 1) // BH
-    pid = tl.program_id(0)
-    i_sq = pid // num_head_blocks
-    i_sq = i_sq.to(tl.int64)
-    i_gbh = pid % num_head_blocks
-    gbh_base = i_gbh * BH
-    DP: tl.constexpr = 512
-    BDP: tl.constexpr = 256
-
-    q_base = q + i_sq * stride_qm + gbh_base * stride_qh
-    kv_base = kv
-    tkv_base = kv + DP
-    t_base = indices + i_sq * stride_tm
-    attn_sink_ptr = attn_sink + gbh_base if HAVE_ATTN_SINK else 0
-    topk_length_ptr = topk_length + i_sq if HAVE_TOPK_LENGTH else 0
-    o_base = output + i_sq * stride_om + gbh_base * stride_oh
-    max_log_base = max_logits + i_sq * stride_mm + gbh_base
-    l_base = lse + i_sq * stride_lm + gbh_base
-
-    offs_h = tl.arange(0, BH)
-    offs_d = tl.arange(0, BDP)
-    if DQK == 576:
-        offs_td = tl.arange(0, 64)
-    offs_t = tl.arange(0, BK)
-
-    q_ptr = q_base + offs_h[:, None] * stride_qh + offs_d[None, :]
-    q_blk0 = tl.load(q_ptr, eviction_policy="evict_first")
-    q_blk1 = tl.load(q_ptr + BDP, eviction_policy="evict_first")
-    if DQK == 576:
-        tq_ptr = q_base + DP + offs_h[:, None] * stride_qh + offs_td[None, :]
-        tq_blk = tl.load(tq_ptr, eviction_policy="evict_first")
-
-    max_log = tl.full([BH], float("-inf"), dtype=tl.float32)
-    sum_exp = tl.full([BH], 0.0, dtype=tl.float32)
-    acc = tl.zeros([BH, BDP], dtype=tl.float32)
-    topk_len = tl.load(topk_length_ptr) if HAVE_TOPK_LENGTH else TOPK
-    NK = tl.cdiv(topk_len, BK)
-    for ck in range(NK):
-        t_idx = BK * ck + offs_t
-        t_msk = t_idx < topk_len
-        kv_ids = tl.load(t_base + t_idx, t_msk, other=-1)
-        mask_ids = (kv_ids < SKV) & (kv_ids >= 0)
-        kv_ids = tl.where(mask_ids, kv_ids, 0)
-
-        kv_ptr = kv_base + offs_d[:, None] + kv_ids[None, :] * stride_kvn
-        kv_blk0 = tl.load(kv_ptr, cache_modifier=".cg")
-        kv_blk1 = tl.load(kv_ptr + BDP, cache_modifier=".cg")
-        qk = tl.dot(q_blk0, kv_blk0, out_dtype=tl.float32)
-        qk = tl.dot(q_blk1, kv_blk1, qk, out_dtype=tl.float32)
-        if DQK == 576:
-            tkv_ptr = tkv_base + offs_td[:, None] + kv_ids[None, :] * stride_kvn
-            tkv_blk = tl.load(tkv_ptr, cache_modifier=".cg")
-            qk = tl.dot(tq_blk, tkv_blk, qk, out_dtype=tl.float32)
-        qk *= sm_scale
-        qk = tl.where(mask_ids[None, :], qk, float("-inf"))
-        new_max = tl.maximum(max_log, tl.max(qk, axis=1))
-        exp_qk = tl.math.exp(qk - new_max[:, None])
-        sum_qk = tl.sum(exp_qk, axis=1)
-        alpha = tl.math.exp(max_log - new_max)
-        sum_exp = sum_exp * alpha + sum_qk
-
-        # For exact 256/256 split, value dimension is the same physical bf16 K tile.
-        # Reusing kv_blk0/kv_blk1 avoids an extra [256,BK] live tile.
-        val_blk = kv_blk0 if V_START == 0 else kv_blk1
-        acc = tl.dot(
-            exp_qk.to(tl.bfloat16),
-            val_blk.trans(),
-            acc * alpha[:, None],
-            out_dtype=tl.float32,
-        )
-        max_log = new_max
-
-    valid_mask = max_log != float("-inf")
-    max_log = tl.where(valid_mask, max_log, float("-inf"))
-    if WRITE_STATS:
-        tl.store(max_log_base + offs_h, max_log)
-    orig_lse = max_log + tl.math.log(sum_exp)
-    lse_out = tl.where(valid_mask, orig_lse, float("inf"))
-    if WRITE_STATS:
-        tl.store(l_base + offs_h, lse_out)
-    if HAVE_ATTN_SINK:
-        sink = tl.load(attn_sink_ptr + offs_h)
-        sum_exp_new_lse = tl.math.exp(orig_lse) + tl.math.exp(sink)
-        factor = tl.math.exp(max_log) / sum_exp_new_lse
-    else:
-        factor = 1.0 / sum_exp
-    out_vals = tl.where(valid_mask[:, None], acc * factor[:, None], 0.0)
-    o_ptr = o_base + offs_h[:, None] * stride_oh + (V_START + offs_d)[None, :]
-    tl.store(o_ptr, out_vals.to(tl.bfloat16))
 
 
 @triton.jit
@@ -276,14 +144,6 @@ def triton_flash_mla_sparse_fwd_halfd_qkfold_blockdiag(
     tl.store(o_ptr, out_vals.to(tl.bfloat16))
 
 
-def _flash_mla_sparse_halfd_serial_enabled() -> bool:
-    return _tuning.current.prefill_half_d
-
-
-def _flash_mla_sparse_qkfold_blockdiag_enabled() -> bool:
-    return _tuning.current.prefill_blockdiag
-
-
 def flash_mla_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -348,16 +208,6 @@ def flash_mla_sparse_fwd(
     assert HKV == 1, "h_kv is expected to be 1"
     assert HQ == 16 or HQ == 64 or HQ == 128, "Unsupported h_q"
     assert DQK == 576 or DQK == 512, "Unsupported d_qk"
-    _ = SKV
-    D = DV
-    TD = DQK - D
-    DP = triton.next_power_of_2(D)
-    HAVE_TAIL = TD > 0
-    TDP = triton.next_power_of_2(TD) if HAVE_TAIL else 1
-    G = HQ // HKV
-    BH = TLE_FLASHMLA_PREFILL_BH
-    RH = G // BH
-    BK = TLE_FLASHMLA_PREFILL_BK
     if out is None:
         output = torch.empty((SQ, HQ, DV), device=q.device, dtype=q.dtype)
     else:
@@ -384,109 +234,9 @@ def flash_mla_sparse_fwd(
     def triton_grid(META):
         return (triton.cdiv(HQ, META["BH"]) * SQ,)
 
-    if _flash_mla_sparse_halfd_serial_enabled() and (
-        SQ > 1
-        and HQ == 16
-        and (HKV == 1)
-        and (DQK in (512, 576))
-        and (DV == 512)
-        and (TOPK > 0)
-        and q.is_contiguous()
-        and kv.is_contiguous()
-        and indices.is_contiguous()
-        and (attn_sink is None or attn_sink.is_contiguous())
-        and (topk_length is None or topk_length.is_contiguous())
-    ):
-        if _flash_mla_sparse_qkfold_blockdiag_enabled() and real_num_heads == 8:
-            triton_flash_mla_sparse_fwd_halfd_qkfold_blockdiag[triton_grid](
-                q,
-                kv,
-                indices,
-                attn_sink,
-                topk_length,
-                sm_scale,
-                output,
-                max_logits,
-                lse,
-                q.stride(1),
-                q.stride(0),
-                kv.stride(1),
-                kv.stride(0),
-                indices.stride(1),
-                indices.stride(0),
-                output.stride(1),
-                output.stride(0),
-                max_logits.stride(0),
-                lse.stride(0),
-                SQ,
-                HQ,
-                DQK,
-                SKV,
-                TOPK,
-                attn_sink is not None,
-                topk_length is not None,
-                BK=16,
-                BH=16,
-                num_warps=4,
-                num_stages=1,
-            )
-        else:
-            for _v_start, _write_stats in ((0, True), (256, False)):
-                triton_flash_mla_sparse_fwd_halfd_serial[triton_grid](
-                    q,
-                    kv,
-                    indices,
-                    attn_sink,
-                    topk_length,
-                    sm_scale,
-                    output,
-                    max_logits,
-                    lse,
-                    q.stride(1),
-                    q.stride(0),
-                    kv.stride(1),
-                    kv.stride(0),
-                    indices.stride(1),
-                    indices.stride(0),
-                    output.stride(1),
-                    output.stride(0),
-                    max_logits.stride(0),
-                    lse.stride(0),
-                    SQ,
-                    HQ,
-                    DQK,
-                    SKV,
-                    TOPK,
-                    attn_sink is not None,
-                    topk_length is not None,
-                    BK=16,
-                    BH=16,
-                    V_START=_v_start,
-                    WRITE_STATS=_write_stats,
-                    num_warps=2,
-                    num_stages=1,
-                )
-        return (output, max_logits, lse)
-    if _can_use_tle_flash_mla_sparse_fwd(q, kv, indices, d_v, topk_length):
-        from triton.tools.tensor_descriptor import TensorDescriptor
-
-        _set_triton_descriptor_allocator(q.device)
-        q_desc = TensorDescriptor(
-            q, shape=[SQ * HQ, DQK], strides=[DQK, 1], block_shape=[BH, DP // 2]
-        )
-        if HAVE_TAIL:
-            tq_desc = TensorDescriptor(
-                q, shape=[SQ * HQ, DQK], strides=[DQK, 1], block_shape=[BH, TDP]
-            )
-        else:
-            tq_desc = q_desc
-        output_desc = TensorDescriptor(
-            output, shape=[SQ * HQ, D], strides=[D, 1], block_shape=[BH, DP // 2]
-        )
-        _tle_flashmla_prefill_fwd[triton_grid](
-            q_desc,
-            tq_desc,
-            output_desc,
+    if SQ > 1 and HQ == 16 and real_num_heads == 8 and TOPK > 0:
+        triton_flash_mla_sparse_fwd_halfd_qkfold_blockdiag[triton_grid](
+            q,
             kv,
             indices,
             attn_sink,
@@ -495,6 +245,16 @@ def flash_mla_sparse_fwd(
             output,
             max_logits,
             lse,
+            q.stride(1),
+            q.stride(0),
+            kv.stride(1),
+            kv.stride(0),
+            indices.stride(1),
+            indices.stride(0),
+            output.stride(1),
+            output.stride(0),
+            max_logits.stride(0),
+            lse.stride(0),
             SQ,
             HQ,
             DQK,
@@ -502,18 +262,9 @@ def flash_mla_sparse_fwd(
             TOPK,
             attn_sink is not None,
             topk_length is not None,
-            D,
-            TD,
-            DP,
-            TDP,
-            G,
-            HKV,
-            RH,
-            HAVE_TAIL,
-            BK,
-            BH,
-            TLE_FLASHMLA_PREFILL_PAIR_BLOCKS,
-            num_warps=TLE_FLASHMLA_PREFILL_WORKER_NUM_WARPS,
+            BK=16,
+            BH=16,
+            num_warps=4,
             num_stages=1,
         )
         return (output, max_logits, lse)
@@ -552,65 +303,24 @@ def sparse_prefill_local(
     q, kv, indices, sm_scale, attn_sink, topk_length, out, max_logits, lse
 ):
     (SQ, HQ, DQK) = q.shape
-    (SKV, TOPK) = (kv.shape[0], indices.shape[-1])
-    grid = (SQ,)
-    if (
-        _tuning.current.prefill_staged
-        and DQK == 512
-        and (q.dtype == torch.bfloat16)
-        and (kv.dtype == torch.bfloat16)
-        and kv.is_contiguous()
-        and (indices.dtype == torch.int32)
-    ):
-        work = _staged.buffers(q, TOPK)
-        _staged.run(
-            q,
-            kv,
-            indices,
-            attn_sink,
-            topk_length,
-            out,
-            max_logits,
-            lse,
-            work,
-            qw=2,
-            pw=2,
-            sm_scale=sm_scale,
-        )
-    else:
-        for _v_start, _write_stats in ((0, True), (256, False)):
-            triton_flash_mla_sparse_fwd_halfd_serial[grid](
-                q,
-                kv,
-                indices,
-                attn_sink,
-                topk_length,
-                sm_scale,
-                out,
-                max_logits,
-                lse,
-                q.stride(1),
-                q.stride(0),
-                kv.stride(1),
-                kv.stride(0),
-                indices.stride(1),
-                indices.stride(0),
-                out.stride(1),
-                out.stride(0),
-                max_logits.stride(0),
-                lse.stride(0),
-                SQ,
-                HQ,
-                DQK,
-                SKV,
-                TOPK,
-                attn_sink is not None,
-                topk_length is not None,
-                BK=16,
-                BH=16,
-                V_START=_v_start,
-                WRITE_STATS=_write_stats,
-                num_warps=2,
-                num_stages=1,
-            )
+    TOPK = indices.shape[-1]
+    # Headpack constructs contiguous [M,16,512] queries with 16 real heads.
+    assert HQ == 16 and DQK == 512
+    assert q.dtype == kv.dtype == torch.bfloat16 and kv.is_contiguous()
+    assert indices.dtype == torch.int32
+    work = _staged.buffers(q, TOPK)
+    _staged.run(
+        q,
+        kv,
+        indices,
+        attn_sink,
+        topk_length,
+        out,
+        max_logits,
+        lse,
+        work,
+        qw=2,
+        pw=2,
+        sm_scale=sm_scale,
+    )
     return (out, max_logits, lse)

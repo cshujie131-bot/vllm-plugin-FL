@@ -134,6 +134,39 @@ class LayerBoundaryTests(unittest.TestCase):
             )
         )
 
+    def test_retired_attention_variants_are_absent(self):
+        retired = {
+            "decode.py": {"_partial_model1_kernel", "_partial_model1_kernel_halfd"},
+            "prefill.py": {"triton_flash_mla_sparse_fwd_halfd_serial"},
+        }
+        for filename, names in retired.items():
+            tree = ast.parse((OPS / filename).read_text())
+            functions = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+            self.assertFalse(functions & names)
+        self.assertFalse((ROOT / "vllm_fl/ops/prefill_topk_native_op.py").exists())
+
+    def test_unchanged_adapters_are_reused(self):
+        folder = ROOT / "vllm_fl/dispatch/backends/flaggems/impl/deepseek_v4_metax"
+        for name in (
+            "activation",
+            "normalization",
+            "rotary",
+            "router_gemm",
+            "fused_moe",
+            "deepseek_v4_ops",
+        ):
+            self.assertFalse((folder / (name + ".py")).exists())
+        backend = (folder.parents[1] / "deepseek_v4_metax.py").read_text()
+        self.assertIn("from .impl import fused_moe", backend)
+        self.assertIn("from .impl import deepseek_v4_attn as _common_attn", backend)
+
+    def test_w4a8_vendor_registrations_are_absent(self):
+        path = ROOT / "vllm_fl/dispatch/backends/vendor/metax/impl/dsv4/mctlass_ops.py"
+        tree = ast.parse(path.read_text())
+        functions = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+        self.assertFalse(any("w4a8" in name for name in functions))
+        self.assertIn("cutlass_moe_mm_w8a8_get_kernel_m", functions)
+
     def test_all_python_sources_parse(self):
         for path in OPS.glob("*.py"):
             ast.parse(path.read_text(), filename=str(path))

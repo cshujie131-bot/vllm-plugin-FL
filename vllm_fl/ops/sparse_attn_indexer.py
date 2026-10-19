@@ -32,12 +32,6 @@ from vllm_fl.dispatch import CachedOp
 
 from vllm_fl import dsv4_config as _dsv4
 
-# Runtime patch: graph-visible native prefill topK custom op. Import registers op before capture.
-try:
-    from vllm_fl.ops import prefill_topk_native_op as _prefill_topk_native_op  # noqa: F401
-except Exception:
-    _prefill_topk_native_op = None
-
 _indexer_k_quant_and_cache = CachedOp("indexer_k_quant_and_cache")
 _cp_gather_indexer_k_quant_cache = CachedOp("cp_gather_indexer_k_quant_cache")
 _top_k_per_row_prefill = CachedOp("top_k_per_row_prefill")
@@ -134,20 +128,6 @@ def _topk_per_row_fixed(
         _log_topk_fix(f"{tag}-all", f"rows={num_rows} max_valid={max_valid}")
         return
 
-    if tag == "prefill" and _dsv4.current.prefill_native_topk:
-        if _prefill_topk_native_op is None:
-            raise RuntimeError(
-                "framework.prefill_native_topk is enabled but its operator import failed"
-            )
-        torch.ops.vllm_fl.prefill_topk_native(
-            logits,
-            ks.reshape(-1).to(torch.int32),
-            ke.reshape(-1).to(torch.int32),
-            out,
-            topk_tokens,
-        )
-        _log_topk_fix("prefill-native-topk", f"rows={num_rows} max_valid={max_valid}")
-        return
 
     if kernel is not None:
         # Production kernel (prefill flagos) writes all rows; short rows are
