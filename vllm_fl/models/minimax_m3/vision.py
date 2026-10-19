@@ -2,11 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2026 FlagOS Contributors
 
-"""Vision deltas: patch projection, partial RoPE and bounded frame batches."""
+"""Vision deltas: patch projection and bounded frame batches."""
 
 import torch
 from vllm.models.minimax_m3.common import vision_tower as native
-from vllm_fl.ops.minimax_m3.vision import vision_rope_op
 
 
 class MiniMaxVLPatchEmbed(native.MiniMaxVLPatchEmbed):
@@ -21,13 +20,6 @@ class MiniMaxVLPatchEmbed(native.MiniMaxVLPatchEmbed):
         from vllm_fl.ops.minimax_m3.layers import patch_embed
 
         return patch_embed(pixel_values, self.patch_embedding.weight)
-
-
-class MiniMaxVLAttention(native.MiniMaxVLAttention):
-    def _apply_rotary_emb(
-        self, qk_reshaped, rotary_cos, rotary_sin, seq_len, rotary_segment_lengths
-    ):
-        return vision_rope_op(qk_reshaped, rotary_cos, rotary_sin)
 
 
 class MiniMaxVLVisionModel(native.MiniMaxVLVisionModel):

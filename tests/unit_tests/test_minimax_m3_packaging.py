@@ -258,6 +258,32 @@ class LauncherTests(unittest.TestCase):
             run.assert_not_called()
 
 
+class VisionDispatchTests(unittest.TestCase):
+    def test_no_private_vision_rope_implementation_or_registration(self):
+        for relative in (
+            "vllm_fl/ops/minimax_m3/vision.py",
+            "vllm_fl/ops/minimax_m3/torch_ops.py",
+            "vllm_fl/ops/minimax_m3/registration.py",
+        ):
+            with self.subTest(path=relative):
+                source = (ROOT / relative).read_text()
+                self.assertNotIn("m3_vision_rope", source)
+                self.assertNotIn('"vision_rope"', source)
+
+    def test_native_vision_attention_method_is_preserved(self):
+        import ast
+
+        source = (ROOT / "vllm_fl/models/minimax_m3/vision.py").read_text()
+        classes = {
+            n.name for n in ast.parse(source).body if isinstance(n, ast.ClassDef)
+        }
+        self.assertNotIn("MiniMaxVLAttention", classes)
+        bindings = (ROOT / "vllm_fl/models/minimax_m3/bindings.py").read_text()
+        self.assertNotIn('"MiniMaxVLAttention"', bindings)
+        worker = (ROOT / "vllm_fl/worker/worker.py").read_text()
+        self.assertIn("patch_oot_apply_rotary_emb()", worker)
+
+
 class SourceImportTests(unittest.TestCase):
     def setUp(self):
         import hashlib

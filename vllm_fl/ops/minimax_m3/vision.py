@@ -8,20 +8,7 @@ from vllm.model_executor.layers.attention.mm_encoder_attention import (
     MMEncoderAttention as _MMEncoderBase,
 )
 
-vision_rope_op = CachedOp("m3_vision_rope")
 vision_attention_op = CachedOp("m3_vision_attention")
-
-
-def vision_rope(x, cos, sin):
-    half = cos.shape[-1]
-    rd = 2 * half
-    assert rd <= x.shape[-1] and cos.shape == sin.shape
-    rot = x[..., :rd].float()
-    c = cos.float().unsqueeze(-2)
-    s = sin.float().unsqueeze(-2)
-    a, b = rot.split(half, dim=-1)
-    y = torch.cat((a * c - b * s, b * c + a * s), dim=-1).to(x.dtype)
-    return torch.cat((y, x[..., rd:]), dim=-1) if rd < x.shape[-1] else y
 
 
 def vision_attention(query, key, value, cu_seqlens, max_seqlen, scale):

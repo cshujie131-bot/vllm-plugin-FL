@@ -170,23 +170,12 @@ _register(
 )
 
 
-def _vision_rope(x, cos, sin):
-    from .vision import vision_rope as implementation
-
-    return implementation(x, cos, sin)
-
-
 def _vision_attention(q, k, v, cu, maxlen, scale):
     from .vision import vision_attention as implementation
 
     return implementation(q, k, v, cu, maxlen, scale)
 
 
-_register(
-    "m3_vision_rope(Tensor x, Tensor cos, Tensor sin) -> Tensor",
-    _vision_rope,
-    lambda x, cos, sin: _empty(x),
-)
 _register(
     "m3_vision_attention(Tensor query, Tensor key, Tensor value, Tensor? cu_seqlens, int max_seqlen, float scale) -> Tensor",
     _vision_attention,
@@ -281,10 +270,6 @@ def sparse_attn(*args, **kwargs):
 
 def sparse_decode(*args, **kwargs):
     return torch.ops.vllm_fl.m3_sparse_decode_out_(*args, **kwargs)
-
-
-def vision_rope(x, cos, sin):
-    return torch.ops.vllm_fl.m3_vision_rope(x, cos, sin)
 
 
 def vision_attention(query, key, value, cu_seqlens, max_seqlen, scale):

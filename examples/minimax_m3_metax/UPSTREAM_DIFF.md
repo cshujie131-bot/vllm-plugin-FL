@@ -16,6 +16,7 @@ Comparison bases are public source revisions, not the earlier M3 PR:
 | Biased router | FL `ops/fused_moe/router.py::FusedTopKBiasRouterFL` | M3 adds the sigmoid-plus-bias branch; other cases delegate to the upstream router. |
 | MoE construction | vLLM `fused_moe/layer.py::FusedMoE`, `routed_experts.py::RoutedExperts` | Use explicit router/expert constructor arguments and a local quant-method subclass. Do not copy the native constructor or replace global factories. |
 | Text/vision model | vLLM `models/minimax_m3/nvidia/model.py`, `common/vision_tower.py` | Changed norm, MoE construction, QKV insertion and vision methods only, plus model-scoped bindings. Loading, metadata and multimodal preprocessing remain upstream. |
+| Vision partial RoPE | FL #560: native M3 vision attention → ApplyRotaryEmb → apply_rotary_emb dispatch | Reused directly. The M3-specific attention override, RoPE implementation, schema and registration are removed. FP32 rotary computation and the two unrotated tail dimensions are preserved. |
 | Warmup | vLLM `model_executor/warmup/kernel_warmup.py`, `minimax_m3_msa_warmup.py` | Reused directly. The copied M3 warmup files were removed. |
 | MSA orchestration | vLLM M3 caller/cache semantics | M3-owned TP16/head layout guards, query packing, length/shape selection and launch metadata. These are framework adaptations, not newly invented attention math. |
 | Torch schemas and dispatch | FL dispatch and PyTorch custom-op interfaces | `torch_ops.py`, `registration.py`, `layers.py`, `msa.py` expose the M3 calls and fake/mutation contracts. Schema/wrapper lines are not new numerical kernels. |
@@ -55,5 +56,8 @@ workspace use, quantization, activation, LoRA ordering and reduction.
 Dependency preparation reconstructs the same operator files as before; compiler
 selection, tuning policy and numerical kernels remain unchanged.
 
-These are CPU/source and preparation checks. The installed-entry TP16 smoke
-remains pending; this PR stays Draft.
+The partial-RoPE replacement also passed 25 standalone cases on MetaX C550
+with FlagTree, including three graph/eager comparisons. It uses the shared
+default.flagos dispatch and FGV rotary kernel. Old/new results meet the accepted
+BF16 tolerance but are not all bitwise identical. The installed-entry TP16
+smoke remains pending; this PR stays Draft.

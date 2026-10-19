@@ -14,7 +14,6 @@ NAMES = (
     "index_decode",
     "sparse_attn",
     "sparse_decode",
-    "vision_rope",
     "vision_attention",
     "qknorm_rope_insert",
     "patch_embed",
@@ -28,7 +27,7 @@ def vllm_fl_register(registry):
                 op_name="m3_" + name,
                 impl_id=(
                     "m3.flag_gems."
-                    if name in {"patch_embed", "vision_rope", "vision_attention"}
+                    if name in {"patch_embed", "vision_attention"}
                     else "m3.flaggems_vllm."
                 )
                 + name,

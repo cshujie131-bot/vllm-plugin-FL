@@ -73,7 +73,7 @@ def install():
             _bind(mtp, name, replacement)
     if profile.framework.flagos_swiglu:
         _bind(native, "SiluAndMulWithClamp", layers.SiluAndMulWithClampFL)
-    for name in ("MiniMaxVLPatchEmbed", "MiniMaxVLAttention", "MiniMaxVLVisionModel"):
+    for name in ("MiniMaxVLPatchEmbed", "MiniMaxVLVisionModel"):
         _bind(vision_tower, name, getattr(vision, name))
     _bind(vision_tower, "MMEncoderAttention", M3VisionAttentionFL)
     _bind(native, "MiniMaxVLVisionModel", vision.MiniMaxVLVisionModel)

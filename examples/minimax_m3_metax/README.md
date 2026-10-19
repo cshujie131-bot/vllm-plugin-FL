@@ -137,7 +137,7 @@ the comparison baseline.
 | Linear | dependencies/flag_gems/01-linear-policy.patch | Retained 35 configurations, small-M dot/GEMV and M8192 program ordering; explicit policy supplied by FL |
 | Gate and MoE | ops/fused_moe/fused_moe_utils.py; ops/minimax_m3/experts.py; expert_layer.py; moe.py; router.py; routing.py; dependencies/flaggems_vllm/03-moe-router.patch | Small shared extension points; M3 overrides only GEMM context, activation and bindings; retained BF16-load/FP32 gate and routed GEMV |
 | Norm/activation/QKV | dependencies/flaggems_vllm/02-norm-activation-qkv.patch | Gemma residual semantics, clamped SwiGLU and BF16 rounding between QK normalization and RoPE/cache insertion |
-| Vision and library runtime | ops/minimax_m3/vision.py; vision_chunk.py; dependencies/flaggems_vllm/04-launch-runtime.patch | Partial RoPE, patch chunking, retained FlagGems varlen call, isolated FGV cache |
+| Vision and library runtime | ops/minimax_m3/vision.py; vision_chunk.py; dependencies/flaggems_vllm/04-launch-runtime.patch | Shared partial-RoPE dispatch from #560, patch chunking, retained FlagGems varlen call, isolated FGV cache |
 | In-place mask | dependencies/flag_gems/02-generic-masked-fill.patch | Select the existing generic masked_fill_ function; non-inplace masked_fill stays excluded |
 | Vendor/communication | patches/minimax_m3_metax/compat.py; sdk/; tuning-ar512k.cfg | MCCL ABI, in-place AllReduce and required SDK compatibility; no vendor framework import |
 
@@ -150,6 +150,11 @@ preserving the accepted four-stage computation. Existing verified FlagGems
 MoE GEMM, sigmoid top-k, ordered sum, vision attention and dense KV insertion
 remain on that pinned implementation. They are not migrated to different FGV
 fusions as part of packaging.
+
+Vision RoPE now follows the native M3 attention class through the shared
+apply_rotary_emb dispatch from #560. Its FGV implementation compiles with
+FlagTree; the duplicate M3 RoPE op and model override are removed. The separate
+text QKV/norm/RoPE/cache-insertion fusion is retained.
 
 The entry has real runtime hooks for the matched Torch/vLLM/MCCL ABI. They are
 centralized, guarded and idempotent, and only the explicit M3 profile installs
@@ -188,6 +193,12 @@ the publication layout. The current deployment keeps FlagTree enabled.
 The accepted deployment passed 104 operator checks, 27 MSA cases, 26 MoE-chain
 cases, 198 service regressions and four chat/image checks. The refactored and
 previous outputs matched under the established per-operator criteria.
+
+The shared vision RoPE entry passed 25 standalone BF16 cases on C550 with
+FlagTree, including three graph/eager checks. The accepted FP32-reference
+tolerance is rtol=0.01 and atol=0.01; input and unrotated tails stay exact.
+Old/new relative L2 was at most 9.84e-6; this is numerical agreement, not a
+claim of bitwise equality or a new full-model accuracy run.
 
 Packaging checks: CPU configuration/launcher tests, syntax, critical lint,
 patch application and numerical-body/configuration comparisons. The installed
