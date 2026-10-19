@@ -78,6 +78,9 @@ For offline hosts, transfer complete Git repositories and install via
 `git+file:///...@<the same SHA>`. Preserve Git history/provenance; a ZIP snapshot
 or an arbitrary same-version wheel is not an equivalent pinned installation.
 
+Build from a clean checkout. The Docker recipe uses a fresh source directory,
+excludes old build outputs and isolates residual files from a previous FL install.
+
 A build example is also provided:
 
 ~~~sh
@@ -102,9 +105,15 @@ unrecognized cache and never stops another service.
 
 ## Validation
 
-The installed-package TP8 smoke for this dependency refactor is being recorded.
-Historical accuracy and performance below are retained; they are not newly
-measured scores for the dependency-layout update.
+The clean installed-package TP8 smoke passed 78/78 requests: short prompts,
+1K/4K/16K/20K prefill, mixed batches and 64 concurrent distinct-string responses.
+All seven decode graph buckets were captured. The 345 installed Python source
+files matched this FL checkout with no extra legacy modules; dependency commit,
+Hash-table and RMS-policy checks passed. There are also 28 passing CPU checks.
+
+This is a serving/packaging smoke, not a quality or throughput benchmark.
+Historical accuracy and performance below are retained, not newly measured
+results for the dependency-layout update.
 
 | Task | Reviewed accuracy |
 |---|---:|

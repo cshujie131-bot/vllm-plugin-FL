@@ -31,6 +31,15 @@ serve = load("ds_serve", EXAMPLE / "serve.py")
 
 
 class PackagingTests(unittest.TestCase):
+    def test_docker_build_uses_clean_source_and_package_paths(self):
+        dockerfile = (EXAMPLE / "Dockerfile").read_text()
+        ignores = (EXAMPLE / "Dockerfile.dockerignore").read_text()
+        self.assertIn("RUN test ! -e /opt/dsv4-fl-source", dockerfile)
+        self.assertIn("pip uninstall -y vllm-plugin-fl", dockerfile)
+        self.assertIn("dsv4-base-leftovers", dockerfile)
+        self.assertIn("build/", ignores)
+        self.assertIn("**/*.egg-info/", ignores)
+
     def test_requirements_match_immutable_pins(self):
         lock = json.loads((EXAMPLE / "dependency-lock.json").read_text())
         requirements = (EXAMPLE / "requirements.txt").read_text()
