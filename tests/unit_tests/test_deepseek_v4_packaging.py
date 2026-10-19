@@ -2,7 +2,6 @@
 """CPU-only publication checks. Do not import Torch or initialize an accelerator."""
 
 import ast
-import difflib
 import importlib.util
 import json
 import os
@@ -28,11 +27,43 @@ def load(name, path):
     return module
 
 
-prepare = load("ds_prepare", EXAMPLE / "prepare_dependencies.py")
 serve = load("ds_serve", EXAMPLE / "serve.py")
 
 
 class PackagingTests(unittest.TestCase):
+    def test_requirements_match_immutable_pins(self):
+        lock = json.loads((EXAMPLE / "dependency-lock.json").read_text())
+        requirements = (EXAMPLE / "requirements.txt").read_text()
+        for entry in lock["libraries"]:
+            self.assertEqual(len(entry["commit"]), 40)
+            self.assertIn(entry["repository"] + ".git@" + entry["commit"], requirements)
+
+    def test_installed_vcs_revisions_match(self):
+        lock = json.loads((EXAMPLE / "dependency-lock.json").read_text())
+        pins = {x["distribution"]: x["commit"] for x in lock["libraries"]}
+
+        def dist(name):
+            return types.SimpleNamespace(
+                read_text=lambda _: json.dumps({"vcs_info": {"commit_id": pins[name]}})
+            )
+
+        with patch.object(serve.importlib.metadata, "distribution", side_effect=dist):
+            self.assertEqual(serve.check_dependency_pins(), pins)
+
+    def test_reject_unpinned_install(self):
+        dist = types.SimpleNamespace(read_text=lambda _: None)
+        with patch.object(serve.importlib.metadata, "distribution", return_value=dist):
+            with self.assertRaisesRegex(RuntimeError, "pinned Git requirement"):
+                serve.check_dependency_pins()
+
+    def test_reject_wrong_dependency_revision(self):
+        dist = types.SimpleNamespace(
+            read_text=lambda _: json.dumps({"vcs_info": {"commit_id": "0" * 40}})
+        )
+        with patch.object(serve.importlib.metadata, "distribution", return_value=dist):
+            with self.assertRaisesRegex(RuntimeError, "expected"):
+                serve.check_dependency_pins()
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -126,98 +157,6 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("FULL_DECODE_ONLY", result.stdout)
         self.assertFalse((self.root / "unused").exists())
         self.assertNotIn("torch", sys.modules)
-
-    def fixture(self):
-        source = self.root / "source"
-        package = source / "src/demo"
-        package.mkdir(parents=True)
-        (source / "pyproject.toml").write_text("[project]\nname='demo'\nversion='0'\n")
-        (package / "__init__.py").write_text("VALUE = 1\n")
-        before = prepare.source_hash(package)
-        (package / "__init__.py").write_text("VALUE = 2\n")
-        after = prepare.source_hash(package)
-        (package / "__init__.py").write_text("VALUE = 1\n")
-        change = "".join(
-            difflib.unified_diff(
-                ["VALUE = 1\n"],
-                ["VALUE = 2\n"],
-                fromfile="a/src/demo/__init__.py",
-                tofile="b/src/demo/__init__.py",
-            )
-        )
-        (self.root / "demo.patch").write_text(change)
-        lock = {
-            "demo": {
-                "commit": "pinned",
-                "source_sha256": before,
-                "result_sha256": after,
-                "patches": ["demo.patch"],
-            }
-        }
-        path = self.root / "lock.json"
-        path.write_text(json.dumps(lock))
-        return source, path
-
-    def test_dependency_round_trip_does_not_modify_input(self):
-        source, lock = self.fixture()
-        output = prepare.prepare({"demo": source}, self.root / "prepared", lock)
-        self.assertEqual(
-            (output / "demo/src/demo/__init__.py").read_text(), "VALUE = 2\n"
-        )
-        self.assertEqual((source / "src/demo/__init__.py").read_text(), "VALUE = 1\n")
-
-    def test_dependency_mismatch_fails_before_output(self):
-        source, lock = self.fixture()
-        (source / "src/demo/__init__.py").write_text("tampered\n")
-        with self.assertRaisesRegex(ValueError, "does not match"):
-            prepare.prepare({"demo": source}, self.root / "output", lock)
-        self.assertFalse((self.root / "output").exists())
-
-    def test_dependency_refuses_existing_output(self):
-        source, lock = self.fixture()
-        with self.assertRaises(FileExistsError):
-            prepare.prepare({"demo": source}, source, lock)
-
-    def test_dependency_refuses_nested_output(self):
-        source, lock = self.fixture()
-        with self.assertRaisesRegex(ValueError, "separate"):
-            prepare.prepare({"demo": source}, source / "nested", lock)
-
-    def test_failed_patch_cleans_only_own_staging(self):
-        source, lock = self.fixture()
-        (self.root / "demo.patch").write_text("invalid patch\n")
-        with self.assertRaises(subprocess.CalledProcessError):
-            prepare.prepare({"demo": source}, self.root / "output", lock)
-        self.assertFalse((self.root / "output").exists())
-        self.assertFalse(list(self.root.glob(".dsv4-deps-*")))
-        self.assertTrue(source.exists())
-
-    def test_hash_ignores_bytecode_cache(self):
-        source, _ = self.fixture()
-        package = source / "src/demo"
-        before = prepare.source_hash(package)
-        (package / "__pycache__").mkdir()
-        (package / "__pycache__/dummy.py").write_text("ignored")
-        self.assertEqual(before, prepare.source_hash(package))
-
-    def test_published_patches_are_readable_git_diffs(self):
-        lock = json.loads((EXAMPLE / "dependencies/lock.json").read_text())
-        for name, item in lock.items():
-            self.assertEqual(len(item["commit"]), 40)
-            self.assertEqual(len(item["source_sha256"]), 64)
-            for patch_name in item["patches"]:
-                result = subprocess.run(
-                    [
-                        "git",
-                        "apply",
-                        "--stat",
-                        str(EXAMPLE / "dependencies" / patch_name),
-                    ],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
-                self.assertIn("file", result.stdout)
 
     def test_no_frozen_source_tree(self):
         self.assertFalse((EXAMPLE / "profile/src").exists())

@@ -46,11 +46,10 @@ def initialize():
 
     compiler_entry = compiler.metax.translate_llvmir_to_mcfatbin
     import flaggems_vllm
-    from flaggems_vllm.ops import metax_tuning
+    from vllm_fl.ops.deepseek_v4_metax import tuning as attention_tuning
 
-    # Decorator-time defaults are generated from this exact sealed profile.
-    assert asdict(metax_tuning.KernelPolicy()) == profile["kernels"]
-    metax_tuning.configure(profile["kernels"])
+    assert asdict(attention_tuning.KernelPolicy()) == profile["kernels"]
+    attention_tuning.configure(profile["kernels"])
     dsv4_config.configure(profile["framework"], profile["moe"])
     assert flaggems_vllm.current_work_registrar is None
     assert compiler.metax.translate_llvmir_to_mcfatbin is compiler_entry
@@ -109,7 +108,7 @@ def initialize():
         "release": profile["release"],
         "pid": os.getpid(),
         "bindings": bindings,
-        "kernel_policy": asdict(metax_tuning.current),
+        "kernel_policy": asdict(attention_tuning.current),
         "framework_policy": asdict(dsv4_config.current),
         "aten_blacklist": blacklist,
         "vendor_imports": [],

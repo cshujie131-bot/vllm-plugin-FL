@@ -85,7 +85,7 @@ def cache_identity(config):
         for path in sorted(root.rglob("*")):
             if (
                 path.is_file()
-                and path.suffix in {".py", ".json", ".patch"}
+                and path.suffix in {".py", ".json"}
                 and "__pycache__" not in path.parts
             ):
                 digest.update(
@@ -137,6 +137,24 @@ def check_model(model):
             raise ValueError(f"Unsupported checkpoint {name}: {metadata.get(name)}")
 
 
+def check_dependency_pins():
+    lock = json.loads((HERE / "dependency-lock.json").read_text())
+    revisions = {}
+    for entry in lock["libraries"]:
+        package = entry["distribution"]
+        distribution = importlib.metadata.distribution(package)
+        provenance = distribution.read_text("direct_url.json")
+        info = json.loads(provenance) if provenance else {}
+        revision = info.get("vcs_info", {}).get("commit_id")
+        if revision != entry["commit"]:
+            raise RuntimeError(
+                f"{package}: install the pinned Git requirement; "
+                f"expected {entry['commit']}, got {revision}"
+            )
+        revisions[package] = revision
+    return revisions
+
+
 def check_environment():
     expected = {
         "vllm": "0.20.2",
@@ -145,12 +163,15 @@ def check_environment():
     }
     for package, version in expected.items():
         found = importlib.metadata.version(package)
-        if found != version:
+        # MetaX wheels may carry a local "+empty" build suffix for vLLM.
+        actual = found.split("+", 1)[0] if package == "vllm" else found
+        if actual != version:
             raise RuntimeError(f"{package}: expected {version}, got {found}")
     for package in ("flaggems-vllm", "vllm-plugin-fl", "mctlassEx", "flagtree"):
         importlib.metadata.distribution(package)
     if not shutil.which("vllm"):
         raise RuntimeError("vllm executable is not in PATH")
+    print("DSV4_DEPENDENCIES " + json.dumps(check_dependency_pins()), flush=True)
 
 
 def main():

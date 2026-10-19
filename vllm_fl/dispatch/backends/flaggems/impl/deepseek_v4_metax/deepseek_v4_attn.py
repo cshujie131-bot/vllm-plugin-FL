@@ -9,7 +9,7 @@ from typing import Optional, Tuple
 import torch
 
 import flag_gems
-from flaggems_vllm.ops.flash_mla_with_kvcache import (
+from vllm_fl.ops.deepseek_v4_metax.decode import (
     FlashMLASchedMeta,
     flash_mla_with_kvcache,
 )

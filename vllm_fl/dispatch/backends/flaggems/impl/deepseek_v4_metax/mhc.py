@@ -6,9 +6,9 @@ FlagGems implementations for mHC (Manifold-Constrained Hyper-Connections) operat
 
 import torch
 
-from flaggems_vllm import mhc_pre as _fgv_mhc_pre
+from vllm_fl.ops.deepseek_v4_metax.mhc import mhc_pre as _mhc_pre_graph
 from flaggems_vllm import mhc_post as _fgv_mhc_post
-from flag_gems import hc_head_fused_kernel
+from vllm_fl.ops.deepseek_v4_metax.hc_head import hc_head as hc_head_fused_kernel
 
 
 def mhc_pre_flaggems(
@@ -23,7 +23,7 @@ def mhc_pre_flaggems(
     sinkhorn_repeat: int,
     n_splits: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _fgv_mhc_pre(
+    return _mhc_pre_graph(
         residual,
         fn,
         hc_scale,

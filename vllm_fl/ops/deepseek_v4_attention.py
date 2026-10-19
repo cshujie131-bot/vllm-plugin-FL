@@ -32,7 +32,7 @@ from vllm_fl.dispatch import CachedOp
 from vllm_fl import dsv4_config as _dsv4
 
 if _dsv4.is_enabled():
-    from flaggems_vllm.ops import metax_tuning as _tuning
+    from vllm_fl.ops.deepseek_v4_metax import tuning as _tuning
 
 _fused_inv_rope_fp8_quant = CachedOp("fused_inv_rope_fp8_quant")
 _deepseek_v4_fp8_einsum = CachedOp("deepseek_v4_fp8_einsum")

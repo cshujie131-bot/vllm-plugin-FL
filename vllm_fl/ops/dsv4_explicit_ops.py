@@ -5,7 +5,7 @@ import torch
 from vllm import _custom_ops
 from flag_gems.ops.dsv4_masked_fill import masked_fill_ as _mask_fast
 from flaggems_vllm.ops.dsv4_int8_quant import quant as _quant
-from flaggems_vllm.ops.dsv4_moe_align import align as selected_align
+from flaggems_vllm import moe_align_block_size_no_tle as selected_align
 from flaggems_vllm.ops.silu_and_mul_with_clamp import silu_and_mul_with_clamp_kernel
 
 _LIB = torch.library.Library("dsv4_fg_explicit", "FRAGMENT")

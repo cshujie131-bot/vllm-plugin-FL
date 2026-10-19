@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 import triton
 from vllm_fl import dsv4_config as _dsv4
-import flaggems_vllm.ops.flashmla_sparse as _kernels
+from vllm_fl.ops.deepseek_v4_metax import prefill as _kernels
 
 
 def _try_headpack(
@@ -101,7 +101,7 @@ def sparse_prefill(
     max_logits_out: Optional[torch.Tensor] = None,
     lse_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Framework-owned TP headpacking; local arithmetic is provided by FGV."""
+    """Framework-owned TP headpacking; the matching TP-specialized arithmetic stays in FL."""
     assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
     assert (
         q.dtype == torch.bfloat16

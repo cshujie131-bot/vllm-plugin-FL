@@ -21,8 +21,6 @@ repos:
     -   id: detect-private-key
     -   id: end-of-file-fixer
     -   id: trailing-whitespace
-        # Preserve unified-diff context; applied sources are checked separately.
-        exclude: ^examples/deepseek_v4_metax/dependencies/.*\.patch$
 - repo: https://github.com/astral-sh/ruff-pre-commit
   rev: v0.14.0
   hooks:
@@ -35,4 +33,3 @@ repos:
   hooks:
   - id: typos
     args: [--force-exclude]
-    exclude: ^examples/deepseek_v4_metax/dependencies/.*\.patch$

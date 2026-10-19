@@ -32,7 +32,7 @@
   ],
   "deepseek_v4_metax": {
     "schema_version": 1,
-    "release": "dsv4-clean-20261016-r2",
+    "release": "dsv4-library-pins-20261019-r2",
     "framework": {
       "decode_hq16": true,
       "real_query_heads": 8,
@@ -57,20 +57,7 @@
       "decode_qkfold": true,
       "prefill_half_d": true,
       "prefill_blockdiag": true,
-      "prefill_staged": true,
-      "mhc_split_tail": true,
-      "mhc_small_m": true,
-      "mhc_max_m": 128,
-      "mhc_splits": 8,
-      "mhc_block_m": 16,
-      "mhc_block_k": 64,
-      "mhc_warps": 4,
-      "mhc_stages": 1,
-      "mhc_pad_n": 32,
-      "mhc_tail_block_h": 8192,
-      "mhc_tail_warps": 4,
-      "mhc_tail_stages": 1,
-      "enable_metax_gdn_compiler_patch": false
+      "prefill_staged": true
     },
     "moe": {
       "use_mctlass": true,

@@ -14,7 +14,7 @@ from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation,
 )
-from flaggems_vllm.ops.dsv4_moe_align import align as moe_align_block_size
+from flaggems_vllm import moe_align_block_size_no_tle as moe_align_block_size
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.model_executor.layers.fused_moe.fused_moe import logger
 from vllm.platforms import current_platform
@@ -651,7 +651,6 @@ def fused_experts_impl(
                     stage1_config["BLOCK_SIZE_M"],
                     global_num_experts,
                     expert_map,
-                    ignore_invalid_experts=True,
                 )
             )
         else:
