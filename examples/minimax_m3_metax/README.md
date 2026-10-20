@@ -160,7 +160,9 @@ text QKV/norm/RoPE/cache-insertion fusion is retained.
 The entry has real runtime hooks for the matched Torch/vLLM/MCCL ABI. They are
 centralized, guarded and idempotent, and only the explicit M3 profile installs
 them. Model hooks replace only named bindings inside vLLM's M3 modules, after checking
-their public source revision. General router and MoE factories stay unchanged.
+their public source revision. General router and MoE factories stay unchanged. The M3 worker explicitly
+disables the shared global MoE hooks because its local router/expert factory
+already supplies that integration; the common default remains enabled.
 Vendor binary access reuses the existing FL vendor backend. The remaining ABI
 compatibility lives alongside it, with the M3 entry controlling installation. No installed
 vLLM source is rewritten and no fake module facade is installed by this entry.
@@ -203,13 +205,20 @@ Old/new relative L2 was at most 9.84e-6; this is numerical agreement, not a
 claim of bitwise equality or a new full-model accuracy run.
 
 This ownership update passed 100 operator fixtures, 27 MSA cases (including
-three changing-input graph checks), 26 exact MoE-chain comparisons and actual
+three changing-input graph checks), 26 exact MoE-chain comparisons, eight
+additional shared-workspace chains, and actual
 ATen registration/routing checks. Standalone library PRs have their own
-correctness and complete-call timing evidence. The model evaluation and serving
+correctness and complete-call timing evidence. The five template-reuse timing
+controls stayed within 0.6% in Graph GPU time. The 26 CPU launch/configuration
+tests and six OOT scope tests also pass. The model evaluation and serving
 tables above are retained measurements; they were not rerun for this cleanup.
 
 The installed entry is checked with clean public vLLM and pinned public library
-commits. TP16 smoke is pending; the PR remains Draft until that boundary passes.
+commits. TP16 smoke passed 12/12 fixed-answer cases on two 8-C550 nodes: short text,
+4K/8K/16K boundaries, mixed requests through 64K, and an image. All 11 text
+answers match the accepted responses; there were no empty/truncated responses,
+preemptions or runtime errors. All 16 ranks completed graph capture and binding
+audits. MCCL used NET/IB/GDRDMA and all four HCA port counters grew on both nodes.
 
 
 ~~~sh

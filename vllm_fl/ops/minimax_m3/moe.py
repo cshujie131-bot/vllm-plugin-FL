@@ -5,9 +5,9 @@
 
 import torch
 import triton.language as tl
-from vllm_fl.minimax_m3_config import load, thaw
 
 from . import moe_gemv
+from vllm_fl.minimax_m3_config import load, thaw
 
 _ALLOWED = {
     "compute_type",

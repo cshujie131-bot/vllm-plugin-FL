@@ -3,14 +3,11 @@
 """vLLM 0.24 sparse wrappers; safe head padding/stages are local launch choices."""
 import torch
 import triton
+
 from vllm.models.minimax_m3.common.ops.sparse_attn import (
     _FP8_DTYPES,
     _gqa_sparse_decode_kernel,
-)
-from vllm.models.minimax_m3.common.ops.sparse_attn import (
     _gqa_sparse_fwd_kernel as _decorated_fwd,
-)
-from vllm.models.minimax_m3.common.ops.sparse_attn import (
     _merge_topk_attn_out_kernel,
 )
 

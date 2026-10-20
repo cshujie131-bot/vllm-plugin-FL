@@ -4,7 +4,7 @@
 import triton
 import triton.language as tl
 
-from .native_sparse import _merge_topk_attn_out_kernel
+from .native_sparse import _merge_topk_attn_out_kernel as _merge_topk_attn_out_kernel
 
 
 @triton.heuristics(

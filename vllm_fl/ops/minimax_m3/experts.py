@@ -4,6 +4,7 @@
 """M3 differences from the shared FL MoE pipeline; no copied backend selector."""
 
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
 from vllm_fl.dispatch import CachedOp
 from vllm_fl.minimax_m3_config import load
 from vllm_fl.ops.fused_moe.activation import apply_moe_activation

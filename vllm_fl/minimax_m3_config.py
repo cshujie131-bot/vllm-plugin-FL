@@ -3,13 +3,15 @@
 
 """Single, immutable deployment policy. Standard-library only; no framework imports."""
 
+import hashlib
+import json
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping, Any
-import hashlib, json, os
-
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 PROFILE_NAME = "minimax_m3_metax"

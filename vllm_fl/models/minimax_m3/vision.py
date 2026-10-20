@@ -5,6 +5,7 @@
 """Vision deltas: patch projection and bounded frame batches."""
 
 import torch
+
 from vllm.models.minimax_m3.common import vision_tower as native
 
 

@@ -55,11 +55,12 @@ def install():
     if not profile.framework.flagos_msa:
         raise RuntimeError("This profile requires the accepted MSA path")
     validate_upstream()
-    from vllm.models.minimax_m3.nvidia import model as native, mtp
     from vllm.models.minimax_m3.common import indexer, sparse_attention, vision_tower
-    from vllm_fl.ops.minimax_m3 import layers, msa, attention
-    from vllm_fl.ops.minimax_m3.vision import M3VisionAttentionFL
+    from vllm.models.minimax_m3.nvidia import model as native, mtp
+
     from . import model, vision
+    from vllm_fl.ops.minimax_m3 import attention, layers, msa
+    from vllm_fl.ops.minimax_m3.vision import M3VisionAttentionFL
 
     for name in (
         "MiniMAXGemmaRMSNorm",

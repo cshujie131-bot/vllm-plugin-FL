@@ -43,10 +43,10 @@ def initialize():
     from .startup import configure_libraries
 
     configure_libraries()
-    import flag_gems
     import torch
     import triton
     import triton.language
+
     from vllm.platforms import current_platform
 
     assert getattr(current_platform, "vendor_name", None) == "metax"
@@ -78,6 +78,7 @@ def initialize():
     assert get_flagos_blacklist() == list(profile.dispatch["flagos_blacklist"])
     assert get_oot_blacklist() == list(profile.dispatch["oot_blacklist"])
     from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size_no_tle
+
     from vllm_fl.ops.minimax_m3.aten import MiniMaxRegistrar
 
     assert callable(MiniMaxRegistrar) and callable(moe_align_block_size_no_tle)
@@ -117,6 +118,7 @@ def audit_effective(stage, runner=None):
     import flag_gems
     import torch
     import triton
+
     from vllm_fl.dispatch import CachedOp, get_default_manager, get_policy
     from vllm_fl.ops.minimax_m3 import layers, msa, vision
     from vllm_fl.utils import get_flag_gems_whitelist_blacklist, get_oot_blacklist

@@ -44,10 +44,9 @@ def configure_libraries():
 
 
 def register_platform():
-    from vllm_fl import _patch_custom_ops, _patch_transformers_compat
-
     from .compat import ensure_dtype_alias, install_platform_hooks
     from .platform_compat import _patch_torch_accelerator
+    from vllm_fl import _patch_custom_ops, _patch_transformers_compat
 
     load()
     install_import_guard()
@@ -61,6 +60,7 @@ def register_platform():
 
 def register_models():
     from vllm.model_executor.models.registry import ModelRegistry
+
     from vllm_fl import register_quant_linear
 
     install_import_guard()

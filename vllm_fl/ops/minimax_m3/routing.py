@@ -5,6 +5,7 @@
 """Explicit M3 sigmoid-bias router; the native router classes remain unchanged."""
 
 import torch
+
 from vllm_fl.dispatch import CachedOp
 from vllm_fl.ops.fused_moe.router import FusedTopKBiasRouterFL as BaseBiasRouter
 

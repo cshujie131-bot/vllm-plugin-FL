@@ -7,15 +7,17 @@
 import torch
 from torch import nn
 from transformers import PretrainedConfig
+
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.models.minimax_m3.nvidia import model as native
+
 from vllm_fl.minimax_m3_config import load
+from vllm_fl.ops.minimax_m3.expert_layer import FusedMoEFL as FusedMoE
 from vllm_fl.ops.minimax_m3.layers import qknorm_rope_insert as _m3_qkv
 from vllm_fl.ops.minimax_m3.router import M3GateLinear as GateLinear
 from vllm_fl.ops.minimax_m3.routing import FusedTopKBiasRouterFL
-from vllm_fl.ops.minimax_m3.expert_layer import FusedMoEFL as FusedMoE
 
 MiniMaxM3MLP = native.MiniMaxM3MLP
 

@@ -325,21 +325,19 @@ class DependencyTests(unittest.TestCase):
                 self.module.importlib.util,
                 "find_spec",
                 return_value=SimpleNamespace(origin="/unexpected/__init__.py"),
-            ),
+            ),self.assertRaisesRegex(RuntimeError, "shadowed")
         ):
-            with self.assertRaisesRegex(RuntimeError, "shadowed"):
-                self.module.verified_dependencies()
+            self.module.verified_dependencies()
 
     def test_unpinned_install_is_rejected(self):
         for origin in ({}, {"vcs_info": {"commit_id": "wrong"}}):
             dist = SimpleNamespace(
-                version="test", read_text=lambda _: json.dumps(origin)
+                version="test", read_text=lambda _, origin=origin: json.dumps(origin)
             )
             with patch.object(
                 self.module.importlib.metadata, "distribution", return_value=dist
-            ):
-                with self.assertRaisesRegex(RuntimeError, "public commit"):
-                    self.module.verified_dependencies()
+            ), self.assertRaisesRegex(RuntimeError, "public commit"):
+                self.module.verified_dependencies()
 
     def test_clean_local_checkout_retains_commit_identity(self):
         with patch.object(
@@ -357,11 +355,10 @@ class DependencyTests(unittest.TestCase):
             self.module.subprocess,
             "check_output",
             side_effect=["a" * 40, " M src/op.py"],
-        ):
-            with self.assertRaisesRegex(RuntimeError, "not clean"):
-                self.module._installed_source_commit(
-                    {"dir_info": {}, "url": "file:///checkout"}
-                )
+        ), self.assertRaisesRegex(RuntimeError, "not clean"):
+            self.module._installed_source_commit(
+                {"dir_info": {}, "url": "file:///checkout"}
+            )
 
     def test_local_install_content_must_match_checkout(self):
         with tempfile.TemporaryDirectory() as folder:

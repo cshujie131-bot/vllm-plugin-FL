@@ -5,9 +5,7 @@
 
 import torch
 
-from . import attention as _attention
-from . import numerics as _qkv
-from . import numerics as _raw
+from . import attention as _attention, numerics as _qkv, numerics as _raw
 
 _LIB = torch.library.Library("vllm_fl", "FRAGMENT")
 

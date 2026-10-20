@@ -4,10 +4,10 @@
 import json
 
 import torch
+
 from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 
-from . import index_policy
-from . import index_score as kernels
+from . import index_policy, index_score as kernels
 from .native_index import minimax_m3_index_score as original
 
 _TP_OK = None

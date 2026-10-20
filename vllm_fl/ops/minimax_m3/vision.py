@@ -3,9 +3,11 @@
 
 import flag_gems
 import torch
+
 from vllm.model_executor.layers.attention.mm_encoder_attention import (
     MMEncoderAttention as _MMEncoderBase,
 )
+
 from vllm_fl.dispatch import CachedOp
 
 vision_attention_op = CachedOp("m3_vision_attention")

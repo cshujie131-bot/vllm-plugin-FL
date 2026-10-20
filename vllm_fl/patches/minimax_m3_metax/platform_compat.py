@@ -4,6 +4,9 @@
 """Retained MetaX torch.accelerator compatibility."""
 
 
+from contextlib import suppress
+
+
 def _patch_torch_accelerator():
     """Complete the metax (MACA) torch.accelerator API.
 
@@ -41,10 +44,8 @@ def _patch_torch_accelerator():
             except RuntimeError:
                 # mtgpu backend may reject an explicit device before the
                 # allocator is initialized; the no-arg variant is the fallback.
-                try:
+                # Allocator not initialized at all yet; nothing to reset.
+                with suppress(RuntimeError):
                     _cuda_reset()
-                except RuntimeError:
-                    # Allocator not initialized at all yet; nothing to reset.
-                    pass
 
         accel.reset_peak_memory_stats = _safe_reset_peak_memory_stats

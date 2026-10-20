@@ -6,23 +6,18 @@ Kernel bodies are imported unchanged. No tuner/default/compiler state is modifie
 """
 import torch
 import triton
+
 from vllm.models.minimax_m3.common.ops.index_topk import (
     _decode_index_score_kernel,
     _index_block_score_kernel,
-)
-from vllm.models.minimax_m3.common.ops.index_topk import (
     _topk_index_kernel as _decorated_topk,
-)
-from vllm.models.minimax_m3.common.ops.index_topk import (
     _topk_index_merge_kernel,
-)
-from vllm.models.minimax_m3.common.ops.index_topk import (
     _topk_index_partial_kernel as _decorated_partial,
 )
 from vllm.utils.math_utils import round_up
-from vllm_fl.minimax_m3_config import load
 
 from .jit import launch_handle
+from vllm_fl.minimax_m3_config import load
 
 SPARSE_BLOCK_SIZE = 128
 _topk_index_kernel = launch_handle(_decorated_topk)

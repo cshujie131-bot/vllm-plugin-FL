@@ -16,9 +16,9 @@ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
-from vllm_fl.ops.fused_moe.fused_moe_utils import select_unquantized_moe_backend_oot
 
 from .experts import TritonExpertsFL
+from vllm_fl.ops.fused_moe.fused_moe_utils import select_unquantized_moe_backend_oot
 
 
 class UnquantizedFusedMoEMethodFL(UnquantizedFusedMoEMethod):

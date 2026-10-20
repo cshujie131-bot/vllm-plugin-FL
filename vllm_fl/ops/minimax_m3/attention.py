@@ -7,15 +7,15 @@ import os
 import weakref
 
 import torch
-from vllm_fl.minimax_m3_config import load
 
-from . import attention_launch as kernels
-from . import attention_policy as policy
+from . import attention_launch as kernels, attention_policy as policy
 from .base_index import index_score as oldi
-from .base_sparse import sparse_attn as oldp
-from .base_sparse import sparse_decode as oldd
-from .native_index import minimax_m3_index_decode as native_index_decode
-from .native_index import minimax_m3_index_topk as index_topk
+from .base_sparse import sparse_attn as oldp, sparse_decode as oldd
+from .native_index import (
+    minimax_m3_index_decode as native_index_decode,
+    minimax_m3_index_topk as index_topk,
+)
+from vllm_fl.minimax_m3_config import load
 
 _TP_OK = None
 _STATE = None
@@ -45,7 +45,7 @@ def _tp16():
 
 
 def _same_device(q, *xs):
-    return q.is_cuda and all((x.device == q.device for x in xs))
+    return q.is_cuda and all(x.device == q.device for x in xs)
 
 
 def _int_vector(x):
@@ -113,7 +113,7 @@ def _prefill_consumer_ok(index_cache):
             except AttributeError:
                 continue
 
-    ref = _OWNER_MAP.get(ptr) if _OWNER_CONTEXT == id(layers) else None
+    ref = _OWNER_MAP.get(ptr) if id(layers) == _OWNER_CONTEXT else None
     layer = ref() if ref is not None else None
     if layer is None:
         rebuild()
@@ -156,7 +156,7 @@ def index_score(q, kv, bt, cu, lens, prefix, max_query_len, max_seq_len, num_kv_
         and (kv.ndim == 3)
         and (tuple(kv.shape[1:]) == (128, 128))
         and _bt(bt)
-        and all((_int_vector(x) for x in [cu, lens, prefix]))
+        and all(_int_vector(x) for x in [cu, lens, prefix])
         and (cu.numel() == lens.numel() + 1)
         and (lens.numel() == prefix.numel())
         and (bt.shape[0] >= lens.numel())
@@ -273,8 +273,8 @@ def initialize_consumer_contract():
     from vllm_fl.models.minimax_m3.bindings import install
 
     install()
-    from vllm.models.minimax_m3.common import indexer
-    from vllm.models.minimax_m3.common import sparse_attention as caller
+    from vllm.models.minimax_m3.common import indexer, sparse_attention as caller
+
     from vllm_fl.models.minimax_m3.model import MiniMaxM3SparseAttention
 
     wanted = dict(
@@ -285,7 +285,7 @@ def initialize_consumer_contract():
         impl_forward=caller.MiniMaxM3SparseTritonImpl.forward,
         index_impl_cls=indexer.MiniMaxM3IndexerTritonImpl,
     )
-    if _STATE is not None and _STATE != wanted:
+    if _STATE is not None and wanted != _STATE:
         raise RuntimeError("Attention consumer changed after initialization")
     assert caller.minimax_m3_sparse_attn is sparse_attn
     _STATE = wanted

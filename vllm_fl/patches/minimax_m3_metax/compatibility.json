@@ -71,7 +71,7 @@
     "name": "pynccl_wrapper",
     "reason": "MCCL API/ABI bridge and accepted in-place torch.distributed all_reduce",
     "relative_source": "dispatch/backends/vendor/metax/patches/pynccl_vllm024.py",
-    "sha256": "a7804fe687d5480319e0996c9b9f2b27edb37a59e6b9254df1b1b1600e25ecad",
+    "sha256": "0df9f5b6c133c5c36dcf9090854859a206ac38c2b262dca6112bc8b98ff395e6",
     "targets": [
       {
         "module": "vllm.distributed.device_communicators.pynccl",
@@ -171,7 +171,7 @@
     "name": "vllm024_compat",
     "reason": "Pointer dtype, sampling penalties and sampling UVA compatibility; unrelated pooling hook removed",
     "relative_source": "dispatch/backends/vendor/metax/patches/vllm024_compat.py",
-    "sha256": "7cde1764bfaf894aa79d4ab7fa6195195df17d4ac6b11ea7d22c76b3eeb1b32b",
+    "sha256": "8aa3f59db45e5906a06f9e236ebe3e07b7fb43c13898c16cf38bb17b204c8418",
     "targets": [
       {
         "module": "vllm.v1.worker.gpu.buffer_utils",

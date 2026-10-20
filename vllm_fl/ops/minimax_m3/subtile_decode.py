@@ -2,11 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """TP16 decode subtile computation and launch; native merge is reused."""
 import torch
-import triton
-from vllm_fl.minimax_m3_config import load
 
 from .long_decode import _gqa_sparse_decode_kernel
 from .native_sparse import _FP8_DTYPES, _merge_topk_attn_out_kernel
+from vllm_fl.minimax_m3_config import load
 
 SPARSE_BLOCK_SIZE = 128
 LAST_KERNELS = []

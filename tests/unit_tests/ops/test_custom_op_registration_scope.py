@@ -11,9 +11,10 @@ import pytest
 @pytest.mark.parametrize("install_hooks", [None, False, True])
 def test_explicit_moe_hook_scope(monkeypatch, enabled, install_hooks):
     import vllm.platforms
+
+    import vllm_fl.dispatch.config.utils as config_utils
     import vllm_fl.ops.custom_ops as ops
     import vllm_fl.utils as utils
-    import vllm_fl.dispatch.config.utils as config_utils
 
     oracle, factory = Mock(), Mock()
     monkeypatch.setattr(ops, "_patch_unquantized_moe_oracle", oracle)

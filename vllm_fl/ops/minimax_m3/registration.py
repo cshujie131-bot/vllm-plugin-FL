@@ -3,9 +3,8 @@
 
 """FL operator registrations. Computation sources are explicit and independently importable."""
 
-from vllm_fl.dispatch import BackendImplKind, OpImpl
-
 from . import torch_ops
+from vllm_fl.dispatch import BackendImplKind, OpImpl
 
 NAMES = (
     "gemma",

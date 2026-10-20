@@ -81,4 +81,12 @@ implementation bitwise, including graph replay, with timing controls around
 Library PR evidence is separate: complete-call eager/Graph timings on C550 with
 fixed dtype/compiler/input, correctness before timing, seven alternating paired
 rounds and explicit fallback controls. Model accuracy/performance tables in the
-README are retained measurements. The installed-entry TP16 smoke is pending.
+README are retained measurements. The installed-entry TP16 smoke passed 12/12 fixed-answer cases, including 64K
+mixed requests and an image. All 16 ranks passed capture/binding audits; there
+were no runtime errors or illegal accesses. This is a functional regression, not
+a new full quality evaluation or throughput benchmark.
+
+The shared worker exposes an opt-out for generic global MoE factory/oracle
+hooks. MiniMax supplies local factory classes; other models retain the default.
+Numerical-mode overlap checks allow disjoint workspace byte spans while rejecting
+real overlap. Both boundaries have dedicated regressions.

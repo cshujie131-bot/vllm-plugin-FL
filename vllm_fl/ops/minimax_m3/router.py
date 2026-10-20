@@ -5,7 +5,9 @@
 
 import torch
 from flaggems_vllm.ops.fp32_router_gemm import fp32_router_gemm
+
 from vllm.model_executor.layers.fused_moe import GateLinear
+
 from vllm_fl.minimax_m3_config import load, thaw
 
 

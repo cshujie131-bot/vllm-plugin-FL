@@ -3,12 +3,13 @@
 
 """vLLM 0.24 abort API on the existing FL MCCL wrapper."""
 
+from vllm.distributed.device_communicators import pynccl, pynccl_wrapper
+
 from vllm_fl.dispatch.backends.vendor.metax.patches.pynccl_wrapper import (
     MCCLLibrary as _MCCLLibrary,
-    ncclResult_t,
     ncclComm_t,
+    ncclResult_t,
 )
-from vllm.distributed.device_communicators import pynccl, pynccl_wrapper
 
 
 class MCCLLibrary(_MCCLLibrary):
