@@ -180,7 +180,7 @@ docstring-code-format = true
 
 [tool.typos.files]
 # these files may be written in non english words
-extend-exclude = ["tests/**", "vllm_fl/**", "examples/minimax_m3_metax/dependencies/**/*.patch"]
+extend-exclude = ["tests/**", "vllm_fl/**"]
 ignore-hidden = true
 ignore-files = true
 ignore-dot = true
