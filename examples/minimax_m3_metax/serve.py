@@ -7,11 +7,13 @@ import argparse
 import fcntl
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import os
 import shlex
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -88,19 +90,62 @@ def build_environment(profile, config_path, state, compiler_root, tuning_path):
     return env
 
 
+def _installed_source_commit(origin):
+    commit = origin.get("vcs_info", {}).get("commit_id")
+    if commit:
+        return commit
+    # pip records a directory URL for ordinary installs from a local checkout.
+    # Keep that checkout available so an offline deployment remains auditable.
+    url = urllib.parse.urlsplit(origin.get("url", ""))
+    if "dir_info" not in origin or url.scheme != "file" or url.netloc:
+        return None
+    checkout = Path(urllib.parse.unquote(url.path))
+    try:
+        commit = subprocess.check_output(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        dirty = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "status",
+                "--porcelain",
+                "--untracked-files=normal",
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    if dirty:
+        raise RuntimeError(f"Dependency checkout is not clean: {checkout}")
+    return commit
+
+
 def verified_dependencies():
-    """Verify normal VCS installs against the public dependency commits."""
+    """Verify installed commits and reject a shadowing source tree."""
     lock = json.loads((HERE / "dependency-lock.json").read_text())
     installed = {}
     for module, spec in lock.items():
         dist = importlib.metadata.distribution(spec["distribution"])
         origin = json.loads(dist.read_text("direct_url.json") or "{}")
-        commit = origin.get("vcs_info", {}).get("commit_id")
+        commit = _installed_source_commit(origin)
         if commit != spec["commit"]:
             raise RuntimeError(
                 f"{module} must be installed from public commit {spec['commit']}; "
                 "see requirements.txt"
             )
+        module_spec = importlib.util.find_spec(module)
+        expected_root = Path(dist.locate_file(module)).resolve()
+        if (
+            module_spec is None
+            or module_spec.origin is None
+            or Path(module_spec.origin).resolve().parent != expected_root
+        ):
+            raise RuntimeError(f"{module} is shadowed by another source tree")
         installed[module] = {"commit": commit, "version": dist.version}
     return installed
 

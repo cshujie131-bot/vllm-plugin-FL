@@ -57,7 +57,9 @@ contains explicit numerical modes and [FGV #962](https://github.com/flagos-ai/Fl
 contains independent cache selection. They are not merged yet.
 
 No source patch, snapshot or patch installer is required. The launcher checks the
-installed VCS commit recorded by pip. It selects FlagTree explicitly, and starts
+installed VCS commit recorded by pip, or the commit and clean state of a retained
+local Git checkout for offline installs. It rejects a different source tree
+shadowing the installed package. It selects FlagTree explicitly, and starts
 Python with `-P` so the working directory cannot accidentally shadow installed
 packages. Build requirements for the public vLLM source include setuptools-rust
 and semantic-version; install them in the isolated build environment without

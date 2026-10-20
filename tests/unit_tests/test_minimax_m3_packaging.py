@@ -288,23 +288,47 @@ class VisionDispatchTests(unittest.TestCase):
 class DependencyTests(unittest.TestCase):
     def setUp(self):
         self.module = load_file(EXAMPLE / "serve.py", "_m3_dependency_test")
+        lock = json.loads((EXAMPLE / "dependency-lock.json").read_text())
+        self.by_name = {value["distribution"]: value for value in lock.values()}
+
+    def distribution(self, name):
+        return SimpleNamespace(
+            version="test",
+            locate_file=lambda module: Path("/test/site") / module,
+            read_text=lambda _: json.dumps(
+                {"vcs_info": {"commit_id": self.by_name[name]["commit"]}}
+            ),
+        )
 
     def test_public_vcs_commits_are_required(self):
-        lock = json.loads((EXAMPLE / "dependency-lock.json").read_text())
-        by_name = {value["distribution"]: value for value in lock.values()}
-
-        def distribution(name):
-            spec = by_name[name]
-            return SimpleNamespace(
-                version="test",
-                read_text=lambda _: json.dumps(
-                    {"vcs_info": {"commit_id": spec["commit"]}}
+        with (
+            patch.object(
+                self.module.importlib.metadata, "distribution", self.distribution
+            ),
+            patch.object(
+                self.module.importlib.util,
+                "find_spec",
+                side_effect=lambda module: SimpleNamespace(
+                    origin=str(Path("/test/site") / module / "__init__.py")
                 ),
-            )
-
-        with patch.object(self.module.importlib.metadata, "distribution", distribution):
+            ),
+        ):
             actual = self.module.verified_dependencies()
-        self.assertEqual(set(actual), set(lock))
+        self.assertEqual(set(actual), {"flag_gems", "flaggems_vllm"})
+
+    def test_shadowing_is_rejected_even_with_matching_commit(self):
+        with (
+            patch.object(
+                self.module.importlib.metadata, "distribution", self.distribution
+            ),
+            patch.object(
+                self.module.importlib.util,
+                "find_spec",
+                return_value=SimpleNamespace(origin="/unexpected/__init__.py"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "shadowed"):
+                self.module.verified_dependencies()
 
     def test_unpinned_install_is_rejected(self):
         for origin in ({}, {"vcs_info": {"commit_id": "wrong"}}):
@@ -316,6 +340,28 @@ class DependencyTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(RuntimeError, "public commit"):
                     self.module.verified_dependencies()
+
+    def test_clean_local_checkout_retains_commit_identity(self):
+        with patch.object(
+            self.module.subprocess, "check_output", side_effect=["a" * 40, ""]
+        ):
+            self.assertEqual(
+                self.module._installed_source_commit(
+                    {"dir_info": {}, "url": "file:///checkout"}
+                ),
+                "a" * 40,
+            )
+
+    def test_dirty_local_checkout_is_rejected(self):
+        with patch.object(
+            self.module.subprocess,
+            "check_output",
+            side_effect=["a" * 40, " M src/op.py"],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "not clean"):
+                self.module._installed_source_commit(
+                    {"dir_info": {}, "url": "file:///checkout"}
+                )
 
     def test_examples_do_not_ship_source_installers_or_patches(self):
         self.assertFalse((EXAMPLE / "prepare_dependencies.py").exists())
