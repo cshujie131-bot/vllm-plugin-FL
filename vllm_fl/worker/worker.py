@@ -522,8 +522,6 @@ class WorkerFL(WorkerBase):
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
 
-        from vllm_fl.worker.model_runner import ModelRunnerFL
-
         # Construct the model runner
         self.model_runner = self.model_runner_type()(self.vllm_config, self.device)
 
