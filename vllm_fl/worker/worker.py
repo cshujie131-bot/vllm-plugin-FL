@@ -257,7 +257,7 @@ class WorkerFL(WorkerBase):
         patch_mm_encoder_attention()
         patch_oot_apply_rotary_emb()
 
-        register_oot_ops()
+        register_oot_ops(**self.oot_registration_kwargs())
 
         if fl_envs.USE_FLAGGEMS:
             import flag_gems
@@ -350,6 +350,9 @@ class WorkerFL(WorkerBase):
     #     else:
     #         context = nullcontext()
     #     return context
+
+    def oot_registration_kwargs(self):
+        return {}
 
     def flaggems_registration_kwargs(self):
         return {}

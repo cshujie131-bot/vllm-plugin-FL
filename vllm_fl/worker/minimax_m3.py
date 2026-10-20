@@ -25,6 +25,10 @@ class MiniMaxModelRunnerFL(ModelRunnerFL):
 
 
 class MiniMaxWorkerFL(WorkerFL):
+    def oot_registration_kwargs(self):
+        # The M3 model supplies its router and local RoutedExperts factory.
+        return {"install_moe_hooks": False}
+
     def flaggems_registration_kwargs(self):
         from vllm_fl.ops.minimax_m3.aten import MiniMaxRegistrar
 
