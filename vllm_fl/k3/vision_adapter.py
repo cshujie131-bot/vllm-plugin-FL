@@ -4,6 +4,7 @@
 """Bounded K3 vision execution through native component factories."""
 
 import torch
+
 from vllm.model_executor.models.kimi_k25_vit import (
     MLP2,
     MoonViT3dEncoder,
@@ -109,21 +110,15 @@ class K3VisionRope(Rope2DPosEmbRepeated):
 
 
 class K3VisionMLP(MLP2):
-    def _forward_block(self, x: torch.Tensor) -> torch.Tensor:
-        x, _ = self.fc0(x)
-        x = self.activation(x)
-        x, _ = self.fc1(x)
-        return x
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.use_data_parallel or x.ndim != 2 or x.shape[0] < 16384:
-            return self._forward_block(x)
+            return super().forward(x)
         output = torch.empty(
             (x.shape[0], self.fc1.output_size), dtype=x.dtype, device=x.device
         )
         for start in range(0, x.shape[0], 8192):
             stop = min(start + 8192, x.shape[0])
-            block = self._forward_block(x[start:stop])
+            block = super().forward(x[start:stop])
             output[start:stop].copy_(block)
             del block
         return output

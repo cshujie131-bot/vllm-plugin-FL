@@ -38,7 +38,7 @@ source patch, source snapshot or patch installer is required at installation.
 
 | Package | Pinned source | Review |
 | --- | --- | --- |
-| vLLM | [cc1c8274](https://github.com/cshujie131-bot/vllm/commit/cc1c8274e47fd9148cc49a8d9e0c02fb037b09f8) | Default-preserving component/runner interfaces; explicit non-CUDA CUSTOM MLA validation; nine Python files, no scheduler algorithm change |
+| vLLM | [c88c603e](https://github.com/cshujie131-bot/vllm/commit/c88c603e1f3d3bde7ad18bd7299cb3d502f7b7a7) | Default-preserving component/runner interfaces; explicit non-CUDA CUSTOM MLA validation; twelve Python files, no scheduler algorithm change |
 | FlagGems | [6efd6dab](https://github.com/cshujie131-bot/FlagGems/commit/6efd6dab4a4a8a78167262d0841ff0d728a2d1d3) | [Argmax #7300](https://github.com/flagos-ai/FlagGems/pull/7300); [addmm compatibility Draft #7302](https://github.com/flagos-ai/FlagGems/pull/7302) |
 | FlagGems-vllm | [1d4b69b3](https://github.com/cshujie131-bot/FlagGems-vllm/commit/1d4b69b355a8a42deb0edd485ef9d9a94b2477b8) | [TopK #950](https://github.com/flagos-ai/FlagGems-vllm/pull/950), [SiTU #951](https://github.com/flagos-ai/FlagGems-vllm/pull/951), [alignment #952](https://github.com/flagos-ai/FlagGems-vllm/pull/952), [MLA interface #953](https://github.com/flagos-ai/FlagGems-vllm/pull/953) |
 
