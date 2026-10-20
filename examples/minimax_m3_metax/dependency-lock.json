@@ -12,7 +12,7 @@
   "flaggems_vllm": {
     "distribution": "flaggems-vllm",
     "repository": "https://github.com/cshujie131-bot/FlagGems-vllm",
-    "commit": "d00fb7a94936774e69093e32e663a4bd76ed9997",
+    "commit": "ff12e0bfa9e124827739ae2e4ce7d7592c7e65b1",
     "base_commit": "b5c2c2249319277ccda4d41aa0f65164bd9b2a19",
     "source_prs": [
       "https://github.com/flagos-ai/FlagGems-vllm/pull/960",

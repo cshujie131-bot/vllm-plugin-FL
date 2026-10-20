@@ -363,6 +363,27 @@ class DependencyTests(unittest.TestCase):
                     {"dir_info": {}, "url": "file:///checkout"}
                 )
 
+    def test_local_install_content_must_match_checkout(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "checkout/src/flag_gems/operator.py"
+            installed = root / "site/flag_gems/operator.py"
+            source.parent.mkdir(parents=True)
+            installed.parent.mkdir(parents=True)
+            source.write_text("value = 1\n")
+            installed.write_text(source.read_text())
+            dist = SimpleNamespace(locate_file=lambda path: root / "site" / path)
+            origin = {"dir_info": {}, "url": (root / "checkout").as_uri()}
+            with patch.object(
+                self.module.subprocess,
+                "check_output",
+                return_value="src/flag_gems/operator.py\0",
+            ):
+                self.module._verify_checkout_install("flag_gems", dist, origin)
+                installed.write_text("value = 0\n")
+                with self.assertRaisesRegex(RuntimeError, "differs"):
+                    self.module._verify_checkout_install("flag_gems", dist, origin)
+
     def test_examples_do_not_ship_source_installers_or_patches(self):
         self.assertFalse((EXAMPLE / "prepare_dependencies.py").exists())
         self.assertFalse(list(EXAMPLE.rglob("*.patch")))

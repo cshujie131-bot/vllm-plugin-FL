@@ -125,6 +125,31 @@ def _installed_source_commit(origin):
     return commit
 
 
+def _verify_checkout_install(module, dist, origin):
+    if "dir_info" not in origin:
+        return
+    checkout = Path(urllib.parse.unquote(urllib.parse.urlsplit(origin["url"]).path))
+    names = subprocess.check_output(
+        ["git", "-C", str(checkout), "ls-files", "-z", "--", "src/" + module, module],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    ).split("\0")
+    checked = 0
+    for name in names:
+        if not name or Path(name).suffix not in {".py", ".json", ".yaml", ".yml"}:
+            continue
+        source = checkout / name
+        relative = name.removeprefix("src/")
+        installed = Path(dist.locate_file(relative))
+        if not installed.is_file() or source.read_bytes() != installed.read_bytes():
+            raise RuntimeError(
+                f"{module} installation differs from its checkout: {relative}"
+            )
+        checked += 1
+    if not checked:
+        raise RuntimeError(f"No tracked package sources found for {module}")
+
+
 def verified_dependencies():
     """Verify installed commits and reject a shadowing source tree."""
     lock = json.loads((HERE / "dependency-lock.json").read_text())
@@ -138,6 +163,7 @@ def verified_dependencies():
                 f"{module} must be installed from public commit {spec['commit']}; "
                 "see requirements.txt"
             )
+        _verify_checkout_install(module, dist, origin)
         module_spec = importlib.util.find_spec(module)
         expected_root = Path(dist.locate_file(module)).resolve()
         if (

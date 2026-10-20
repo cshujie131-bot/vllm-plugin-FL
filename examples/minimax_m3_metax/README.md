@@ -20,7 +20,7 @@ original BF16 checkpoint. The serving configuration uses 32 CPU cores per node.
 | vLLM | 0.24.0, public commit ee0da84ab9e04ac7610e28580af62c365e898389 |
 | FL branch | main, with this PR |
 | FlagGems | validated a7620cc1 base + [c7a255b6 integration](https://github.com/cshujie131-bot/FlagGems/commit/c7a255b6bb24d3e5b3c1d40aa392e590d84c29d6) |
-| FlagGems-vllm | validated b5c2c224 base + [d00fb7a9 integration](https://github.com/cshujie131-bot/FlagGems-vllm/commit/d00fb7a94936774e69093e32e663a4bd76ed9997) |
+| FlagGems-vllm | validated b5c2c224 base + [ff12e0bf integration](https://github.com/cshujie131-bot/FlagGems-vllm/commit/ff12e0bfa9e124827739ae2e4ce7d7592c7e65b1) |
 | Vendor FlashAttention | 2.6.3+metax3.8.1.0torch2.10 |
 
 The FlagGems-vllm release reports 0.1.0 in package metadata; the public commit is
