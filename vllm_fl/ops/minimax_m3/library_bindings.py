@@ -3,10 +3,8 @@
 
 """M3 library bindings; source package and numerical preparation are explicit."""
 
-import torch
-import triton
 import flag_gems
-from vllm.utils.math_utils import round_up
+import torch
 
 
 def moe_align_block_size(
@@ -17,45 +15,49 @@ def moe_align_block_size(
     pad_sorted_ids: bool = False,
     ignore_invalid_experts: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from flag_gems.fused.moe_align_block_size import moe_align_block_size_triton
+    from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size_no_tle
 
-    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
-    if pad_sorted_ids:
-        max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
-    if topk_ids.numel() < num_experts:
-        max_num_tokens_padded = min(
-            topk_ids.numel() * block_size, max_num_tokens_padded
-        )
-    sorted_ids = torch.empty(
-        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
+    return moe_align_block_size_no_tle(
+        topk_ids, block_size, num_experts, expert_map, pad_sorted_ids
     )
-    max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
-    expert_ids = torch.empty(
-        (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
-    )
-    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
-    moe_align_block_size_triton(
-        topk_ids,
-        num_experts,
-        block_size,
-        sorted_ids,
-        expert_ids,
-        num_tokens_post_pad,
-        allow_tle=False,
-    )
-    if expert_map is not None:
-        expert_ids = expert_map[expert_ids]
-
-    return sorted_ids, expert_ids, num_tokens_post_pad
 
 
 def invoke_fused_moe_triton_kernel(*args, **kwargs):
-    return flag_gems.invoke_fused_moe_triton_kernel(*args, **kwargs)
+    from flaggems_vllm.ops.fused_moe import invoke_fused_moe_triton_kernel as invoke
+
+    return invoke(*args, **kwargs)
 
 
 def moe_sum(inp, out):
-    return flag_gems.moe_sum(inp, out)
+    from flaggems_vllm.ops.moe_sum import moe_sum as ordered_sum
+
+    return ordered_sum(inp, out, reduction="sequential")
 
 
-def grouped_topk(*args, **kwargs):
-    return flag_gems.grouped_topk(*args, **kwargs)
+def grouped_topk(
+    scores,
+    n_group,
+    topk_group,
+    topk,
+    renormalize,
+    routed_scaling_factor,
+    bias,
+    scoring_func=0,
+):
+    from flaggems_vllm.ops.grouped_topk import grouped_topk as select
+
+    if scoring_func not in (0, 1):
+        raise ValueError("Expected identity or sigmoid scoring")
+    # Preserve the accepted materialized sigmoid and dtype before expert selection.
+    if scoring_func == 1:
+        scores = flag_gems.sigmoid(scores.float()).to(scores.dtype)
+    return select(
+        scores,
+        n_group,
+        topk_group,
+        topk,
+        renormalize,
+        routed_scaling_factor,
+        bias,
+        scoring_func=0,
+    )

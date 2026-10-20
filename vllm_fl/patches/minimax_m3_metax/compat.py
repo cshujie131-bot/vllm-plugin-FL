@@ -7,8 +7,16 @@ This module manages real runtime patches. It does not claim the deployment is
 patch-free. Static M3 operators, model routing and shape policies do not use it.
 """
 
+import hashlib
+import importlib
+import importlib.metadata
+import importlib.util
+import inspect
+import json
+import os
+import sys
 from pathlib import Path
-import hashlib, importlib, importlib.metadata, importlib.util, inspect, json, os, sys
+
 from vllm_fl.minimax_m3_config import ROOT
 
 _APPLIED = {}
@@ -156,9 +164,9 @@ def install_metax_hooks():
                     raise RuntimeError("Unexpected target signature: " + key)
             importlib.import_module(spec["import_module"])
             after = {
-                t["module"] + ":" + t["attribute"]: identity(target(t))
-                if target(t) is not None
-                else None
+                t["module"]
+                + ":"
+                + t["attribute"]: identity(target(t)) if target(t) is not None else None
                 for t in spec["targets"]
             }
             _APPLIED[name] = {

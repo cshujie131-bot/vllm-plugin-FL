@@ -4,9 +4,9 @@
 """M3-local gate subclass. Original GateLinear and other models remain untouched."""
 
 import torch
-from vllm_fl.minimax_m3_config import load, thaw
-from flaggems_vllm.ops.minimax_m3.router import fused_kernel
+from flaggems_vllm.ops.fp32_router_gemm import fp32_router_gemm
 from vllm.model_executor.layers.fused_moe import GateLinear
+from vllm_fl.minimax_m3_config import load, thaw
 
 
 def router_bf16_load_fp32_dot(hidden, weight):
@@ -15,12 +15,14 @@ def router_bf16_load_fp32_dot(hidden, weight):
     assert weight.shape == (n, k) and weight.dtype == torch.float32
     assert hidden.is_cuda and weight.device == hidden.device
     assert hidden.is_contiguous() and weight.is_contiguous()
-    out = torch.empty((m, n), device=hidden.device, dtype=torch.float32)
-    config = thaw(load().linear["router_config"])
-    fused_kernel[(m // config["BLOCK_SIZE_M"], n // config["BLOCK_SIZE_N"])](
-        hidden, weight, weight, out, m, n, k, k, 1, k, 1, n, 1, 0, BIAS=False, **config
-    )
-    return out
+    assert thaw(load().linear["router_config"]) == {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 32,
+        "num_warps": 4,
+        "num_stages": 4,
+    }
+    return fp32_router_gemm(hidden, weight)
 
 
 @torch.library.custom_op("vllm_fl::m3_router_bf16_fp32", mutates_args=())

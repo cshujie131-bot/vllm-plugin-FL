@@ -262,6 +262,8 @@ class WorkerFL(WorkerBase):
         if fl_envs.USE_FLAGGEMS:
             import flag_gems
 
+            registration_kwargs = self.flaggems_registration_kwargs()
+
             # Get whitelist and blacklist from environment variables
             whitelist, blacklist = get_flag_gems_whitelist_blacklist()
 
@@ -277,6 +279,7 @@ class WorkerFL(WorkerBase):
                     record=should_record,
                     once=True,
                     path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
+                    **registration_kwargs,
                 )
             elif blacklist:
                 logger.info(f"[FlagGems] Disable the following ops: {blacklist}")
@@ -285,11 +288,13 @@ class WorkerFL(WorkerBase):
                     record=should_record,
                     once=True,
                     path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
+                    **registration_kwargs,
                 )
             else:
                 logger.info("[FlagGems] Enable all ops")
                 flag_gems.enable(
-                    record=should_record, once=True, path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH
+                    record=should_record, once=True, path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
+                    **registration_kwargs,
                 )
 
     # def sleep(self, level: int = 1) -> None:
@@ -345,6 +350,9 @@ class WorkerFL(WorkerBase):
     #     else:
     #         context = nullcontext()
     #     return context
+
+    def flaggems_registration_kwargs(self):
+        return {}
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks

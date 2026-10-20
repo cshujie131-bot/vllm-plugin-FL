@@ -3,9 +3,16 @@
 
 """Ordered initialization and effective-policy assertions for the sealed M3 deployment."""
 
-import importlib, importlib.metadata, inspect, json, os, sys, hashlib
-from pathlib import Path
+import hashlib
+import importlib
+import importlib.metadata
+import inspect
+import json
+import os
+import sys
 from dataclasses import asdict
+from pathlib import Path
+
 from vllm_fl.minimax_m3_config import load, thaw
 
 _INITIALIZED = False
@@ -20,9 +27,11 @@ def _identity(fn):
         module=getattr(fn, "__module__", None),
         qualname=getattr(fn, "__qualname__", type(fn).__qualname__),
         source=p,
-        sha256=hashlib.sha256(Path(p).read_bytes()).hexdigest()
-        if p and Path(p).is_file()
-        else None,
+        sha256=(
+            hashlib.sha256(Path(p).read_bytes()).hexdigest()
+            if p and Path(p).is_file()
+            else None
+        ),
     )
 
 
@@ -34,10 +43,10 @@ def initialize():
     from .startup import configure_libraries
 
     configure_libraries()
+    import flag_gems
     import torch
     import triton
     import triton.language
-    import flag_gems
     from vllm.platforms import current_platform
 
     assert getattr(current_platform, "vendor_name", None) == "metax"
@@ -51,12 +60,12 @@ def initialize():
         .is_relative_to(Path(os.environ["FLAGTREE_ROOT"]).resolve())
     )
     # Correctness-sensitive registration must be fixed before WorkerFL enables ATen.
+    from vllm_fl.dispatch.config import get_effective_config, get_flagos_blacklist
     from vllm_fl.utils import (
         get_flag_gems_whitelist_blacklist,
         get_oot_blacklist,
         is_oot_enabled,
     )
-    from vllm_fl.dispatch.config import get_effective_config, get_flagos_blacklist
 
     assert is_oot_enabled() is True
     assert {k: get_effective_config()[k] for k in profile.dispatch} == thaw(
@@ -68,18 +77,10 @@ def initialize():
     )
     assert get_flagos_blacklist() == list(profile.dispatch["flagos_blacklist"])
     assert get_oot_blacklist() == list(profile.dispatch["oot_blacklist"])
-    generic = importlib.import_module("flag_gems.ops.masked_fill").masked_fill_
-    assert flag_gems.masked_fill_ is generic
-    selected = {
-        row[0]: row[1]
-        for row in flag_gems._FULL_CONFIG
-        if row[0] in {"masked_fill_.Scalar", "masked_fill_.Tensor"}
-    }
-    assert len(selected) == 2 and all(fn is generic for fn in selected.values())
-    align = importlib.import_module("flag_gems.fused.moe_align_block_size")
-    assert (
-        "allow_tle" in inspect.signature(align.moe_align_block_size_triton).parameters
-    )
+    from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size_no_tle
+    from vllm_fl.ops.minimax_m3.aten import MiniMaxRegistrar
+
+    assert callable(MiniMaxRegistrar) and callable(moe_align_block_size_no_tle)
     assert profile.kernels.moe_alignment_tle is False
     from vllm_fl.ops.minimax_m3.attention import initialize_consumer_contract
 
@@ -113,10 +114,12 @@ def initialize():
 
 
 def audit_effective(stage, runner=None):
-    import torch, triton, flag_gems
+    import flag_gems
+    import torch
+    import triton
     from vllm_fl.dispatch import CachedOp, get_default_manager, get_policy
-    from vllm_fl.utils import get_flag_gems_whitelist_blacklist, get_oot_blacklist
     from vllm_fl.ops.minimax_m3 import layers, msa, vision
+    from vllm_fl.utils import get_flag_gems_whitelist_blacklist, get_oot_blacklist
 
     mgr = get_default_manager()
     mgr.ensure_initialized()
@@ -145,7 +148,25 @@ def audit_effective(stage, runner=None):
             "kind": str(impl.kind),
             "function": _identity(impl.fn),
         }
+    registrar = getattr(flag_gems, "current_work_registrar", None)
+    aten_bindings = {}
+    if registrar is not None and hasattr(registrar, "selected_functions"):
+        aten_bindings = {
+            key: _identity(fn)
+            for key, fn in registrar.selected_functions.items()
+            if key in {"linear", "masked_fill_.Scalar", "masked_fill_.Tensor"}
+        }
     if stage == "after_capture":
+        from vllm_fl.ops.minimax_m3.aten import MiniMaxRegistrar
+        from vllm_fl.ops.minimax_m3.linear import linear
+
+        generic = importlib.import_module("flag_gems.ops.masked_fill").masked_fill_
+        assert isinstance(registrar, MiniMaxRegistrar)
+        assert registrar.selected_functions["linear"] is linear
+        assert all(
+            registrar.selected_functions[key] is generic
+            for key in ("masked_fill_.Scalar", "masked_fill_.Tensor")
+        )
         registered = set(flag_gems.aten_lib._op_impls)
         assert {
             "aten/masked_fill_.Scalar/CUDA",
@@ -186,6 +207,7 @@ def audit_effective(stage, runner=None):
         whitelist_blacklist=get_flag_gems_whitelist_blacklist(),
         oot_blacklist=get_oot_blacklist(),
         bindings=bindings,
+        aten_bindings=aten_bindings,
         policy=str(get_policy()),
         triton_module=triton.__file__,
         native_router_unchanged=True,

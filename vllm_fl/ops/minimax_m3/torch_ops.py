@@ -4,9 +4,10 @@
 """M3 custom operators exposed as torch.ops.vllm_fl, with honest mutation schemas."""
 
 import torch
-from flaggems_vllm.ops.minimax_m3 import norm_activation as _raw
+
 from . import attention as _attention
-from flaggems_vllm.ops.minimax_m3 import qkv as _qkv
+from . import numerics as _qkv
+from . import numerics as _raw
 
 _LIB = torch.library.Library("vllm_fl", "FRAGMENT")
 

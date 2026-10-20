@@ -4,8 +4,9 @@
 """M3 execution boundary and audit, scoped to this worker/runner pair."""
 
 import torch
-from .worker import WorkerFL
+
 from .model_runner import ModelRunnerFL
+from .worker import WorkerFL
 
 
 class MiniMaxModelRunnerFL(ModelRunnerFL):
@@ -24,6 +25,11 @@ class MiniMaxModelRunnerFL(ModelRunnerFL):
 
 
 class MiniMaxWorkerFL(WorkerFL):
+    def flaggems_registration_kwargs(self):
+        from vllm_fl.ops.minimax_m3.aten import MiniMaxRegistrar
+
+        return {"registrar": MiniMaxRegistrar}
+
     def determine_available_memory(self):
         result = super().determine_available_memory()
         from vllm_fl.patches.minimax_m3_metax.bootstrap import audit_memory_budget

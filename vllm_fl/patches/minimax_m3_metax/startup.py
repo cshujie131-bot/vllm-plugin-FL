@@ -3,7 +3,6 @@
 
 """Ordered opt-in startup through installed FL and operator packages."""
 
-from dataclasses import asdict
 import importlib.abc
 import os
 import sys
@@ -37,17 +36,16 @@ def configure_libraries():
     global _LIBRARIES_CONFIGURED
     if _LIBRARIES_CONFIGURED:
         return
-    from flag_gems.runtime.linear_launch import configure as configure_linear
-    from flaggems_vllm.ops.minimax_m3 import configure as configure_kernels
+    from vllm_fl.ops.minimax_m3.linear import configure as configure_linear
 
     profile = load()
     configure_linear(thaw(profile.linear))
-    configure_kernels(asdict(profile.kernels), thaw(profile.attention))
     _LIBRARIES_CONFIGURED = True
 
 
 def register_platform():
     from vllm_fl import _patch_custom_ops, _patch_transformers_compat
+
     from .compat import ensure_dtype_alias, install_platform_hooks
     from .platform_compat import _patch_torch_accelerator
 

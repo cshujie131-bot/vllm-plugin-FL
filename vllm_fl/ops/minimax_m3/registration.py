@@ -3,8 +3,9 @@
 
 """FL operator registrations. Computation sources are explicit and independently importable."""
 
+from vllm_fl.dispatch import BackendImplKind, OpImpl
+
 from . import torch_ops
-from vllm_fl.dispatch import OpImpl, BackendImplKind
 
 NAMES = (
     "gemma",
@@ -28,7 +29,18 @@ def vllm_fl_register(registry):
                 impl_id=(
                     "m3.flag_gems."
                     if name in {"patch_embed", "vision_attention"}
-                    else "m3.flaggems_vllm."
+                    else (
+                        "m3.fl."
+                        if name
+                        in {
+                            "index_score",
+                            "index_topk",
+                            "index_decode",
+                            "sparse_attn",
+                            "sparse_decode",
+                        }
+                        else "m3.flaggems_vllm."
+                    )
                 )
                 + name,
                 kind=BackendImplKind.DEFAULT,
@@ -48,7 +60,7 @@ def vllm_fl_register(registry):
         registry.register_impl(
             OpImpl(
                 op_name="m3_" + name,
-                impl_id="m3.flag_gems." + name,
+                impl_id="m3.flaggems_vllm." + name,
                 kind=BackendImplKind.DEFAULT,
                 fn=getattr(library_bindings, name),
                 priority=150,

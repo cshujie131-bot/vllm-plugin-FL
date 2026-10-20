@@ -1,8 +1,8 @@
 # MiniMax M3 BF16 on MetaX C550
 
 This example enables the MiniMax M3 optimizations in the installed FL package.
-Model/TP orchestration lives in FL; operator changes are readable patches against
-pinned public FlagGems and FlagGems-vllm sources. Other model profiles keep the
+Model/TP orchestration lives in FL; pure operator changes are normal source PRs
+in FlagGems and FlagGems-vllm, pinned here by public integration commits. Other model profiles keep the
 normal FL entry points and dispatch policy.
 
 ## Environment
@@ -19,8 +19,8 @@ original BF16 checkpoint. The serving configuration uses 32 CPU cores per node.
 | Triton API / FlagTree | 3.6.0 / 0.6.1+metax3.6 |
 | vLLM | 0.24.0, public commit ee0da84ab9e04ac7610e28580af62c365e898389 |
 | FL branch | main, with this PR |
-| FlagGems | v5.3.5, a7620cc191a0b42e040194622c5758b22a7a25dc + patches |
-| FlagGems-vllm | release v0.2.0, b5c2c2249319277ccda4d41aa0f65164bd9b2a19 + patches |
+| FlagGems | validated a7620cc1 base + [c7a255b6 integration](https://github.com/cshujie131-bot/FlagGems/commit/c7a255b6bb24d3e5b3c1d40aa392e590d84c29d6) |
+| FlagGems-vllm | validated b5c2c224 base + [d00fb7a9 integration](https://github.com/cshujie131-bot/FlagGems-vllm/commit/d00fb7a94936774e69093e32e663a4bd76ed9997) |
 | Vendor FlashAttention | 2.6.3+metax3.8.1.0torch2.10 |
 
 The FlagGems-vllm release reports 0.1.0 in package metadata; the public commit is
@@ -42,27 +42,28 @@ git clone https://github.com/vllm-project/vllm.git /work/vllm
 git -C /work/vllm checkout ee0da84ab9e04ac7610e28580af62c365e898389
 VLLM_TARGET_DEVICE=empty python -m pip install --no-deps --no-build-isolation /work/vllm
 
-git clone https://github.com/flagos-ai/FlagGems.git /work/FlagGems
-git -C /work/FlagGems checkout a7620cc191a0b42e040194622c5758b22a7a25dc
-git clone https://github.com/flagos-ai/FlagGems-vllm.git /work/FlagGems-vllm
-git -C /work/FlagGems-vllm checkout b5c2c2249319277ccda4d41aa0f65164bd9b2a19
-
-python examples/minimax_m3_metax/prepare_dependencies.py \
-  --flag-gems-source /work/FlagGems \
-  --fgv-source /work/FlagGems-vllm \
-  --vllm-source /work/vllm \
-  --output /work/m3-dependencies --install
+python -m pip install --no-deps --no-build-isolation \
+  -r examples/minimax_m3_metax/requirements.txt
 
 python -m pip install --no-deps --no-build-isolation -e .
 ~~~
 
-Preparation checks the public commits, creates separate copies, and reads two
-MSA kernel files from the pinned vLLM source into the FGV copy. Their exact
-hashes are checked before applying the incremental patches in manifest order.
-No installed vLLM source is modified, and FGV has no runtime dependency on vLLM. It refuses a dirty source or an existing output
-directory. It does not modify the supplied checkouts. An empty-target wheel labeled 0.24.0+flagos is accepted only when its guarded
-APIs and M3 model files match the public v0.24.0 sources. Old vendor images with
-locally modified M3 files must install the clean source above.
+The dependency lock records public commits and their source PRs. These are
+selective backports onto the verified library bases, not upgrades to the latest
+whole library. [FG #7320](https://github.com/flagos-ai/FlagGems/pull/7320) and
+[FGV #960](https://github.com/flagos-ai/FlagGems-vllm/pull/960) contain the qualified
+Linear/router improvements; [FGV #961](https://github.com/flagos-ai/FlagGems-vllm/pull/961)
+contains explicit numerical modes and [FGV #962](https://github.com/flagos-ai/FlagGems-vllm/pull/962)
+contains independent cache selection. They are not merged yet.
+
+No source patch, snapshot or patch installer is required. The launcher checks the
+installed VCS commit recorded by pip. It selects FlagTree explicitly, and starts
+Python with `-P` so the working directory cannot accidentally shadow installed
+packages. Build requirements for the public vLLM source include setuptools-rust
+and semantic-version; install them in the isolated build environment without
+replacing the vendor Torch. The Python-only empty-device build is used here; it
+does not provide vendor binaries. Old images with modified vLLM Python files must
+install the clean source above. Version/source checks reject a mismatched ABI.
 
 Use the BF16 checkpoint from
 [ModelScope MiniMax/MiniMax-M3](https://www.modelscope.cn/models/MiniMax/MiniMax-M3).
@@ -85,7 +86,7 @@ attention shape rules, dispatch policy and standard runtime/communication
 variables. The launcher clears obsolete optimization switches before starting a
 fresh Python process.
 
-The migrated vLLM kernels are compiled with FlagTree; source reuse does not
+The imported vLLM kernels are compiled with FlagTree; source reuse does not
 change their compiler or switch them to native binary operators.
 Supply the installed FlagTree root containing triton/; it is used as the compiler
 import prefix. The example prints its command by default. Add --execute only when
@@ -125,31 +126,29 @@ and port counters during the smoke.
 ## Review map
 
 [Changes against pinned upstream sources](UPSTREAM_DIFF.md) identifies reused
-code, source imports and the actual M3 deltas. It does not use an older PR as
+code, direct upstream imports and the actual M3 deltas. It does not use an older PR as
 the comparison baseline.
 
-| Area | Main files or patches | What to review |
+| Area | Main files / public library PR | What to review |
 |---|---|---|
 | Configuration/startup | vllm_fl/minimax_m3_config.py; patches/minimax_m3_metax/ | Typed immutable policy, effective blacklists, scoped initialization and cache identity |
-| Model | vllm_fl/models/minimax_m3/ | Only changed text/vision methods and explicit M3 module bindings; unchanged model code stays in vLLM |
-| MSA orchestration | ops/minimax_m3/attention.py; base_index.py; base_sparse.py; *_policy.py; attention_launch.py | TP/owner checks, local query/head packing, length/shape selection and output slicing |
-| MSA kernels | dependencies/flaggems_vllm/01-msa-kernels.patch | Exact block top-k, packed prefill, subtile/split decode and long-context computation |
-| Linear | dependencies/flag_gems/01-linear-policy.patch | Retained 35 configurations, small-M dot/GEMV and M8192 program ordering; explicit policy supplied by FL |
-| Gate and MoE | ops/fused_moe/fused_moe_utils.py; ops/minimax_m3/experts.py; expert_layer.py; moe.py; router.py; routing.py; dependencies/flaggems_vllm/03-moe-router.patch | Small shared extension points; M3 overrides only GEMM context, activation and bindings; retained BF16-load/FP32 gate and routed GEMV |
-| Norm/activation/QKV | dependencies/flaggems_vllm/02-norm-activation-qkv.patch | Gemma residual semantics, clamped SwiGLU and BF16 rounding between QK normalization and RoPE/cache insertion |
-| Vision and library runtime | ops/minimax_m3/vision.py; vision_chunk.py; dependencies/flaggems_vllm/04-launch-runtime.patch | Shared partial-RoPE dispatch from #560, patch chunking, retained FlagGems varlen call, isolated FGV cache |
-| In-place mask | dependencies/flag_gems/02-generic-masked-fill.patch | Select the existing generic masked_fill_ function; non-inplace masked_fill stays excluded |
-| Vendor/communication | patches/minimax_m3_metax/compat.py; sdk/; tuning-ar512k.cfg | MCCL ABI, in-place AllReduce and required SDK compatibility; no vendor framework import |
+| Model | vllm_fl/models/minimax_m3/ | Changed methods and explicit M3 bindings; loading and unchanged model code remain in vLLM |
+| MSA | ops/minimax_m3/attention.py; *_policy.py; native_index.py; native_sparse.py | TP/owner checks and explicit launch arguments; unchanged native JIT bodies are imported from vLLM |
+| TP16 companion kernels | ops/minimax_m3/index_score.py; long_prefill.py; long_decode.py; moe_gemv.py | Query/head packing, selected-page traversal, page splitting and routed GEMV; base and long paths share templates |
+| Linear | ops/minimax_m3/linear.py; aten.py; FG #7320 | FL owns all 35 legacy / 28 small-M rules and ordered shapes; FG owns the reused GEMM and GEMV computation |
+| Gate and MoE | ops/minimax_m3/router.py; moe.py; experts.py; library_bindings.py; FGV #960 | Shared expert pipeline and FGV GEMMs/alignment/reduction; no duplicate backend selector |
+| Norm/activation/QKV | ops/minimax_m3/numerics.py; FGV #961 | Explicit Gemma, division-form SwiGLU, BF16 staged norm/RoPE and sequential reduction modes |
+| Vision | ops/minimax_m3/vision.py; vision_chunk.py | Shared partial-RoPE dispatch from #560, patch chunking and retained FlagGems varlen call |
+| In-place mask | ops/minimax_m3/aten.py | Public registrar selects generic masked_fill_; library exports/defaults stay intact; masked_fill stays excluded |
+| Vendor/communication | dispatch/backends/vendor/metax/; patches/minimax_m3_metax/compat.py; tuning-ar512k.cfg | Existing vendor backend plus scoped vLLM 0.24 ABI hooks and accepted MCCL transport |
 
-The M3 computation modules take tensors, workspace and launch parameters; they
-do not discover TP groups or import FL. Existing rotary and ordinary SiLU
-implementations are reused. The M3 QKV variant preserves the accepted intermediate
-BF16 rounding, so it is not replaced with a newer fusion that changes that
-contract. The alignment patch exposes an explicit allow_tle argument; M3 passes false,
-preserving the accepted four-stage computation. Existing verified FlagGems
-MoE GEMM, sigmoid top-k, ordered sum, vision attention and dense KV insertion
-remain on that pinned implementation. They are not migrated to different FGV
-fusions as part of packaging.
+Independent numerical kernels receive explicit tensors and metadata. FGV does
+not infer MiniMax TP groups or import FL. Namespace migration alone is not a
+performance claim. MoE alignment uses the existing no-TLE four-stage interface;
+MoE GEMM, ordered sum and grouped top-k reuse FGV implementations after direct
+chain comparisons. Sigmoid materialization remains explicit in FL. No global
+tuner, compiler setting or library export is replaced.
+
 
 Vision RoPE now follows the native M3 attention class through the shared
 apply_rotary_emb dispatch from #560. Its FGV implementation compiles with
@@ -160,7 +159,8 @@ The entry has real runtime hooks for the matched Torch/vLLM/MCCL ABI. They are
 centralized, guarded and idempotent, and only the explicit M3 profile installs
 them. Model hooks replace only named bindings inside vLLM's M3 modules, after checking
 their public source revision. General router and MoE factories stay unchanged.
-Unchanged SDK wrappers are imported from FL instead of copied. No installed
+Vendor binary access reuses the existing FL vendor backend. The remaining ABI
+compatibility lives alongside it, with the M3 entry controlling installation. No installed
 vLLM source is rewritten and no fake module facade is installed by this entry.
 
 ## Validation and measurements
@@ -200,11 +200,15 @@ tolerance is rtol=0.01 and atol=0.01; input and unrotated tails stay exact.
 Old/new relative L2 was at most 9.84e-6; this is numerical agreement, not a
 claim of bitwise equality or a new full-model accuracy run.
 
-Packaging checks: CPU configuration/launcher tests, syntax, critical lint,
-patch application and numerical-body/configuration comparisons. The installed
-entry with clean public vLLM sources still needs a TP16 smoke; this PR stays
-Draft until that passes. The model evaluations and serving results above are
-existing measurements, not new runs of this packaging.
+This ownership update passed 100 operator fixtures, 27 MSA cases (including
+three changing-input graph checks), 26 exact MoE-chain comparisons and actual
+ATen registration/routing checks. Standalone library PRs have their own
+correctness and complete-call timing evidence. The model evaluation and serving
+tables above are retained measurements; they were not rerun for this cleanup.
+
+The installed entry is checked with clean public vLLM and pinned public library
+commits. TP16 smoke is pending; the PR remains Draft until that boundary passes.
+
 
 ~~~sh
 python tests/unit_tests/test_minimax_m3_packaging.py -v

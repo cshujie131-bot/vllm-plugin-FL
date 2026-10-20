@@ -9,13 +9,15 @@ router is patched and no caller changes a runner's private state.
 """
 
 import inspect
+
+from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE as native_fused_moe
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
 from vllm_fl.ops.fused_moe.fused_moe_utils import select_unquantized_moe_backend_oot
+
 from .experts import TritonExpertsFL
 
 

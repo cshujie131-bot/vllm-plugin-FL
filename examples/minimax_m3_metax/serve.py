@@ -9,10 +9,10 @@ import hashlib
 import importlib.metadata
 import json
 import os
-from pathlib import Path
 import shlex
 import subprocess
 import sys
+from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 LEGACY_ENV = {
@@ -88,6 +88,23 @@ def build_environment(profile, config_path, state, compiler_root, tuning_path):
     return env
 
 
+def verified_dependencies():
+    """Verify normal VCS installs against the public dependency commits."""
+    lock = json.loads((HERE / "dependency-lock.json").read_text())
+    installed = {}
+    for module, spec in lock.items():
+        dist = importlib.metadata.distribution(spec["distribution"])
+        origin = json.loads(dist.read_text("direct_url.json") or "{}")
+        commit = origin.get("vcs_info", {}).get("commit_id")
+        if commit != spec["commit"]:
+            raise RuntimeError(
+                f"{module} must be installed from public commit {spec['commit']}; "
+                "see requirements.txt"
+            )
+        installed[module] = {"commit": commit, "version": dist.version}
+    return installed
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -142,13 +159,14 @@ def main(argv=None):
         "fl_source": source_identity(),
         "node_rank": a.node_rank,
         "flagtree_root": str(compiler),
-        "dependencies": json.loads((HERE / "dependencies/manifest.json").read_text()),
+        "dependencies": json.loads((HERE / "dependency-lock.json").read_text()),
         "communication_sha256": hashlib.sha256(tuning.read_bytes()).hexdigest(),
     }
     config_path = state / "profile.json"
     env = build_environment(profile, config_path, state, compiler, tuning)
     command = [
         sys.executable,
+        "-P",
         "-m",
         "vllm_fl.patches.minimax_m3_metax.launch",
         "--model",
@@ -178,6 +196,7 @@ def main(argv=None):
     print(shlex.join(command), flush=True)
     if not a.execute:
         return
+    identity["installed_dependencies"] = verified_dependencies()
     # One launch owns this cache for its entire lifetime. Never stop a service
     # or remove a directory to make an incompatible cache usable.
     state.mkdir(parents=True, exist_ok=True)

@@ -3,15 +3,19 @@
 
 """Static TP/shape selection, owned by FL; local kernels receive explicit metadata."""
 
-import os, torch, weakref
+import os
+import weakref
+
+import torch
 from vllm_fl.minimax_m3_config import load
-from . import attention_launch as kernels, attention_policy as policy
+
+from . import attention_launch as kernels
+from . import attention_policy as policy
 from .base_index import index_score as oldi
-from .base_sparse import sparse_attn as oldp, sparse_decode as oldd
-from flaggems_vllm.ops.minimax_m3.index_native import (
-    minimax_m3_index_topk as index_topk,
-    minimax_m3_index_decode as native_index_decode,
-)
+from .base_sparse import sparse_attn as oldp
+from .base_sparse import sparse_decode as oldd
+from .native_index import minimax_m3_index_decode as native_index_decode
+from .native_index import minimax_m3_index_topk as index_topk
 
 _TP_OK = None
 _STATE = None
@@ -269,7 +273,8 @@ def initialize_consumer_contract():
     from vllm_fl.models.minimax_m3.bindings import install
 
     install()
-    from vllm.models.minimax_m3.common import sparse_attention as caller, indexer
+    from vllm.models.minimax_m3.common import indexer
+    from vllm.models.minimax_m3.common import sparse_attention as caller
     from vllm_fl.models.minimax_m3.model import MiniMaxM3SparseAttention
 
     wanted = dict(

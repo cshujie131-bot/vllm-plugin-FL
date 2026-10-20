@@ -9,10 +9,10 @@ import importlib.util
 import io
 import json
 import os
-from pathlib import Path
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -191,6 +191,7 @@ class LauncherTests(unittest.TestCase):
         with (
             contextlib.redirect_stdout(io.StringIO()),
             patch.object(self.module, "source_identity", return_value="test-source"),
+            patch.object(self.module, "verified_dependencies", return_value={}),
         ):
             return self.module.main(args)
 
@@ -284,68 +285,42 @@ class VisionDispatchTests(unittest.TestCase):
         self.assertIn("patch_oot_apply_rotary_emb()", worker)
 
 
-class SourceImportTests(unittest.TestCase):
+class DependencyTests(unittest.TestCase):
     def setUp(self):
-        import hashlib
+        self.module = load_file(EXAMPLE / "serve.py", "_m3_dependency_test")
 
-        self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
-        self.file = self.root / "vllm/kernel.py"
-        self.file.parent.mkdir()
-        self.content = b"# upstream kernel fixture\n"
-        self.file.write_bytes(self.content)
-        self.preparer = load_file(
-            EXAMPLE / "prepare_dependencies.py", "_m3_prepare_test"
-        )
-        self.spec = {
-            "source_import": {
-                "commit": "pinned",
-                "files": [
-                    {
-                        "source": "vllm/kernel.py",
-                        "destination": "src/flaggems_vllm/ops/kernel.py",
-                        "sha256": hashlib.sha256(self.content).hexdigest(),
-                    }
-                ],
-            }
-        }
+    def test_public_vcs_commits_are_required(self):
+        lock = json.loads((EXAMPLE / "dependency-lock.json").read_text())
+        by_name = {value["distribution"]: value for value in lock.values()}
 
-    def tearDown(self):
-        self.tmp.cleanup()
+        def distribution(name):
+            spec = by_name[name]
+            return SimpleNamespace(
+                version="test",
+                read_text=lambda _: json.dumps(
+                    {"vcs_info": {"commit_id": spec["commit"]}}
+                ),
+            )
 
-    def test_exact_source_import_keeps_source_read_only(self):
-        result = self.preparer.source_imports(self.spec, self.root)
-        self.assertEqual(
-            result, [(Path("src/flaggems_vllm/ops/kernel.py"), self.content)]
-        )
-        self.assertEqual(self.file.read_bytes(), self.content)
-        self.assertFalse((self.root / "src").exists())
+        with patch.object(self.module.importlib.metadata, "distribution", distribution):
+            actual = self.module.verified_dependencies()
+        self.assertEqual(set(actual), set(lock))
 
-    def test_changed_upstream_source_is_rejected(self):
-        self.file.write_bytes(b"locally modified")
-        with self.assertRaisesRegex(ValueError, "source differs"):
-            self.preparer.source_imports(self.spec, self.root)
+    def test_unpinned_install_is_rejected(self):
+        for origin in ({}, {"vcs_info": {"commit_id": "wrong"}}):
+            dist = SimpleNamespace(
+                version="test", read_text=lambda _: json.dumps(origin)
+            )
+            with patch.object(
+                self.module.importlib.metadata, "distribution", return_value=dist
+            ):
+                with self.assertRaisesRegex(RuntimeError, "public commit"):
+                    self.module.verified_dependencies()
 
-    def test_paths_cannot_escape_the_checkout(self):
-        for field in ("source", "destination"):
-            with self.subTest(field=field):
-                spec = copy.deepcopy(self.spec)
-                spec["source_import"]["files"][0][field] = "../outside.py"
-                with self.assertRaisesRegex(ValueError, "inside their checkouts"):
-                    self.preparer.source_imports(spec, self.root)
-
-    def test_missing_source_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "vLLM source is required"):
-            self.preparer.source_imports(self.spec, None)
-
-    def test_wrong_checkout_revision_is_rejected(self):
-        (self.root / ".git").mkdir()
-        with patch.object(self.preparer, "git", return_value="wrong-revision"):
-            with self.assertRaisesRegex(ValueError, "commit does not match"):
-                self.preparer.source_imports(self.spec, self.root)
-
-    def test_other_dependencies_do_not_require_source_imports(self):
-        self.assertEqual(self.preparer.source_imports({}, None), [])
+    def test_examples_do_not_ship_source_installers_or_patches(self):
+        self.assertFalse((EXAMPLE / "prepare_dependencies.py").exists())
+        self.assertFalse(list(EXAMPLE.rglob("*.patch")))
+        self.assertFalse((EXAMPLE / "dependencies").exists())
 
 
 if __name__ == "__main__":

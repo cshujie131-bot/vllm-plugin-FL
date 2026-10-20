@@ -70,7 +70,7 @@
   {
     "name": "pynccl_wrapper",
     "reason": "MCCL API/ABI bridge and accepted in-place torch.distributed all_reduce",
-    "relative_source": "patches/minimax_m3_metax/sdk/pynccl_wrapper.py",
+    "relative_source": "dispatch/backends/vendor/metax/patches/pynccl_vllm024.py",
     "sha256": "a7804fe687d5480319e0996c9b9f2b27edb37a59e6b9254df1b1b1600e25ecad",
     "targets": [
       {
@@ -104,7 +104,7 @@
         ]
       }
     ],
-    "import_module": "vllm_fl.patches.minimax_m3_metax.sdk.pynccl_wrapper"
+    "import_module": "vllm_fl.dispatch.backends.vendor.metax.patches.pynccl_vllm024"
   },
   {
     "name": "cuda_wrapper",
@@ -170,7 +170,7 @@
   {
     "name": "vllm024_compat",
     "reason": "Pointer dtype, sampling penalties and sampling UVA compatibility; unrelated pooling hook removed",
-    "relative_source": "patches/minimax_m3_metax/sdk/vllm024_compat.py",
+    "relative_source": "dispatch/backends/vendor/metax/patches/vllm024_compat.py",
     "sha256": "7cde1764bfaf894aa79d4ab7fa6195195df17d4ac6b11ea7d22c76b3eeb1b32b",
     "targets": [
       {
@@ -290,6 +290,6 @@
         ]
       }
     ],
-    "import_module": "vllm_fl.patches.minimax_m3_metax.sdk.vllm024_compat"
+    "import_module": "vllm_fl.dispatch.backends.vendor.metax.patches.vllm024_compat"
   }
 ]

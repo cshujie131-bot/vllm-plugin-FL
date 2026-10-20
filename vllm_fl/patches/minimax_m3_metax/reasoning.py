@@ -4,6 +4,7 @@
 """Scope MiniMax-M3 prompt reasoning-state detection to the current message."""
 
 from collections.abc import Sequence
+
 from vllm.reasoning import ReasoningParserManager
 from vllm.reasoning.minimax_m3_reasoning_parser import MiniMaxM3ReasoningParser
 

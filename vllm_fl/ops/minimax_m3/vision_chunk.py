@@ -5,8 +5,8 @@
 No frames, patches, attention edges, projection weights or output rows are removed.
 """
 
-from vllm_fl.minimax_m3_config import load
 import torch
+from vllm_fl.minimax_m3_config import load
 
 
 def vision_forward(model, pixel_values, grid_thw):

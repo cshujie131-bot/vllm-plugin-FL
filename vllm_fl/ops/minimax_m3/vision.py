@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
 
-import torch
 import flag_gems
-from vllm_fl.dispatch import CachedOp
+import torch
 from vllm.model_executor.layers.attention.mm_encoder_attention import (
     MMEncoderAttention as _MMEncoderBase,
 )
+from vllm_fl.dispatch import CachedOp
 
 vision_attention_op = CachedOp("m3_vision_attention")
 

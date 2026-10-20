@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
 
-import torch, triton
-from flaggems_vllm.ops.minimax_m3 import (
-    index_score as idx,
-    long_prefill as sp,
-    long_decode as sd,
-)
+import torch
+import triton
+
+from . import index_score as idx
+from . import long_decode as sd
+from . import long_prefill as sp
 
 
 def index_score(q, kv, bt, cu, lens, prefix, maxq, maxseq, nkv, config):

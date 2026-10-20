@@ -7,9 +7,7 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm_fl.dispatch import CachedOp
 from vllm_fl.minimax_m3_config import load
 from vllm_fl.ops.fused_moe.activation import apply_moe_activation
-from vllm_fl.ops.fused_moe.fused_moe_utils import (
-    TritonExpertsFL as BaseTritonExpertsFL,
-)
+from vllm_fl.ops.fused_moe.fused_moe_utils import TritonExpertsFL as BaseTritonExpertsFL
 
 _moe_align_block_size = CachedOp("m3_moe_align_block_size")
 _invoke_fused_moe_triton_kernel = CachedOp("m3_invoke_fused_moe_triton_kernel")

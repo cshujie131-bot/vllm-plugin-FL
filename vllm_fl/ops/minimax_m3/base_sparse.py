@@ -2,14 +2,11 @@
 # Copyright 2026 FlagOS Contributors
 
 import torch
-from flaggems_vllm.ops.minimax_m3 import (
-    packed_prefill as kernel,
-    subtile_decode as decode_kernel,
-)
-from flaggems_vllm.ops.minimax_m3.sparse_native import (
-    minimax_m3_sparse_attn as original,
-    minimax_m3_sparse_attn_decode as original_decode,
-)
+
+from . import packed_prefill as kernel
+from . import subtile_decode as decode_kernel
+from .native_sparse import minimax_m3_sparse_attn as original
+from .native_sparse import minimax_m3_sparse_attn_decode as original_decode
 
 COUNTS = {"prefill_packed": 0, "decode_subtile": 0, "fallback": 0}
 PREFILL_SHAPES = {}
