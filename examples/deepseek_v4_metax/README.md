@@ -106,21 +106,21 @@ unrecognized cache and never stops another service.
 
 ## Validation
 
-Before the redundancy-only cleanup, the clean installed-package TP8 smoke at
-`6903cb0` passed 78/78 requests: short prompts, 1K/4K/16K/20K prefill, mixed
-batches and 64 concurrent distinct-string responses. All seven decode graph
-buckets were captured; installed-source, dependency, Hash-table and RMS checks passed.
+The capability-dispatch refactor passed a fresh installed-package TP8 smoke:
+78/78 requests covering short prompts, 1K/4K/16K/20K prefill, mixed batches and
+64 concurrent distinct-string responses. All seven decode graph buckets were
+captured; no request failed or hit its output-token limit.
 
-The cleanup removes retired attention variants, disabled native-prefill-topk,
-unreachable non-W8A8 vendor paths and duplicate backend adapters. Decode keeps
-blockdiag split/reduce. Prefill keeps staged headpacking **and** its short-query
-blockdiag path; one-token/native shape fallbacks are still needed. Hot kernel
-bodies and their accepted launch settings are unchanged. CPU differential call
-traces matched for 80 MoE and 71 attention cases; 31 CPU unit checks also pass.
-These are structural/host-call checks, not new GPU numerical or timing results.
+The 333 installed FL Python sources matched the tested checkout without stale
+modules. Dependency pins, the scoped provider bindings, 24 Hash-table aliases
+and 24 rank/role RMS settings were checked. All 32 CPU tests passed, including
+registration against the real registry API and profile/blacklist isolation.
 
-No serving, quality or performance benchmark was rerun for that cleanup.
-Historical accuracy and performance below are retained, not newly measured results.
+The five relocated attention/launch files are byte-identical to `a004750`;
+existing graph-adapter function bodies and the compute/service policies are
+unchanged. Compatibility hooks remain explicitly documented in the review map.
+This was a functional smoke, not a new quality or throughput benchmark.
+Historical accuracy and performance below are retained.
 
 | Task | Reviewed accuracy |
 |---|---:|
