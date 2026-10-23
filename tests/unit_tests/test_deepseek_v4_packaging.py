@@ -251,15 +251,22 @@ class PackagingTests(unittest.TestCase):
             def __getattr__(self, name):
                 return impl
 
-        class Registry:
-            def __init__(self):
-                self.entries = []
+        # Exercise the real registry API; do not invent a mock register() method.
+        fixture = types.ModuleType("dsv4_registry_fixture")
+        fixture.__path__ = [str(ROOT / "vllm_fl/dispatch")]
+        with patch.dict(sys.modules, {fixture.__name__: fixture}):
+            registry_module = load(
+                "dsv4_registry_fixture.registry", ROOT / "vllm_fl/dispatch/registry.py"
+            )
 
-            def register(self, entry):
-                self.entries.append(entry)
-
-            def register_many(self, entries):
-                self.entries.extend(entries)
+        class Registry(registry_module.OpRegistry):
+            @property
+            def entries(self):
+                return [
+                    entry
+                    for entries in self.snapshot().impls_by_op.values()
+                    for entry in entries
+                ]
 
         library_names = {
             "silu_and_mul_with_clamp",
@@ -306,7 +313,7 @@ class PackagingTests(unittest.TestCase):
                 ):
                     env = {
                         "__package__": package,
-                        "OpImpl": types.SimpleNamespace,
+                        "OpImpl": registry_module.OpImpl,
                         "BackendImplKind": types.SimpleNamespace(
                             DEFAULT="flagos", VENDOR="vendor"
                         ),

@@ -116,7 +116,7 @@ def register_builtins(registry) -> None:
             ("flash_mla_with_kvcache", decode_attention),
             ("flash_mla_sparse_fwd", prefill_attention),
         ):
-            registry.register(OpImpl(
+            registry.register_impl(OpImpl(
                 op_name=name,
                 impl_id="vendor.metax.dsv4",
                 kind=BackendImplKind.VENDOR,
