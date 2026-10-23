@@ -19,6 +19,33 @@
     "topk_softmax": [
       "flagos",
       "reference"
+    ],
+    "flash_mla_with_kvcache": [
+      "impl:vendor.metax.dsv4"
+    ],
+    "flash_mla_sparse_fwd": [
+      "impl:vendor.metax.dsv4"
+    ],
+    "silu_and_mul_with_clamp": [
+      "impl:default.flagos.dsv4"
+    ],
+    "combine_topk_swa_indices": [
+      "impl:default.flagos.dsv4"
+    ],
+    "dequantize_and_gather_k_cache": [
+      "impl:default.flagos.dsv4"
+    ],
+    "fused_q_kv_rmsnorm": [
+      "impl:default.flagos.dsv4"
+    ],
+    "mhc_pre": [
+      "impl:default.flagos.dsv4"
+    ],
+    "mhc_post": [
+      "impl:default.flagos.dsv4"
+    ],
+    "hc_head_fused_kernel": [
+      "impl:default.flagos.dsv4"
     ]
   },
   "flagos_blacklist": [
@@ -32,7 +59,7 @@
   ],
   "deepseek_v4_metax": {
     "schema_version": 1,
-    "release": "dsv4-library-pins-20261019-r2",
+    "release": "dsv4-capability-dispatch-20261023-r1",
     "framework": {
       "decode_hq16": true,
       "real_query_heads": 8,

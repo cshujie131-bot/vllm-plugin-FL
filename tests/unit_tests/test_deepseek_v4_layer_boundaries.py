@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
-OPS = ROOT / "vllm_fl/ops/deepseek_v4_metax"
+OPS = ROOT / "vllm_fl/dispatch/backends/vendor/metax/impl/dsv4/attention"
 
 
 def load(name, path):
@@ -91,7 +91,7 @@ class LayerBoundaryTests(unittest.TestCase):
                 name, {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
             )
         headpack = (ROOT / "vllm_fl/ops/dsv4_headpack.py").read_text()
-        self.assertIn("vllm_fl.ops.deepseek_v4_metax import prefill", headpack)
+        self.assertIn("vllm_fl.dispatch.backends.vendor.metax.impl.dsv4.attention import prefill", headpack)
         self.assertNotIn("flaggems_vllm.ops.flashmla_sparse", headpack)
 
     def test_tuning_has_no_mhc_or_compiler_policy(self):
@@ -156,9 +156,10 @@ class LayerBoundaryTests(unittest.TestCase):
             "deepseek_v4_ops",
         ):
             self.assertFalse((folder / (name + ".py")).exists())
-        backend = (folder.parents[1] / "deepseek_v4_metax.py").read_text()
-        self.assertIn("from .impl import fused_moe", backend)
-        self.assertIn("from .impl import deepseek_v4_attn as _common_attn", backend)
+        self.assertFalse((folder.parents[1] / "deepseek_v4_metax.py").exists())
+        provider = (folder.parent / "deepseek_v4.py").read_text()
+        self.assertIn("def operator_impls", provider)
+        self.assertNotIn("torch.distributed", provider)
 
     def test_w4a8_vendor_registrations_are_absent(self):
         path = ROOT / "vllm_fl/dispatch/backends/vendor/metax/impl/dsv4/mctlass_ops.py"

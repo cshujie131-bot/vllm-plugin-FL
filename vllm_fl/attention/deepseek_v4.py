@@ -1,83 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 FlagOS Contributors
+"""DS vLLM attention ABI: scheduler metadata, TP layout and caller output buffers.
+
+Registered by the MetaX provider; no kernel arithmetic is implemented here.
+The local device kernels and launch policy live in vendor/metax/impl/dsv4.
+"""
 from vllm_fl import dsv4_config as _dsv4
-# Copyright (c) 2026 BAAI. All rights reserved.
-
-"""
-FlagGems implementations for DeepseekV4 attention operators.
-"""
-
-import torch
-
-from vllm_fl.ops.deepseek_v4_metax.decode import (
+from vllm_fl.dispatch.backends.vendor.metax.impl.dsv4.attention.decode import (
     FlashMLASchedMeta,
     flash_mla_with_kvcache,
 )
-
-from flaggems_vllm import combine_topk_swa_indices as _fgv_combine_topk_swa_indices
-
-from flaggems_vllm import (
-    dequantize_and_gather_k_cache as _fgv_dequantize_and_gather_k_cache,
-)
-
-from flaggems_vllm import fused_q_kv_rmsnorm as _fgv_fused_q_kv_rmsnorm
-
 from vllm_fl.ops.dsv4_headpack import sparse_prefill as _framework_sparse_prefill
 
 
-# ==================== Sparse Attention Indexer Ops ====================
-
-
-def combine_topk_swa_indices_flaggems(
-    topk_indices: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    seq_lens: torch.Tensor,
-    gather_lens: torch.Tensor,
-    window_size: int,
-    compress_ratio: int,
-    topk: int,
-    M: int,
-    N: int,
-) -> None:
-    """FlagGems implementation of combine_topk_swa_indices."""
-    return _fgv_combine_topk_swa_indices(
-        topk_indices,
-        query_start_loc,
-        seq_lens,
-        gather_lens,
-        window_size,
-        compress_ratio,
-        topk,
-        M,
-        N,
-    )
-
-
-def dequantize_and_gather_k_cache_flaggems(
-    out: torch.Tensor,
-    k_cache: torch.Tensor,
-    seq_lens: torch.Tensor,
-    gather_lens: torch.Tensor | None,
-    block_table: torch.Tensor,
-    block_size: int,
-    offset: int,
-) -> None:
-    """FlagGems implementation of dequantize_and_gather_k_cache."""
-    _fgv_dequantize_and_gather_k_cache(
-        out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
-    )
-
-
-def fused_q_kv_rmsnorm_flaggems(
-    qr: torch.Tensor,
-    kv: torch.Tensor,
-    q_weight: torch.Tensor,
-    kv_weight: torch.Tensor,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """FlagGems implementation of fused_q_kv_rmsnorm."""
-    return _fgv_fused_q_kv_rmsnorm(qr, kv, q_weight, kv_weight, eps)
-
-
-def flash_mla_with_kvcache_flaggems(
+def decode_attention(
     q,
     k_cache,
     block_table,
@@ -130,9 +66,7 @@ def flash_mla_with_kvcache_flaggems(
     return result
 
 
-def flash_mla_sparse_fwd_flaggems(
-    q, kv, indices, sm_scale, attn_sink, topk_length, out
-):
+def prefill_attention(q, kv, indices, sm_scale, attn_sink, topk_length, out):
     (out_tmp, max_logits, lse) = _framework_sparse_prefill(
         q=q,
         kv=kv,

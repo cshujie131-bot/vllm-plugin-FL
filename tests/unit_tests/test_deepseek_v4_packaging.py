@@ -222,57 +222,131 @@ class PackagingTests(unittest.TestCase):
             serve.check_model(model)
 
     def test_provider_selection_is_scoped(self):
+        """The generic backend is never replaced by a DS subclass."""
         source = ROOT / "vllm_fl/dispatch/backends/flaggems/register_ops.py"
         tree = ast.parse(source.read_text())
-        function = next(
+        fn = next(
             n
             for n in tree.body
             if isinstance(n, ast.FunctionDef) and n.name == "register_builtins"
         )
-        selection = []
-        for node in function.body:
-            if isinstance(node, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id == "impls" for t in node.targets
-            ):
-                break
-            selection.append(node)
+        constructors = [
+            n.value.func.id
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "backend" for t in n.targets)
+            and isinstance(n.value, ast.Call)
+            and isinstance(n.value.func, ast.Name)
+        ]
+        self.assertEqual(constructors, ["FlagGemsBackend"])
+
+    def test_ds_capabilities_use_common_registry_and_policy(self):
+        def impl(*args, **kwargs):
+            return args, kwargs
 
         class Generic:
             def is_available(self):
                 return True
 
-        class DSV4(Generic):
-            pass
+            def __getattr__(self, name):
+                return impl
 
-        for enabled in (False, True):
-            root = types.ModuleType("vllm_fl")
-            root.dsv4_config = types.SimpleNamespace(
-                is_enabled=lambda enabled=enabled: enabled
+        class Registry:
+            def __init__(self):
+                self.entries = []
+
+            def register(self, entry):
+                self.entries.append(entry)
+
+            def register_many(self, entries):
+                self.entries.extend(entries)
+
+        library_names = {
+            "silu_and_mul_with_clamp",
+            "combine_topk_swa_indices",
+            "dequantize_and_gather_k_cache",
+            "fused_q_kv_rmsnorm",
+            "mhc_pre",
+            "mhc_post",
+            "hc_head_fused_kernel",
+        }
+        device_names = {"flash_mla_with_kvcache", "flash_mla_sparse_fwd"}
+        for backend, kind, names in (
+            ("flaggems", "flagos", library_names),
+            ("vendor/metax", "vendor", device_names),
+        ):
+            path = ROOT / "vllm_fl/dispatch/backends" / backend / "register_ops.py"
+            fn = next(
+                n
+                for n in ast.parse(path.read_text()).body
+                if isinstance(n, ast.FunctionDef) and n.name == "register_builtins"
             )
-            generic = types.ModuleType("vllm_fl.dispatch.backends.flaggems.flaggems")
-            generic.FlagGemsBackend = Generic
-            optimized = types.ModuleType(
-                "vllm_fl.dispatch.backends.flaggems.deepseek_v4_metax"
-            )
-            optimized.DeepseekV4MetaXBackend = DSV4
-            with patch.dict(
-                sys.modules,
-                {
-                    "vllm_fl": root,
-                    generic.__name__: generic,
-                    optimized.__name__: optimized,
-                },
-            ):
-                namespace = {"__package__": "vllm_fl.dispatch.backends.flaggems"}
-                exec(
-                    compile(
-                        ast.Module(body=selection, type_ignores=[]),
-                        "<provider>",
-                        "exec",
-                    ),
-                    namespace,
+            package = "vllm_fl.dispatch.backends." + backend.replace("/", ".")
+            for enabled in (False, True):
+                root = types.ModuleType("vllm_fl")
+                root.dsv4_config = types.SimpleNamespace(is_enabled=lambda: enabled)
+                generic = types.ModuleType(
+                    package + (".flaggems" if kind == "flagos" else ".metax")
                 )
-                self.assertIs(type(namespace["backend"]), DSV4 if enabled else Generic)
+                generic.FlagGemsBackend = generic.MacaBackend = Generic
+                library = types.ModuleType(
+                    "vllm_fl.dispatch.backends.flaggems.impl.deepseek_v4"
+                )
+                library.operator_impls = lambda: {name: impl for name in library_names}
+                bridge = types.ModuleType("vllm_fl.attention.deepseek_v4")
+                bridge.decode_attention = bridge.prefill_attention = impl
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "vllm_fl": root,
+                        generic.__name__: generic,
+                        library.__name__: library,
+                        bridge.__name__: bridge,
+                    },
+                ):
+                    env = {
+                        "__package__": package,
+                        "OpImpl": types.SimpleNamespace,
+                        "BackendImplKind": types.SimpleNamespace(
+                            DEFAULT="flagos", VENDOR="vendor"
+                        ),
+                        "BackendPriority": types.SimpleNamespace(
+                            DEFAULT=150, VENDOR=100
+                        ),
+                        "_bind_is_available": lambda fn, check: fn,
+                        "_has_flaggems_op": lambda name: lambda: True,
+                        "use_flaggems_op": lambda name: True,
+                    }
+                    exec(
+                        compile(
+                            ast.Module(body=[fn], type_ignores=[]),
+                            "<registration>",
+                            "exec",
+                        ),
+                        env,
+                    )
+                    registry = Registry()
+                    env["register_builtins"](registry)
+                    selected = [
+                        x for x in registry.entries if x.impl_id.endswith(".dsv4")
+                    ]
+                    self.assertEqual(
+                        {x.op_name for x in selected}, names if enabled else set()
+                    )
+                    self.assertTrue(all(x.kind == kind for x in selected))
+                    if kind == "flagos" and enabled:
+                        env["use_flaggems_op"] = lambda name: name != "mhc_pre"
+                        blocked = Registry()
+                        env["register_builtins"](blocked)
+                        self.assertNotIn(
+                            "mhc_pre", {x.op_name for x in blocked.entries}
+                        )
+
+        profile = self.config()
+        for name in library_names:
+            self.assertEqual(profile["op_backends"][name], ["impl:default.flagos.dsv4"])
+        for name in device_names:
+            self.assertEqual(profile["op_backends"][name], ["impl:vendor.metax.dsv4"])
 
     def test_prewarm_return_contract(self):
         tree = ast.parse((ROOT / "vllm_fl/dispatch/__init__.py").read_text())

@@ -8,12 +8,13 @@ or a patch installer.
 
 | Layer | Files / responsibility |
 |---|---|
-| FL attention | `vllm_fl/ops/deepseek_v4_metax/{decode,prefill,staged}.py`: TP-local padded heads, blockdiag, headpack-compatible staged attention, split/reduce and shape guards |
+| MetaX local attention | `vllm_fl/dispatch/backends/vendor/metax/impl/dsv4/attention/`: TP-local blockdiag/staged kernels, split/reduce and launch policy |
 | FL communication | `vllm_fl/ops/dsv4_headpack.py`, `indexer_query_sharding.py`: head exchanges and complete-query-row M/4 sharding |
-| FL launch policy | `vllm_fl/ops/deepseek_v4_metax/{launch,tuning}.py`: local launch handles; library kernels/autotuners are not globally replaced |
-| FL graph/model adapters | `vllm_fl/ops/deepseek_v4_metax/{mhc,hc_head}.py`, model and W8A8 quantization modules: graph boundaries, Hash routing and MCTlass binding |
+| FL attention interface | `vllm_fl/attention/deepseek_v4.py`: scheduler metadata and caller output buffers; standard dispatch selects the implementation |
+| Library/model adapters | `vllm_fl/dispatch/backends/flaggems/impl/deepseek_v4.py`, model and W8A8 quantization modules: pinned FG/FGV calls, graph boundaries, Hash routing and MCTlass binding |
 | Operator libraries | The source commits below: pure operators and separately identified compatibility changes |
 
+See [the capability and compatibility review map](../../docs/deepseek-v4-metax.md).
 TP/headpack adaptations stay in FL. Library performance PRs must preserve the
 operator boundary and demonstrate correctness and standalone gains against the
 corresponding native library, not merely a namespace migration or vendor comparison.

@@ -102,3 +102,25 @@ def register_builtins(registry) -> None:
     ]
 
     registry.register_many(impls)
+
+    # TP8 attention is an FL/MetaX specialization, not a generic FG override.
+    from vllm_fl import dsv4_config
+
+    if dsv4_config.is_enabled():
+        from vllm_fl.attention.deepseek_v4 import (
+            decode_attention,
+            prefill_attention,
+        )
+
+        for name, fn in (
+            ("flash_mla_with_kvcache", decode_attention),
+            ("flash_mla_sparse_fwd", prefill_attention),
+        ):
+            registry.register(OpImpl(
+                op_name=name,
+                impl_id="vendor.metax.dsv4",
+                kind=BackendImplKind.VENDOR,
+                fn=_bind_is_available(fn, is_avail),
+                vendor="metax",
+                priority=BackendPriority.VENDOR,
+            ))

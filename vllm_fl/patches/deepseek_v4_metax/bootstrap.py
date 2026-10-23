@@ -13,11 +13,7 @@ from .compat import install_vendor_guard, install_serial_execution
 _initialized = False
 
 
-def initialize():
-    global _initialized
-    if _initialized:
-        return
-    profile = load()
+def _prepare_compatibility(profile):
     install_vendor_guard()
     import torch
 
@@ -46,7 +42,9 @@ def initialize():
 
     compiler_entry = compiler.metax.translate_llvmir_to_mcfatbin
     import flaggems_vllm
-    from vllm_fl.ops.deepseek_v4_metax import tuning as attention_tuning
+    from vllm_fl.dispatch.backends.vendor.metax.impl.dsv4.attention import (
+        tuning as attention_tuning,
+    )
 
     assert asdict(attention_tuning.KernelPolicy()) == profile["kernels"]
     attention_tuning.configure(profile["kernels"])
@@ -62,15 +60,19 @@ def initialize():
         profile["hash_tables"],
         profile["audit_dir"],
     )
+    return
+
+
+def _bind_dispatch(profile):
     from vllm_fl.dispatch import CachedOp, get_default_manager
 
     from vllm_fl.utils import get_flag_gems_whitelist_blacklist
     from vllm_fl.dispatch.config import get_oot_blacklist
 
     whitelist, blacklist = get_flag_gems_whitelist_blacklist()
-    assert whitelist is None and blacklist == profile["dispatch"]["flagos_blacklist"], (
-        "ATen policy differs from the sealed profile"
-    )
+    assert (
+        whitelist is None and blacklist == profile["dispatch"]["flagos_blacklist"]
+    ), "ATen policy differs from the sealed profile"
     assert get_oot_blacklist() == profile["dispatch"]["oot_blacklist"]
     mgr = get_default_manager()
     mgr.ensure_initialized()
@@ -101,6 +103,10 @@ def initialize():
                         continue
                     raise
                 bindings[name + "." + attr] = impl.impl_id
+    return bindings, blacklist
+
+
+def _record_startup(profile, bindings, blacklist):
     assert not any(
         n == "vllm_metax" or n.startswith("vllm_metax.") for n in sys.modules
     )
@@ -108,8 +114,8 @@ def initialize():
         "release": profile["release"],
         "pid": os.getpid(),
         "bindings": bindings,
-        "kernel_policy": asdict(attention_tuning.current),
-        "framework_policy": asdict(dsv4_config.current),
+        "kernel_policy": profile["kernels"],
+        "framework_policy": profile["framework"],
         "aten_blacklist": blacklist,
         "vendor_imports": [],
         "compiler_entry_unchanged": True,
@@ -118,6 +124,17 @@ def initialize():
     folder = Path(profile["audit_dir"])
     folder.mkdir(parents=True, exist_ok=True)
     (folder / f"bootstrap_{os.getpid()}.json").write_text(json.dumps(record, indent=2))
+
+
+def initialize():
+    """Install the pinned compatibility policy, then bind standard dispatch ops."""
+    global _initialized
+    if _initialized:
+        return
+    profile = load()
+    _prepare_compatibility(profile)
+    bindings, blacklist = _bind_dispatch(profile)
+    _record_startup(profile, bindings, blacklist)
     _initialized = True
     print(
         "DSV4_CLEAN_BOOTSTRAP "

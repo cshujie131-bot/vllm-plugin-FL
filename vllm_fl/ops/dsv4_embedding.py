@@ -6,7 +6,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_masked_input_and_mask,
 )
-from .dsv4_explicit_ops import selected_mask
+from vllm_fl.dispatch.backends.flaggems.impl.deepseek_v4 import selected_mask
 
 
 class DSV4VocabParallelEmbedding(VocabParallelEmbedding):

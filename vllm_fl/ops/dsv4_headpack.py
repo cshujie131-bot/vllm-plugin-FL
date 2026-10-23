@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 import triton
 from vllm_fl import dsv4_config as _dsv4
-from vllm_fl.ops.deepseek_v4_metax import prefill as _kernels
+from vllm_fl.dispatch.backends.vendor.metax.impl.dsv4.attention import prefill as _kernels
 
 
 def _try_headpack(

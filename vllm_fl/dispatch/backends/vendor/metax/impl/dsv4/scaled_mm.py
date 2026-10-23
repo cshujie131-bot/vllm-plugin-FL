@@ -2,7 +2,7 @@
 
 import torch
 
-from vllm_fl.ops.dsv4_explicit_ops import scaled_int8_quant
+from vllm_fl.dispatch.backends.flaggems.impl.deepseek_v4 import scaled_int8_quant
 from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
     CutlassInt8ScaledMMLinearKernel,
     Int8ScaledMMLinearLayerConfig,
