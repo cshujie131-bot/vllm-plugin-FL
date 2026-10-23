@@ -7,7 +7,9 @@ triton = pytest.importorskip("triton")
 pytest.importorskip("vllm")
 from triton import language as tl  # noqa: E402
 
-from vllm_fl.ops.kimi_k3_metax.kda_kernels.launch import local_kernel  # noqa: E402
+from vllm_fl.dispatch.backends.vendor.metax.impl.kimi_k3.kda.launch import (
+    local_kernel,  # noqa: E402
+)
 
 
 @triton.jit
@@ -64,7 +66,7 @@ def test_vision_mlp_reuses_native_forward_with_same_chunk_boundaries(
 ):
     import torch
 
-    from vllm_fl.k3.vision_adapter import K3VisionMLP
+    from vllm_fl.models.kimi_k3_vision import K3VisionMLP
 
     class Projection(torch.nn.Module):
         output_size = 8

@@ -6,30 +6,25 @@ and recurrent state retain their accepted precision. This is not an INT8 convers
 
 ## Review map
 
-| Responsibility | Implementation |
+Read [the file-by-file guide](../../docs/kimi-k3-metax.md) for implementation origins.
+
+| Responsibility | Reading entry |
 | --- | --- |
-| Model factories, latent TP shards, head packing, vision layout | `vllm_fl/k3/{model_adapter,latent_moe,mla_adapter,kda_adapter,vision_adapter}.py` |
-| One execution policy and explicit worker registration | `vllm_fl/k3/{configuration,context,registration,op_registrar,routing}.py` |
-| TP8 expert layout, packed-weight GEMMs, G1/SiTU specialization, bounded G2 scratch | `vllm_fl/ops/kimi_k3_metax/{tp8_experts,tp8_expert_g1,expert_gemm,decode_experts,marlin_mxfp4}.py` |
-| TP-local MLA, staged QK/PV, short/long shape selection, interleaved KV fallback | `vllm_fl/k3/{mla,mla_dispatch}.py`, `vllm_fl/ops/kimi_k3_metax/mla*.py` |
-| Accepted KDA input/state compatibility | `vllm_fl/k3/kda_adapter.py`, `vllm_fl/ops/kimi_k3_metax/{kda,kda_preprocess,normalization,kda_kernels/}` |
-| Runner-owned workspace and PP input ownership | `vllm_fl/k3/{model_runner,tp8_prefill_workspace}.py`, `vllm_fl/worker/pipeline_input.py` |
-| Host-packed sampled-token feedback | `vllm_fl/k3/pp_feedback.py`; vLLM retains the native queue and two default-preserving extension points |
-| Pure routing, SiTU and route alignment | Pinned FlagGems-vllm source and PRs below |
-| ATen correctness and addmm launch compatibility | Pinned FlagGems source and PRs below |
-| Existing MACA/MCCL bindings and host-only extensions | `vllm_fl/dispatch/backends/vendor/metax/`, `csrc/metax/`, `setup.py` |
+| Model and vision components | `vllm_fl/models/kimi_k3*.py` |
+| Attention metadata, shapes and TP layout | `vllm_fl/attention/kimi_k3/` |
+| vLLM projection / activation interfaces | `vllm_fl/ops/kimi_k3/` |
+| Packed MXFP4 expert interface | `vllm_fl/quantization/mxfp4/kimi_k3.py` |
+| Qualified local compute | `vllm_fl/dispatch/backends/vendor/metax/impl/kimi_k3/` |
+| FG/FGV adapters | `vllm_fl/dispatch/backends/flaggems/impl/kimi_k3*.py` |
+| Workspace, PP and Graph lifecycle | `vllm_fl/worker/kimi_k3*.py`, `vllm_fl/distributed/kimi_k3_pp.py` |
+| Version / runtime hooks | `vllm_fl/patches/kimi_k3/` |
+| Model-scoped backend policy | `dispatch.yaml`, through the existing FL configuration mechanism |
 
-This update relocates 30 previously validated source files. The framework
-kernels were previously carried in an example dependency patch. TP layout,
-head packing, buffer ownership and launch policy now live in FL; pure qualified
-math is called from the libraries. Native model loading, processors, metadata
-and model forward skeletons are reused.
-
-The KDA compatibility path retains the previously evaluated FP32 chunk inputs
-and local FP64 normalization/gate accumulation. It is not advertised as a new
-performance contribution. Its wrappers retain their local kernel bindings;
-replacing them with a same-named newer KDA implementation would change the
-numerical contract and is outside this cleanup.
+The refactor preserves computation, shape guards, launch settings, fallbacks and
+dependency revisions. Generic backend defaults are retained; K3 differences
+are explicit capabilities. Native model loading, processors and the forward
+skeleton remain inherited. Existing KDA numerical compatibility, including
+local FP64 accumulation, is retained without a new performance claim.
 
 ## Public source dependencies
 
@@ -111,7 +106,8 @@ python -I examples/kimi_k3_metax/launch.py \
 
 The launcher checks installed dependency commits and rejects import shadowing
 before model allocation. `--dry-run` prints the command without loading a model.
-The policy remains `K3ExecutionConfig` plus `serve.yaml`; no new operator
+The policy remains `K3ExecutionConfig` plus `serve.yaml`; `dispatch.yaml` selects
+this profile through the existing `VLLM_FL_CONFIG` setting. No new operator
 environment switches are introduced. Existing transport settings use 16 channels
 and 1 MiB buffers. Use a private writable compilation-cache directory per node.
 
@@ -141,6 +137,3 @@ its successful snapshot; the long-context rows include the later memory fixes:
 | 4096 | 1192.596 | 238.519 |
 | 16384 | 1196.806 | 70.400 |
 | 65536 | 1553.939 | 23.907 |
-
-AI assistance was used. Upstream approval and merge status remain separate from
-the source pin and the reported validation.

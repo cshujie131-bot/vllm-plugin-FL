@@ -20,7 +20,7 @@ def build_launch(args):
         "VLLM_FL_PREFER_ENABLED": "1",
         "VLLM_FL_PREFER": "flagos",
         "VLLM_FL_STRICT": "1",
-        "VLLM_FL_DENY_VENDORS": "metax",
+        "VLLM_FL_CONFIG": str(Path(__file__).with_name("dispatch.yaml").resolve()),
         "OMP_NUM_THREADS": "2",
         "K3_CACHE_ROOT": cache,
         "VLLM_CACHE_ROOT": cache + "/bootstrap/vllm",

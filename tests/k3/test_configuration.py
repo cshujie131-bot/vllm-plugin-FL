@@ -3,7 +3,7 @@
 import unittest
 from types import SimpleNamespace as NS
 
-from vllm_fl.k3.configuration import K3ExecutionConfig
+from vllm_fl.kimi_k3_config import K3ExecutionConfig
 
 
 def config(model="kimi_k3", tp=8, pp=4, dp=1, ep=False, options=None, family=None):

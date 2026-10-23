@@ -7,6 +7,7 @@
 # Native runtime wrappers are registered by vllm_fl.register before this module.
 import os
 import importlib
+from vllm_fl.patches.kimi_k3.profile import is_kimi_k3_profile
 from contextlib import suppress
 from typing import TYPE_CHECKING, TypeVar
 
@@ -14,7 +15,7 @@ import torch
 from typing_extensions import ParamSpec
 
 # MetaX empty builds use the explicit runtime registration above.
-if getattr(torch.version, "maca", None) is None:
+if getattr(torch.version, "maca", None) is None or not is_kimi_k3_profile():
     for _extension in (
         "vllm._C",
         "vllm._C_stable_libtorch",
@@ -187,10 +188,25 @@ class PlatformFL(Platform):
         """Import device-specific kernels."""
         logger.info(f"current vendor_name is: {cls.vendor_name}")
 
-        if cls.vendor_name == "metax":
-            from vllm_fl.dispatch.backends.vendor.metax.metax import register_runtime
+        if cls.vendor_name == "metax" and is_kimi_k3_profile():
+            from vllm_fl.patches.kimi_k3.runtime import register_runtime
 
             register_runtime()
+        elif cls.vendor_name == "metax":
+            try:
+                import mcoplib._C  # noqa: F401
+            except ImportError:
+                logger.warning("Failed to import mcoplib._C")
+
+            try:
+                import mcoplib._moe_C  # noqa: F401
+            except ImportError:
+                logger.warning("Failed to import mcoplib._moe_C")
+
+            try:
+                import vllm_fl.dispatch.backends.vendor.metax.patches  # noqa: F401
+            except Exception as e:
+                logger.warning(f"Failed to import maca patches: {e}")
         else:
             super().import_kernels()
 
@@ -361,7 +377,7 @@ class PlatformFL(Platform):
         # --------------------------------------------------------
         # MetaX uses the open kernels and MCCL, without a vendor custom all-reduce.
         if cls.vendor_name == "metax":
-            if not parallel_config.disable_custom_all_reduce:
+            if is_kimi_k3_profile() and not parallel_config.disable_custom_all_reduce:
                 raise NotImplementedError(
                     "K3 MetaX requires --disable-custom-all-reduce; use MCCL"
                 )

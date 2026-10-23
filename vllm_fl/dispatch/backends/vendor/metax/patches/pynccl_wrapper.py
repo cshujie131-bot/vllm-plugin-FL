@@ -2,16 +2,19 @@
 # 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
-# MetaX device-runtime ABI mapping for the vLLM PyNCCL interface.
-# Registration is performed explicitly by metax.register_runtime().
+# MetaX compatibility patch: replace NCCLLibrary with MCCLLibrary (maca backend)
+# and patch CudaCommunicator.all_reduce to use torch.distributed for torch.compile
+# compatibility (ctypes paths are not traceable by TorchDynamo).
 
 import ctypes
+import platform
 from typing import Any
 
 from vllm.distributed.device_communicators.pynccl_wrapper import (
     Function,
     buffer_type,
     cudaStream_t,
+    logger,
     ncclComm_t,
     ncclDataType_t,
     ncclRedOp_t,
@@ -169,13 +172,28 @@ class MCCLLibrary:
         # it is better not to call it at all.
         # ncclResult_t  ncclCommDestroy(ncclComm_t comm);
         Function("mcclCommDestroy", ncclResult_t, [ncclComm_t]),
-        # MACA SDK mccl.h: mcclResult_t mcclCommAbort(mcclComm_t comm).
-        Function("mcclCommAbort", ncclResult_t, [ncclComm_t]),
         # ncclResult_t ncclGroupStart();
         Function("mcclGroupStart", ncclResult_t, []),
         # ncclResult_t ncclGroupEnd();
         Function("mcclGroupEnd", ncclResult_t, []),
-
+        # # ncclResult_t ncclCommWindowRegister(
+        # #   ncclComm_t comm, void* buff, size_t size,
+        # #   ncclWindow_t* win, int winFlags);
+        # Function(
+        #     "mcclCommWindowRegister",
+        #     ncclResult_t,
+        #     [
+        #         ncclComm_t,
+        #         buffer_type,
+        #         ctypes.c_size_t,
+        #         ctypes.POINTER(ncclWindow_t),
+        #         ctypes.c_int,
+        #     ],
+        # ),
+        # # ncclResult_t ncclCommWindowDeregister(
+        # #   ncclComm_t comm, ncclWindow_t win);
+        # Function("mcclCommWindowDeregister", ncclResult_t,
+        #          [ncclComm_t, ncclWindow_t]),
     ]
     # \------------------------- Metax Modification -------------------------/
 
@@ -188,18 +206,52 @@ class MCCLLibrary:
     path_to_dict_mapping: dict[str, dict[str, Any]] = {}
 
     def __init__(self, so_file: str | None = None):
+        # /------------------------  Metax Modification -------------------------\
         so_file = so_file or find_mccl_library()
-        if so_file not in MCCLLibrary.path_to_library_cache:
-            MCCLLibrary.path_to_library_cache[so_file] = ctypes.CDLL(so_file)
-        self.lib = MCCLLibrary.path_to_library_cache[so_file]
+        # \------------------------- Metax Modification -------------------------/
+        try:
+            if so_file not in MCCLLibrary.path_to_dict_mapping:
+                lib = ctypes.CDLL(so_file)
+                MCCLLibrary.path_to_library_cache[so_file] = lib
+            self.lib = MCCLLibrary.path_to_library_cache[so_file]
+        except Exception as e:
+            logger.error(
+                "Failed to load NCCL library from %s. "
+                "It is expected if you are not running on NVIDIA/AMD GPUs."
+                "Otherwise, the nccl library might not exist, be corrupted "
+                "or it does not support the current platform %s. "
+                "If you already have the library, please set the "
+                "environment variable VLLM_NCCL_SO_PATH"
+                " to point to the correct nccl library path.",
+                so_file,
+                platform.platform(),
+            )
+            raise e
+
         if so_file not in MCCLLibrary.path_to_dict_mapping:
-            funcs: dict[str, Any] = {}
+            _funcs: dict[str, Any] = {}
             for func in MCCLLibrary.exported_functions:
-                entry = getattr(self.lib, func.name)
-                entry.restype = func.restype
-                entry.argtypes = func.argtypes
-                funcs[func.name] = entry
-            MCCLLibrary.path_to_dict_mapping[so_file] = funcs
+                try:
+                    f = getattr(self.lib, func.name)
+                    f.restype = func.restype
+                    f.argtypes = func.argtypes
+                    _funcs[func.name] = f
+                except AttributeError:
+                    if func.name in [
+                        "ncclCommWindowRegister",
+                        "ncclCommWindowDeregister",
+                    ]:
+                        if envs.VLLM_USE_NCCL_SYMM_MEM:
+                            logger.warning_once(
+                                "The symbol %s is not found in the NCCL "
+                                "library %s. To enable VLLM_USE_NCCL_SYMM_MEM "
+                                " please update your NCCL version to >= "
+                                "2.27.03.",
+                                func.name,
+                                so_file,
+                            )
+                    raise
+            MCCLLibrary.path_to_dict_mapping[so_file] = _funcs
         self._funcs = MCCLLibrary.path_to_dict_mapping[so_file]
 
     def ncclGetErrorString(self, result: ncclResult_t) -> str:
@@ -377,9 +429,6 @@ class MCCLLibrary:
     def ncclCommDestroy(self, comm: ncclComm_t) -> None:
         self.NCCL_CHECK(self._funcs["mcclCommDestroy"](comm))
 
-    def ncclCommAbort(self, comm: ncclComm_t) -> None:
-        self.NCCL_CHECK(self._funcs["mcclCommAbort"](comm))
-
     def ncclGroupStart(self) -> None:
         self.NCCL_CHECK(self._funcs["mcclGroupStart"]())
 
@@ -389,7 +438,36 @@ class MCCLLibrary:
     def ncclCommWindowRegister(
         self, comm: ncclComm_t, buff: buffer_type, size: int, win_flags: int
     ) -> ncclWindow_t:
-        raise NotImplementedError("MCCL symmetric-memory windows are not supported")
+        window = ncclWindow_t()
+        # self.NCCL_CHECK(self._funcs["mcclCommWindowRegister"](
+        #     comm, buff, size, ctypes.byref(window), win_flags))
+        return window
 
     def ncclCommWindowDeregister(self, comm: ncclComm_t, window: ncclWindow_t) -> None:
-        raise NotImplementedError("MCCL symmetric-memory windows are not supported")
+        # self.NCCL_CHECK(self._funcs["mcclCommWindowDeregister"](comm, window))
+        return
+
+
+from vllm_fl.patches.kimi_k3.profile import is_kimi_k3_profile
+
+if not is_kimi_k3_profile():
+    from vllm.distributed.device_communicators import pynccl, pynccl_wrapper
+
+    pynccl.NCCLLibrary = MCCLLibrary
+    pynccl_wrapper.NCCLLibrary = MCCLLibrary
+
+
+    # Patch: pynccl uses ctypes to pass tensor pointers to MCCL; TorchDynamo
+    # cannot trace ctypes calls. Replace CudaCommunicator.all_reduce with a
+    # torch.distributed call which Dynamo can trace natively.
+    import torch.distributed as dist
+    from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
+
+
+    def _compile_friendly_all_reduce(self, input_):
+        """Use torch.distributed all_reduce which Dynamo can trace."""
+        dist.all_reduce(input_, op=dist.ReduceOp.SUM, group=self.device_group)
+        return input_
+
+
+    CudaCommunicator.all_reduce = _compile_friendly_all_reduce

@@ -195,7 +195,7 @@ if VLLM_VENDOR:
         )
         ext_modules.append(
             CppExtension(
-                name="vllm_fl.k3.k3_runtime",
+                name="vllm_fl.dispatch.backends.vendor.metax.kimi_k3_runtime",
                 sources=["csrc/metax/uva.cpp"],
                 include_dirs=["/opt/maca/include"],
                 library_dirs=["/opt/maca/lib"],

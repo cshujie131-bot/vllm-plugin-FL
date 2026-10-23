@@ -1,33 +1,43 @@
-"""The model-scoped provider uses public registry invalidation, without replacement."""
-
-from unittest.mock import Mock
+"""K3 library providers use ordinary registry initialization and policy selection."""
 
 import pytest
 
+from vllm_fl.dispatch.backends.flaggems import register_ops
+from vllm_fl.dispatch.backends.flaggems.impl.kimi_k3_routing import grouped_topk
 from vllm_fl.dispatch.registry import OpRegistry
 from vllm_fl.dispatch.types import BackendImplKind, OpImpl
-from vllm_fl.k3 import routing
+from vllm_fl.patches.kimi_k3 import profile
 
 
-def test_register_is_idempotent_and_invalidates_cached_dispatch(monkeypatch):
-    monkeypatch.setattr(routing, "use_flaggems_op", lambda name: True)
-    manager = Mock(registry=OpRegistry())
-    monkeypatch.setattr(routing, "get_default_manager", lambda: manager)
-    routing.register()
-    routing.register()
-    assert len(manager.registry.get_implementations("grouped_topk")) == 1
-    provider = manager.registry.get_implementation(
+def register_profile(registry, monkeypatch, enabled=True):
+    monkeypatch.setattr(profile, "is_kimi_k3_profile", lambda: enabled)
+    register_ops.register_builtins(registry)
+
+
+def test_k3_provider_is_scoped_and_preserves_generic_registration(monkeypatch):
+    registry = OpRegistry()
+    register_profile(registry, monkeypatch)
+    provider = registry.get_implementation(
         "grouped_topk", "flagos.kimi_k3.grouped_topk"
     )
-    assert provider.fn is routing.grouped_topk
+    assert provider.fn is grouped_topk
     assert provider.kind == BackendImplKind.DEFAULT
-    manager.bump_policy_epoch.assert_called_once()
+    assert len(registry.get_implementations("grouped_topk")) >= 2
 
 
-def test_registration_rejects_conflicting_provider(monkeypatch):
-    monkeypatch.setattr(routing, "use_flaggems_op", lambda name: True)
-    manager = Mock(registry=OpRegistry())
-    manager.registry.register_impl(
+def test_normal_profile_has_no_k3_override(monkeypatch):
+    registry = OpRegistry()
+    register_profile(registry, monkeypatch, False)
+    assert (
+        registry.get_implementation("grouped_topk", "flagos.kimi_k3.grouped_topk")
+        is None
+    )
+    assert registry.get_implementations("grouped_topk")
+
+
+def test_conflicting_k3_provider_is_rejected(monkeypatch):
+    registry = OpRegistry()
+    registry.register_impl(
         OpImpl(
             "grouped_topk",
             "flagos.kimi_k3.grouped_topk",
@@ -35,15 +45,15 @@ def test_registration_rejects_conflicting_provider(monkeypatch):
             lambda: None,
         )
     )
-    monkeypatch.setattr(routing, "get_default_manager", lambda: manager)
     with pytest.raises(RuntimeError, match="Conflicting K3"):
-        routing.register()
-    manager.bump_policy_epoch.assert_not_called()
+        register_profile(registry, monkeypatch)
 
 
-def test_disabled_operator_does_not_register_a_model_override(monkeypatch):
-    manager_factory = Mock()
-    monkeypatch.setattr(routing, "get_default_manager", manager_factory)
-    monkeypatch.setattr(routing, "use_flaggems_op", lambda name: False)
-    routing.register()
-    manager_factory.assert_not_called()
+def test_disabled_grouped_topk_does_not_add_model_override(monkeypatch):
+    monkeypatch.setattr(register_ops, "use_flaggems_op", lambda name: False)
+    registry = OpRegistry()
+    register_profile(registry, monkeypatch)
+    assert (
+        registry.get_implementation("grouped_topk", "flagos.kimi_k3.grouped_topk")
+        is None
+    )

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 BAAI. All rights reserved.
+
 """
 FlagGems backend implementation.
 
@@ -5,11 +7,6 @@ This backend provides operator implementations using the FlagGems library.
 """
 
 from __future__ import annotations
-
-from vllm_fl.k3.context import execution_config
-# Copyright (c) 2026 BAAI. All rights reserved.
-
-
 
 from typing import Optional, Union
 
@@ -169,17 +166,12 @@ class FlagGemsBackend(Backend):
         # TritonAttentionBackend requires CUDA, check if available
         if not torch.cuda.is_available():
             raise RuntimeError(
-                "The open attention backend requires an available accelerator."
+                "TritonAttentionBackend requires CUDA but CUDA is not available. "
+                "Falling back to vendor implementation."
             )
-
-        if use_mla and execution_config().enabled:
-            return "vllm_fl.k3.mla.K3MLABackend"
 
         if use_mla:
-            raise NotImplementedError(
-                "The FlagOS MLA adapter has not been validated for this model; "
-                "a vendor attention backend is not selected implicitly"
-            )
+            raise NotImplementedError("NOT support mla now!")
 
         if use_sparse:
             raise ValueError("use_sparse=True requires use_mla=True.")

@@ -5,9 +5,11 @@ import logging
 import os
 import sys
 
-from .k3.cache import initialize_process_cache
+from .patches.kimi_k3.cache import initialize_process_cache
+from .patches.kimi_k3.profile import is_kimi_k3_profile
 
-initialize_process_cache()
+if is_kimi_k3_profile():
+    initialize_process_cache()
 def _patch_flag_gems_triton_import_compat():
     """Allow newer FlagGems to load with the Kunlunxin Triton runtime.
 
@@ -109,7 +111,7 @@ def _patch_custom_ops():
     import torch
     from vllm_fl.utils import DeviceInfo
 
-    if DeviceInfo().vendor_name == "metax":
+    if DeviceInfo().vendor_name == "metax" and is_kimi_k3_profile():
         if os.environ.get("FLAGCX_PATH"):
             raise RuntimeError("K3 MetaX uses MCCL and does not enable FlagCX")
         import vllm_fl._C
@@ -123,7 +125,7 @@ def _patch_custom_ops():
         if not torch._C._dispatch_has_kernel_for_dispatch_key(op_name, "CUDA"):
             raise RuntimeError("FL weak_ref_tensor has no CUDA dispatch implementation")
         logger.info("FL open weak_ref_tensor provider: %s", vllm_fl._C.__file__)
-        from vllm_fl.ops._C_ops_registry import register_op_schemas
+        from vllm_fl.patches.kimi_k3.op_registry import register_op_schemas
         register_op_schemas()
         return
 
@@ -200,7 +202,7 @@ def register():
 
     from vllm_fl.utils import DeviceInfo
 
-    if DeviceInfo().vendor_name != "metax":
+    if DeviceInfo().vendor_name != "metax" or not is_kimi_k3_profile():
         _patch_flash_attn_import()
 
     # Note: FlagCX connector registration is deferred to register_model()

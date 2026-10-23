@@ -1,7 +1,7 @@
 from functools import partial
 """A GPU worker class adapted for the FL out-of-tree platform."""
 
-from vllm_fl.k3.context import execution_config
+from vllm_fl.models.kimi_k3_context import execution_config
 from vllm_fl.worker.runtime_identity import worker_profile_identity
 from vllm.utils.import_utils import resolve_obj_by_qualname
 # Copyright (c) 2025 BAAI. All rights reserved.
@@ -159,9 +159,8 @@ def _initialize_fl_runtime(rank: int, config=None) -> None:
     }
     policy = execution_config(config) if config is not None else None
     if policy is not None and policy.enabled:
-        resolve_obj_by_qualname("vllm_fl.k3.routing.register")()
         common["registrar"] = partial(
-            resolve_obj_by_qualname("vllm_fl.k3.op_registrar.K3OpRegistrar"),
+            resolve_obj_by_qualname("vllm_fl.dispatch.backends.flaggems.kimi_k3_registrar.K3OpRegistrar"),
             execution_config=policy,
         )
     if whitelist:
@@ -629,7 +628,7 @@ class WorkerFL(WorkerBase):
 
             # HACK(woosuk): This is a temporary fix to avoid type errors.
             if self.k3_execution.enabled:
-                runner_cls = resolve_obj_by_qualname("vllm_fl.k3.model_runner.K3ModelRunner")
+                runner_cls = resolve_obj_by_qualname("vllm_fl.worker.kimi_k3.K3ModelRunner")
                 self.model_runner = runner_cls(
                     self.vllm_config, self.device, diagnostics=self.runtime_diagnostics
                 )

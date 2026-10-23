@@ -7,7 +7,7 @@ import torch
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
 
-from vllm_fl.k3.mla import K3PrefillBackend
+from vllm_fl.attention.kimi_k3.backend import K3PrefillBackend
 
 
 def configuration(dtype):

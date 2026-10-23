@@ -1,6 +1,59 @@
-# Validation of the source-only K3 integration
+# Validation of the K3 integration
 
-## Current checks
+## Current structural refactor
+
+The runtime arithmetic, explicit launch settings and tuning candidate sets, guards, quantization/rounding and
+communication order remain those of the accepted K3 path. No operator library
+commit or native serving parameter was upgraded.
+
+- 170 function/method AST comparisons are unchanged, including all 45 local
+  Triton JIT functions; 61 module/class assignments retain the explicit launch
+  tables, precision settings and workspace constants. The extracted small-projection launch body is also
+  identical; dispatch-only call-target changes are checked separately.
+- 52 unit/contract tests pass in the pinned MetaX runtime. They cover model
+  policy, explicit dispatch profile, native callable identity, blacklist
+  behavior, canonical FG imports, PP queue/lifetime handling and SDK reuse.
+  Some native imports query accelerator capabilities, so these tests need a
+  matching runtime with an idle visible GPU even though they do not load a model.
+- 328 installed FL source/config files match the candidate. Another 6,681
+  installed vLLM/FG/FGV source/config files match the fixed public revisions;
+  only generated version metadata is additional. A final SDK-file EOF cleanup
+  is separately confirmed bytecode-identical under Python 3.12.
+- CUDA/MCCL wrapper checks, idempotent general-plugin registration and real
+  UVA/weak-reference providers pass. K3 imports no forbidden vendor framework.
+- Four-node TP8/PP4 Graph smoke passes **18/18** generation requests: short,
+  4K/16K/64K text, red/blue images, repeated-query consistency, mixed semantic
+  requests and eight concurrent exact-length outputs. All logprobs are finite.
+  There are 18 unique response IDs, 99,936 prompt tokens and 208 output tokens;
+  client and server accounting agree, with zero errors or preemptions.
+- A test-only native worker extension observes CPU function boundaries without
+  replacing compute methods or adding GPU operations. All 32 ranks execute
+  **94 native FULL replays** (56 at padded size1, 38 at size4), 22 long eager
+  prefill steps and 38 mixed-request FULL steps. Other Graph sizes are not
+  claimed to have been replayed by this short smoke.
+- Every rank retains one 176 MiB prefill arena. The service reports 1,207,448
+  effective KV tokens, no allocator OOM, prefix caching off and Mamba mode none.
+  All four temporary model containers exit normally with code0.
+- Changed example/test files pass the repository's Ruff checks. A stricter
+  optional name scan finds only the same existing legacy SDK diagnostic present
+  in the target base; K3 uses its separately checked constructor.
+
+Reproduce the contract checks after the pinned installation, selecting an idle
+GPU through the runtime's usual visibility setting:
+
+```sh
+VLLM_FL_CONFIG="$PWD/examples/kimi_k3_metax/dispatch.yaml" \
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+python -m pytest --import-mode=importlib --confcutdir=tests/k3 -q tests/k3
+```
+
+The model smoke uses fresh private caches. Cold JIT/autotuning messages are
+retained; no latency or throughput claim is made from this correctness run.
+No GPU profile, full GPQA/ERQA evaluation or formal serving benchmark is repeated.
+The historical results below and in README remain explicitly historical.
+
+
+## Prior ownership-cleanup checks (retained)
 
 - 110 source/default-path equivalence checks; relocated function bodies and launch settings retained.
 - 29 CPU policy/launcher/PP/provenance tests, including the native root-parser regression for disabled prefix caching.

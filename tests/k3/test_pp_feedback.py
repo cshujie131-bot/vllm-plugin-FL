@@ -10,7 +10,7 @@ import torch
 
 from vllm.v1.worker.gpu import pp_utils
 
-from vllm_fl.k3 import pp_feedback
+import vllm_fl.distributed.kimi_k3_pp as pp_feedback
 
 
 def test_host_constructor_does_not_create_unused_gpu_communicator():
