@@ -83,7 +83,7 @@ def initialize():
 
     assert callable(MiniMaxRegistrar) and callable(moe_align_block_size_no_tle)
     assert profile.kernels.moe_alignment_tle is False
-    from vllm_fl.ops.minimax_m3.attention import initialize_consumer_contract
+    from vllm_fl.attention.minimax_m3.bridge import initialize_consumer_contract
 
     initialize_consumer_contract()
     from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
@@ -150,6 +150,18 @@ def audit_effective(stage, runner=None):
             "kind": str(impl.kind),
             "function": _identity(impl.fn),
         }
+    # The five MSA interfaces remain the same computations, now explicitly
+    # classified as MetaX specializations instead of default library operators.
+    for name in (
+        "index_score",
+        "index_topk",
+        "index_decode",
+        "sparse_attn",
+        "sparse_decode",
+    ):
+        binding = bindings["m3_" + name]
+        assert binding["kind"] == "vendor"
+        assert binding["impl_id"] == "vendor.metax.m3." + name
     registrar = getattr(flag_gems, "current_work_registrar", None)
     aten_bindings = {}
     if registrar is not None and hasattr(registrar, "selected_functions"):

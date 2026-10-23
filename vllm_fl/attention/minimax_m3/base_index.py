@@ -7,8 +7,13 @@ import torch
 
 from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 
-from . import index_policy, index_score as kernels
-from .native_index import minimax_m3_index_score as original
+from . import index_policy
+from vllm_fl.dispatch.backends.vendor.metax.impl.minimax_m3 import (
+    index_score as kernels,
+)
+from vllm_fl.dispatch.backends.vendor.metax.impl.minimax_m3.native_index import (
+    minimax_m3_index_score as original,
+)
 
 _TP_OK = None
 COUNTS = {"optimized": 0, "fallback": 0}

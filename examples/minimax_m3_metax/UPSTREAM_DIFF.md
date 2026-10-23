@@ -28,7 +28,7 @@ imported directly from vLLM and compile through FlagTree 0.6.1+metax3.6.
 Startup checks the package version and actual triton module path. There is no
 runtime copy into FGV, source exec, string replacement or fake module facade.
 
-The Python wrappers in native_index.py/native_sparse.py are retained because
+The Python wrappers in `dispatch/backends/vendor/metax/impl/minimax_m3/native_index.py` and `native_sparse.py` are retained because
 vLLM 0.24 does not expose their MetaX launch parameters per call. They unwrap
 read-only JIT handles and pass explicit constants; they never mutate upstream
 autotuners or function defaults. All unchanged numerical bodies are imported.
@@ -90,3 +90,15 @@ The shared worker exposes an opt-out for generic global MoE factory/oracle
 hooks. MiniMax supplies local factory classes; other models retain the default.
 Numerical-mode overlap checks allow disjoint workspace byte spans while rejecting
 real overlap. Both boundaries have dedicated regressions.
+
+## Structure-only follow-up
+
+The accepted implementation is organized by responsibility: TP/shape/consumer
+selection is in `attention/minimax_m3/`, MetaX calculation and launches in
+`dispatch/backends/vendor/metax/impl/minimax_m3/`, and library calls in
+`dispatch/backends/flaggems/impl/minimax_m3/`. The five MSA dispatch entries are
+VENDOR implementations selected explicitly by the example policy. The existing
+backend classes and generic operator registrations are unchanged. This does not
+change the compiler: all retained Triton sources still compile with FlagTree.
+No kernel arithmetic, launch tuning, dependency pin or communication order is
+changed. See [the file guide](../../docs/minimax-m3-metax.md).

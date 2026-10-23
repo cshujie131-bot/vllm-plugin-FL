@@ -13,7 +13,7 @@ from flag_gems.ops.linear_primitives import (
     linear_gemv_untransposed_kernel as linear_gemv,
 )
 
-from .jit import launch_handle
+from vllm_fl.dispatch.jit import launch_handle
 
 linear_scheduled = launch_handle(_native_kernel)
 legacy_kernel = linear_scheduled

@@ -4,7 +4,9 @@
 import torch
 import triton
 
-from . import index_score as idx, long_decode as sd, long_prefill as sp
+from . import index_score as idx
+from . import long_decode as sd
+from . import long_prefill as sp
 
 
 def index_score(q, kv, bt, cu, lens, prefix, maxq, maxseq, nkv, config):

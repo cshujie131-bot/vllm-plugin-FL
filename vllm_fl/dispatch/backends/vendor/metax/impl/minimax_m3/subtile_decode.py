@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """TP16 decode subtile computation and launch; native merge is reused."""
+
 import torch
 
 from .long_decode import _gqa_sparse_decode_kernel
-from .native_sparse import _FP8_DTYPES, _merge_topk_attn_out_kernel
+from .native_sparse import _FP8_DTYPES
+from .native_sparse import _merge_topk_attn_out_kernel
 from vllm_fl.minimax_m3_config import load
 
 SPARSE_BLOCK_SIZE = 128

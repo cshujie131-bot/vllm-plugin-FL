@@ -59,7 +59,9 @@ def install():
     from vllm.models.minimax_m3.nvidia import model as native, mtp
 
     from . import model, vision
-    from vllm_fl.ops.minimax_m3 import attention, layers, msa
+    from vllm_fl.attention.minimax_m3 import bridge as attention
+    from vllm_fl.ops.minimax_m3 import layers
+    from vllm_fl.ops.minimax_m3 import msa
     from vllm_fl.ops.minimax_m3.vision import M3VisionAttentionFL
 
     for name in (

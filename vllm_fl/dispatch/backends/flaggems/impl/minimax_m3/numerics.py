@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
 """MiniMax call contracts for the explicitly selected library numerical modes."""
+
 import torch
 import triton
 from flag_gems.ops.gemma_rms_norm import gemma_rms_norm_kernel
@@ -8,7 +9,8 @@ from flaggems_vllm.ops.fused_add_rms_norm import fused_add_rms_norm
 from flaggems_vllm.ops.fused_minimax_m3_qknorm_rope_kv_insert import (
     fused_minimax_m3_qknorm_rope_kv_insert,
 )
-from flaggems_vllm.ops.fused_moe import MoEActivation, apply_moe_activation
+from flaggems_vllm.ops.fused_moe import MoEActivation
+from flaggems_vllm.ops.fused_moe import apply_moe_activation
 
 
 def _matrix(x):

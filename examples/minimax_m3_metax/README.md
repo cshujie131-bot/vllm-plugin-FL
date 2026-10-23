@@ -133,16 +133,16 @@ the comparison baseline.
 
 | Area | Main files / public library PR | What to review |
 |---|---|---|
-| Configuration/startup | vllm_fl/minimax_m3_config.py; patches/minimax_m3_metax/ | Typed immutable policy, effective blacklists, scoped initialization and cache identity |
-| Model | vllm_fl/models/minimax_m3/ | Changed methods and explicit M3 bindings; loading and unchanged model code remain in vLLM |
-| MSA | ops/minimax_m3/attention.py; *_policy.py; native_index.py; native_sparse.py | TP/owner checks and explicit launch arguments; unchanged native JIT bodies are imported from vLLM |
-| TP16 companion kernels | ops/minimax_m3/index_score.py; long_prefill.py; long_decode.py; moe_gemv.py | Query/head packing, selected-page traversal, page splitting and routed GEMV; base and long paths share templates |
-| Linear | ops/minimax_m3/linear.py; aten.py; FG #7320 | FL owns all 35 legacy / 28 small-M rules and ordered shapes; FG owns the reused GEMM and GEMV computation |
-| Gate and MoE | ops/minimax_m3/router.py; moe.py; experts.py; library_bindings.py; FGV #960 | Shared expert pipeline and FGV GEMMs/alignment/reduction; no duplicate backend selector |
-| Norm/activation/QKV | ops/minimax_m3/numerics.py; FGV #961 | Explicit Gemma, division-form SwiGLU, BF16 staged norm/RoPE and sequential reduction modes |
-| Vision | ops/minimax_m3/vision.py; vision_chunk.py | Shared partial-RoPE dispatch from #560, patch chunking and retained FlagGems varlen call |
-| In-place mask | ops/minimax_m3/aten.py | Public registrar selects generic masked_fill_; library exports/defaults stay intact; masked_fill stays excluded |
-| Vendor/communication | dispatch/backends/vendor/metax/; patches/minimax_m3_metax/compat.py; tuning-ar512k.cfg | Existing vendor backend plus scoped vLLM 0.24 ABI hooks and accepted MCCL transport |
+| Configuration/startup | `vllm_fl/minimax_m3_config.py`; `patches/minimax_m3_metax/` | Typed policy, blacklists, scoped initialization and cache identity |
+| Model and vLLM interfaces | `models/minimax_m3/`; `ops/minimax_m3/` | Model deltas, honest torch-op mutation schemas, local router/expert classes |
+| MSA orchestration | `attention/minimax_m3/bridge.py`; `base_*.py`; `*_policy.py` | TP/consumer guards, query/head packing selection, base/long branches and fallbacks |
+| MetaX local calculation | `dispatch/backends/vendor/metax/impl/minimax_m3/` | Accepted index/sparse/GEMV kernels and explicit launch metadata; unchanged vLLM kernels imported directly |
+| Library adapters | `dispatch/backends/flaggems/impl/minimax_m3/` | FG vision/Gemma, FGV numerical modes/alignment/GEMM/reduction/top-k; no copied library kernels |
+| Linear and router | `ops/minimax_m3/linear.py`; `router.py`; FG #7320 / FGV #960 | Model shape rules and direct calls into pinned library primitives |
+| Dispatch | `ops/minimax_m3/registration.py`; `config.json` | Explicit MetaX MSA entries, distinct FG/FGV entries; standard backends unchanged |
+| Vendor/communication | Existing MetaX vendor backend; `patches/minimax_m3_metax/compat.py`; `tuning-ar512k.cfg` | Required binary ABI hooks, graph collective boundary and MCCL transport |
+
+For a file-by-file source guide, see [MiniMax M3 code map](../../docs/minimax-m3-metax.md).
 
 Independent numerical kernels receive explicit tensors and metadata. FGV does
 not infer MiniMax TP groups or import FL. Namespace migration alone is not a
@@ -224,3 +224,12 @@ audits. MCCL used NET/IB/GDRDMA and all four HCA port counters grew on both node
 ~~~sh
 python tests/unit_tests/test_minimax_m3_packaging.py -v
 ~~~
+
+The structure-only follow-up passed 32 CPU checks, installed-entry cold imports,
+and TP16 graph smoke on two 8-C550 nodes: 12/12 fixed-answer cases, all 11 text
+outputs equal to the accepted responses, and all 16 rank binding audits passed.
+FULL and PIECEWISE graphs were captured; there were no truncated responses,
+preemptions or runtime errors. All four HCAs on each node showed RDMA write
+traffic. Source checks retain all five local JIT bodies, launch settings and
+12 Torch schemas. The historical quality and serving tables above were not
+rerun for this layout change. See the [file guide](../../docs/minimax-m3-metax.md).

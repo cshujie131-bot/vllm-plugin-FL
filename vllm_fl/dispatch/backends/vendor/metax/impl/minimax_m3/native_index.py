@@ -4,19 +4,22 @@
 
 Kernel bodies are imported unchanged. No tuner/default/compiler state is modified.
 """
+
 import torch
 import triton
 
+from vllm.models.minimax_m3.common.ops.index_topk import _decode_index_score_kernel
+from vllm.models.minimax_m3.common.ops.index_topk import _index_block_score_kernel
 from vllm.models.minimax_m3.common.ops.index_topk import (
-    _decode_index_score_kernel,
-    _index_block_score_kernel,
     _topk_index_kernel as _decorated_topk,
-    _topk_index_merge_kernel,
+)
+from vllm.models.minimax_m3.common.ops.index_topk import _topk_index_merge_kernel
+from vllm.models.minimax_m3.common.ops.index_topk import (
     _topk_index_partial_kernel as _decorated_partial,
 )
 from vllm.utils.math_utils import round_up
 
-from .jit import launch_handle
+from vllm_fl.dispatch.jit import launch_handle
 from vllm_fl.minimax_m3_config import load
 
 SPARSE_BLOCK_SIZE = 128
@@ -42,9 +45,9 @@ def minimax_m3_index_score(
     max over a 128-token index-K block. M3 has num_idx_heads == num_kv_heads.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
-    assert (
-        num_idx_heads == num_kv_heads
-    ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
+    assert num_idx_heads == num_kv_heads, (
+        "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
+    )
     batch = cu_seqlens_q.shape[0] - 1
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
 
@@ -163,9 +166,9 @@ def minimax_m3_index_decode(
     ``out[:, :total_q, :]`` (stable address for cudagraph) instead of allocating.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
-    assert (
-        num_idx_heads == num_kv_heads
-    ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
+    assert num_idx_heads == num_kv_heads, (
+        "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
+    )
     assert decode_query_len <= max_decode_query_len
     assert total_q == seq_lens.shape[0] * decode_query_len
     batch = total_q

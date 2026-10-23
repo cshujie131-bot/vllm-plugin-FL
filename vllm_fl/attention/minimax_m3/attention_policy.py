@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
 
-from vllm_fl.minimax_m3_config import load, thaw
+from vllm_fl.minimax_m3_config import load
+from vllm_fl.minimax_m3_config import thaw
 
 
 def choose_index(total_q, batch, max_query_len, max_seq_len):

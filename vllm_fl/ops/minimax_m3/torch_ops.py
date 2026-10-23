@@ -5,7 +5,10 @@
 
 import torch
 
-from . import attention as _attention, numerics as _qkv, numerics as _raw
+from vllm_fl.dispatch.backends.flaggems.impl.minimax_m3.vision import _patch_embed
+
+from vllm_fl.attention.minimax_m3 import bridge as _attention
+from vllm_fl.dispatch.backends.flaggems.impl.minimax_m3 import numerics as _numerics
 
 _LIB = torch.library.Library("vllm_fl", "FRAGMENT")
 
@@ -27,13 +30,13 @@ def _empty(x, shape=None, dtype=None):
 
 _register(
     "m3_gemma(Tensor x, Tensor weight, float eps) -> Tensor",
-    lambda x, weight, eps: _raw.gemma(x, weight, eps),
+    lambda x, weight, eps: _numerics.gemma(x, weight, eps),
     lambda x, weight, eps: _empty(x),
 )
 
 
 def _gemma_add(x, residual, weight, eps):
-    _raw.gemma(x, weight, eps, residual)
+    _numerics.gemma(x, weight, eps, residual)
 
 
 _register(
@@ -44,13 +47,13 @@ _register(
 
 _register(
     "m3_swiglu(Tensor x, float limit, float alpha, float beta) -> Tensor",
-    lambda x, limit, alpha, beta: _raw.swiglu(x, limit, alpha, beta),
+    lambda x, limit, alpha, beta: _numerics.swiglu(x, limit, alpha, beta),
     lambda x, limit, alpha, beta: _empty(x, (*x.shape[:-1], x.shape[-1] // 2)),
 )
 
 
 def _swiglu_out(x, limit, alpha, beta, out):
-    _raw.swiglu(x, limit, alpha, beta, out=out)
+    _numerics.swiglu(x, limit, alpha, beta, out=out)
 
 
 _register(
@@ -61,7 +64,7 @@ _register(
 
 _register(
     'm3_qknorm_rope_insert_(Tensor(a!) qkv, Tensor q_norm_weight, Tensor k_norm_weight, Tensor cos_sin_cache, Tensor positions, int num_heads, int num_kv_heads, int rotary_dim, float eps, Tensor? index_q_norm_weight=None, Tensor? index_k_norm_weight=None, int num_index_heads=0, Tensor? slot_mapping=None, Tensor? index_slot_mapping=None, Tensor(b!)? kv_cache=None, Tensor(c!)? index_cache=None, int block_size=0, Tensor(d!)? q_out=None, Tensor(e!)? index_q_out=None, str kv_cache_dtype="auto") -> ()',
-    _qkv.qknorm_rope_insert,
+    _numerics.qknorm_rope_insert,
     lambda *a, **kw: None,
 )
 
@@ -170,7 +173,9 @@ _register(
 
 
 def _vision_attention(q, k, v, cu, maxlen, scale):
-    from .vision import vision_attention as implementation
+    from vllm_fl.dispatch.backends.flaggems.impl.minimax_m3.vision import (
+        vision_attention as implementation,
+    )
 
     return implementation(q, k, v, cu, maxlen, scale)
 
@@ -283,13 +288,6 @@ def vision_attention(query, key, value, cu_seqlens, max_seqlen, scale):
 
 
 # A full non-overlapping Conv3d patch is exactly a row-wise matrix projection.
-def _patch_embed(pixel_values, weight):
-    import flag_gems
-
-    assert pixel_values.ndim == 2 and weight.ndim == 5
-    assert pixel_values.shape[1] == weight[0].numel()
-    assert pixel_values.dtype == weight.dtype
-    return flag_gems.mm(pixel_values, weight.flatten(1).t())
 
 
 _register(

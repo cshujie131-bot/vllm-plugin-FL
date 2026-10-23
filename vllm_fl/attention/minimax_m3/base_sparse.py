@@ -3,9 +3,16 @@
 
 import torch
 
-from . import packed_prefill as kernel, subtile_decode as decode_kernel
-from .native_sparse import (
+from vllm_fl.dispatch.backends.vendor.metax.impl.minimax_m3 import (
+    packed_prefill as kernel,
+)
+from vllm_fl.dispatch.backends.vendor.metax.impl.minimax_m3 import (
+    subtile_decode as decode_kernel,
+)
+from vllm_fl.dispatch.backends.vendor.metax.impl.minimax_m3.native_sparse import (
     minimax_m3_sparse_attn as original,
+)
+from vllm_fl.dispatch.backends.vendor.metax.impl.minimax_m3.native_sparse import (
     minimax_m3_sparse_attn_decode as original_decode,
 )
 

@@ -137,6 +137,15 @@ def load():
         "oot_blacklist"
     ] != ["masked_fill"]:
         raise ValueError("Preserve the validated ATen/OOT blacklists")
+    for name in (
+        "index_score",
+        "index_topk",
+        "index_decode",
+        "sparse_attn",
+        "sparse_decode",
+    ):
+        if data["dispatch"]["op_backends"].get("m3_" + name) != ["vendor:metax"]:
+            raise ValueError("MiniMax MSA requires the explicit MetaX dispatch policy")
     framework = typed(FrameworkPolicy, data["framework"])
     kernels = typed(KernelPolicy, data["kernels"])
     if framework.tensor_parallel_size != 16:

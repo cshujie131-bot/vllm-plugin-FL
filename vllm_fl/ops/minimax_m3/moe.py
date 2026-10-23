@@ -6,7 +6,7 @@
 import torch
 import triton.language as tl
 
-from . import moe_gemv
+from vllm_fl.dispatch.backends.vendor.metax.impl.minimax_m3 import moe_gemv
 from vllm_fl.minimax_m3_config import load, thaw
 
 _ALLOWED = {
