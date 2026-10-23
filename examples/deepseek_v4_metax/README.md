@@ -108,19 +108,21 @@ unrecognized cache and never stops another service.
 
 ## Validation
 
-The capability-dispatch refactor passed a fresh installed-package TP8 smoke:
+The attention/indexer boundary refactor passed a fresh installed-package TP8 smoke:
 78/78 requests covering short prompts, 1K/4K/16K/20K prefill, mixed batches and
 64 concurrent distinct-string responses. All seven decode graph buckets were
 captured; no request failed or hit its output-token limit.
 
-The 333 installed FL Python sources matched the tested checkout without stale
-modules. Dependency pins, the scoped provider bindings, 24 Hash-table aliases
-and 24 rank/role RMS settings were checked. All 32 CPU tests passed, including
-registration against the real registry API and profile/blacklist isolation.
+The 336 installed FL Python sources matched the tested checkout without stale
+modules. Dependency pins and provider bindings were unchanged; 24 Hash-table
+aliases and 24 rank/role RMS settings were checked. All 37 CPU tests passed,
+including registry/profile isolation and the kernel/framework/import boundaries.
 
-The five relocated attention/launch files are byte-identical to `a004750`;
-existing graph-adapter function bodies and the compute/service policies are
-unchanged. Compatibility hooks remain explicitly documented in the review map.
+Seven files moved byte-for-byte from `3e5dcc5`; 51 function/class bodies matched
+after excluding imports and import-only exception handlers. M/2 scoring was
+separated from its host orchestration without changing either computation or
+launch arguments. Attention kernels, dependency pins and service policies were
+unchanged. The loose-file top-k import fallback was removed intentionally.
 This was a functional smoke, not a new quality or throughput benchmark.
 Historical accuracy and performance below are retained.
 
