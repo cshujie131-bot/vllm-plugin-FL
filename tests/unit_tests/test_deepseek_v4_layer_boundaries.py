@@ -90,7 +90,7 @@ class LayerBoundaryTests(unittest.TestCase):
             self.assertIn(
                 name, {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
             )
-        headpack = (ROOT / "vllm_fl/ops/dsv4_headpack.py").read_text()
+        headpack = (ROOT / "vllm_fl/attention/deepseek_v4/headpack.py").read_text()
         self.assertIn("vllm_fl.dispatch.backends.vendor.metax.impl.dsv4.attention import prefill", headpack)
         self.assertNotIn("flaggems_vllm.ops.flashmla_sparse", headpack)
 
@@ -167,6 +167,80 @@ class LayerBoundaryTests(unittest.TestCase):
         functions = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
         self.assertFalse(any("w4a8" in name for name in functions))
         self.assertIn("cutlass_moe_mm_w8a8_get_kernel_m", functions)
+
+    def test_indexer_math_has_no_framework_or_collective_imports(self):
+        folder = OPS.parent / "indexer"
+        for path in folder.glob("*.py"):
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    modules = [node.module or ""]
+                elif isinstance(node, ast.Import):
+                    modules = [alias.name for alias in node.names]
+                else:
+                    continue
+                for module in modules:
+                    self.assertFalse(module.startswith((
+                        "torch.distributed", "vllm.distributed",
+                        "vllm_fl.ops", "vllm_fl.attention", "vllm_fl.dsv4_config",
+                    )), (path, module))
+                self.assertFalse(
+                    isinstance(node, ast.ImportFrom)
+                    and node.module == "vllm_fl"
+                    and any(a.name == "dsv4_config" for a in node.names),
+                    path,
+                )
+
+    def test_framework_attention_contains_no_triton_kernels(self):
+        folder = ROOT / "vllm_fl/attention/deepseek_v4"
+        for path in folder.glob("*.py"):
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef):
+                    self.assertFalse(any(
+                        isinstance(d, ast.Attribute) and d.attr in {"jit", "autotune"}
+                        for d in node.decorator_list
+                    ), (path, node.name))
+        for name in ("row_sharding.py", "query_sharding.py"):
+            self.assertIn("dist.all_gather_into_tensor", (folder / name).read_text())
+        row = (folder / "row_sharding.py").read_text()
+        self.assertIn("indexer.row_score import", row)
+        self.assertIn("indexer.deep_gemm import", row)
+
+    def test_moved_packages_do_not_eagerly_import_providers(self):
+        for folder in (
+            ROOT / "vllm_fl/attention/deepseek_v4",
+            ROOT / "vllm_fl/patches/deepseek_v4_metax",
+            OPS.parent / "indexer",
+        ):
+            tree = ast.parse((folder / "__init__.py").read_text())
+            self.assertTrue(all(isinstance(node, ast.Expr) for node in tree.body))
+
+    def test_old_ops_paths_and_loose_file_fallback_are_absent(self):
+        retired = {
+            "batched_logits", "paged_indexer_logits", "tree_topk", "indexer_m84_score",
+            "indexer_query_sharding", "prefill_indexer_rowshard", "dsv4_headpack",
+            "dsv4_serial", "dsv4_validation",
+        }
+        for name in retired:
+            self.assertFalse((ROOT / "vllm_fl/ops" / (name + ".py")).exists())
+        for path in (ROOT / "vllm_fl").rglob("*.py"):
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    self.assertNotIn(node.module, {"vllm_fl.ops." + n for n in retired})
+                    self.assertNotEqual(node.module, "tree_topk")
+
+    def test_validation_keeps_its_lazy_embedding_dependency(self):
+        path = ROOT / "vllm_fl/patches/deepseek_v4_metax/validation.py"
+        tree = ast.parse(path.read_text())
+        target = "vllm_fl.ops.dsv4_embedding"
+        self.assertFalse(any(
+            isinstance(n, ast.ImportFrom) and n.module == target for n in tree.body
+        ))
+        self.assertTrue(any(
+            isinstance(n, ast.ImportFrom) and n.module == target for n in ast.walk(tree)
+        ))
 
     def test_all_python_sources_parse(self):
         for path in OPS.glob("*.py"):

@@ -9,8 +9,10 @@ or a patch installer.
 | Layer | Files / responsibility |
 |---|---|
 | MetaX local attention | `vllm_fl/dispatch/backends/vendor/metax/impl/dsv4/attention/`: TP-local blockdiag/staged kernels, split/reduce and launch policy |
-| FL communication | `vllm_fl/ops/dsv4_headpack.py`, `indexer_query_sharding.py`: head exchanges and complete-query-row M/4 sharding |
-| FL attention interface | `vllm_fl/attention/deepseek_v4.py`: scheduler metadata and caller output buffers; standard dispatch selects the implementation |
+| MetaX local indexer | `vllm_fl/dispatch/backends/vendor/metax/impl/dsv4/indexer/`: logits, paged reads, row scoring and exact tree top-k |
+| FL communication | `vllm_fl/attention/deepseek_v4/{headpack,row_sharding,query_sharding}.py`: head exchanges, M/2 logits gather and M/4 index gather |
+| FL attention interface | `vllm_fl/attention/deepseek_v4/bridge.py`: scheduler metadata and caller output buffers; standard dispatch selects the implementation |
+| Runtime compatibility | `vllm_fl/patches/deepseek_v4_metax/`: startup validation, serial execution and RMS policy |
 | Library/model adapters | `vllm_fl/dispatch/backends/flaggems/impl/deepseek_v4.py`, model and W8A8 quantization modules: pinned FG/FGV calls, graph boundaries, Hash routing and MCTlass binding |
 | Operator libraries | The source commits below: pure operators and separately identified compatibility changes |
 

@@ -27,7 +27,7 @@ def install_vendor_guard():
 
 def install_serial_execution(expected_source_sha256):
     import vllm.utils.multi_stream_utils as native
-    from vllm_fl.ops.dsv4_serial import run_pair_serially, run_branches_serially
+    from .serial import run_pair_serially, run_branches_serially
 
     source = Path(native.__file__)
     assert hashlib.sha256(source.read_bytes()).hexdigest() == expected_source_sha256, (

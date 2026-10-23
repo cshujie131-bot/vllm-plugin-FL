@@ -150,19 +150,11 @@ def _topk_per_row_fixed(
 
     # Decode path with long rows: flagos decode top-k kernel fails to compile
     # on MetaX (CompilationError). Use the MetaX-verified Triton tree top-k
-    # (scripts/sparse_indexer_tree_topk/tree_topk.py, exact top-K + select-all
-    # semantics, standalone-verified for N=753..8192). No reference/no-op
-    # fallback is allowed here: a failure must raise.
-    try:
-        from vllm_fl.ops.tree_topk import decode_topk_tree
-    except ImportError:
-        try:
-            from tree_topk import decode_topk_tree
-        except ImportError as exc:
-            raise RuntimeError(
-                "sparse_indexer_tree_topk: tree_topk.py not importable; "
-                "bind-mount it to vllm_fl/ops/tree_topk.py"
-            ) from exc
+    # (exact top-K + select-all semantics, verified for N=753..8192).
+    # Only the packaged implementation is accepted; no loose-file fallback.
+    from vllm_fl.dispatch.backends.vendor.metax.impl.dsv4.indexer.tree_topk import (
+        decode_topk_tree,
+    )
     decode_topk_tree(logits, valid, out, topk_tokens)
     _log_topk_fix(
         f"{tag}-tree",
@@ -362,11 +354,11 @@ def sparse_attn_indexer_fl(
                 k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
 
             if current_platform.vendor_name == "metax" and not use_fp4_cache:
-                from vllm_fl.ops.prefill_indexer_rowshard import (
+                from vllm_fl.attention.deepseek_v4.row_sharding import (
                     bf16_mqa_logits_prefill as bf16_mqa_logits,
                 )
 
-                from vllm_fl.ops.indexer_query_sharding import (
+                from vllm_fl.attention.deepseek_v4.query_sharding import (
                     try_prefill_query_sharding,
                 )
 
@@ -505,7 +497,9 @@ def sparse_attn_indexer_fl(
         graphsafe_decode = _dsv4.current.indexer_graphsafe
         decode_static_context_len = max_model_len
         if current_platform.vendor_name == "metax" and not use_fp4_cache:
-            from vllm_fl.dispatch.backends.vendor.metax.impl.dsv4.indexer import bf16_mqa_logits
+            from vllm_fl.dispatch.backends.vendor.metax.impl.dsv4.indexer.deep_gemm import (
+                bf16_mqa_logits,
+            )
 
             context_lens_per_batch = seq_lens.amax(dim=1)
             cu_seq_lens = torch.zeros(
@@ -554,12 +548,12 @@ def sparse_attn_indexer_fl(
                     # Does not bypass logits/topk/indexer; only removes the contiguous
                     # k_quant/k_scale workspace materialization in decode next_n=1.
                     try:
-                        from vllm_fl.ops.paged_indexer_logits import (
+                        from vllm_fl.dispatch.backends.vendor.metax.impl.dsv4.indexer.paged_logits import (
                             paged_indexer_mqa_logits_match,
                         )
                     except ImportError as exc:
                         raise RuntimeError(
-                            "paged_indexer_logits: paged_indexer_logits.py not importable"
+                            "MetaX paged indexer implementation is unavailable"
                         ) from exc
                     q_b = padded_q_quant_cast.to(torch.bfloat16).reshape(
                         batch_size, -1, padded_q_quant_cast.shape[-1]
@@ -599,10 +593,12 @@ def sparse_attn_indexer_fl(
                     # bf16_mqa_logits) launches. Exact per-bit semantics vs the
                     # loop version (standalone-verified N=1024..8192).
                     try:
-                        from vllm_fl.ops.batched_logits import batched_mqa_logits
+                        from vllm_fl.dispatch.backends.vendor.metax.impl.dsv4.indexer.batched_logits import (
+                            batched_mqa_logits,
+                        )
                     except ImportError as exc:
                         raise RuntimeError(
-                            "fused_logits: batched_logits.py not importable"
+                            "MetaX batched indexer implementation is unavailable"
                         ) from exc
                     if next_n == 1:
                         q_b = padded_q_quant_cast.to(torch.bfloat16).reshape(

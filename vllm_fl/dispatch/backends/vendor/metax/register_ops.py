@@ -107,7 +107,7 @@ def register_builtins(registry) -> None:
     from vllm_fl import dsv4_config
 
     if dsv4_config.is_enabled():
-        from vllm_fl.attention.deepseek_v4 import (
+        from vllm_fl.attention.deepseek_v4.bridge import (
             decode_attention,
             prefill_attention,
         )

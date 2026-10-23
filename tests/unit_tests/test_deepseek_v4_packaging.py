@@ -300,7 +300,7 @@ class PackagingTests(unittest.TestCase):
                     "vllm_fl.dispatch.backends.flaggems.impl.deepseek_v4"
                 )
                 library.operator_impls = lambda: {name: impl for name in library_names}
-                bridge = types.ModuleType("vllm_fl.attention.deepseek_v4")
+                bridge = types.ModuleType("vllm_fl.attention.deepseek_v4.bridge")
                 bridge.decode_attention = bridge.prefill_attention = impl
                 with patch.dict(
                     sys.modules,

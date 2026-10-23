@@ -24,10 +24,12 @@ IDs; import/registration errors cannot silently select an older implementation.
 |---|---|
 | FG/FGV calls, mutable/fake schemas, MHC shape fallback | `dispatch/backends/flaggems/impl/deepseek_v4.py` |
 | Provider registrations | the existing FlagGems and MetaX `register_ops.py` files |
-| vLLM scheduler metadata / caller output ABI | `attention/deepseek_v4.py` |
-| TP head exchange and query-row sharding | `ops/dsv4_headpack.py`, `ops/indexer_query_sharding.py` |
+| vLLM scheduler metadata / caller output ABI | `attention/deepseek_v4/bridge.py` |
+| TP head exchange, M/2 logits gather and M/4 index gather | `attention/deepseek_v4/{headpack,row_sharding,query_sharding}.py` |
 | Local TP8 sparse attention math and launch policy | `dispatch/backends/vendor/metax/impl/dsv4/attention/` |
+| Local logits, paged reads, row scoring and exact tree top-k | `dispatch/backends/vendor/metax/impl/dsv4/indexer/` |
 | MCTlass host execution and binary bindings | `dispatch/backends/vendor/metax/impl/dsv4/` |
+| vLLM attention/indexer, embedding and MoE interface adapters | existing `ops/` modules; no copied kernel implementations |
 | vLLM quantization scheme/expert interface | `quantization/w8a8/deepseek_v4.py` |
 | Version-specific runtime compatibility | `patches/deepseek_v4_metax/` |
 
@@ -44,6 +46,16 @@ operator-library coverage merely from the dispatch implementation ID.
   adapters and their existing opaque Torch graph boundaries are in one file.
 - Scheduler metadata conversion and output-buffer adaptation moved out of the
   FlagGems adapter into the framework attention interface.
+- Local indexer implementations moved from `ops/` to the MetaX `indexer/`
+  implementation package. The M/2 file was split at its existing kernel/host
+  boundary: the scoring function belongs to dispatch; TP groups, eligibility,
+  allocations, launches and collectives belong to the attention layer.
+- Headpack and M/4 orchestration live alongside that M/2 path. Startup-only Hash
+  validation and serial compatibility live with the other runtime hooks.
+  Package initializers are inert, and Hash validation keeps its lazy model
+  dependency. The old loose-file top-k import fallback is removed.
+- Internal kernels are not registered as separate dispatch capabilities: the
+  existing attention/indexer entrypoints keep their graph and buffer contracts.
 - Headpack, M/4, INT8 rounding, router scaling, graph schemas/fakes and the
   single-token/short-query fallbacks retain their accepted contracts.
 

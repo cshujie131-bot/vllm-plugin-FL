@@ -1,4 +1,6 @@
-from vllm_fl.ops.dsv4_validation import validate_hash_tables_after_load
+from vllm_fl.patches.deepseek_v4_metax.validation import (
+    validate_hash_tables_after_load,
+)
 
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project

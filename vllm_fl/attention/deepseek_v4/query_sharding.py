@@ -5,7 +5,9 @@ import torch
 import torch.distributed as dist
 from vllm.distributed import get_tp_group
 from vllm_fl import dsv4_config as _dsv4
-from vllm_fl.ops.indexer_m84_score import mqa_hoist_skip_kernel
+from vllm_fl.dispatch.backends.vendor.metax.impl.dsv4.indexer.query_score import (
+    mqa_hoist_skip_kernel,
+)
 
 _GROUPS = {}
 

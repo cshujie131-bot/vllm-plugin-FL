@@ -54,7 +54,7 @@ def _prepare_compatibility(profile):
     from .rms_policy import install as install_rms
 
     install_rms(profile["rms"], profile["audit_dir"])
-    from vllm_fl.ops.dsv4_validation import configure as configure_validation
+    from .validation import configure as configure_validation
 
     configure_validation(
         profile["hash_tables"],

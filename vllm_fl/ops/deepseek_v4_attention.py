@@ -71,7 +71,10 @@ from vllm.model_executor.layers.quantization.input_quant_fp8 import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
 )
-from vllm_fl.ops.dsv4_serial import run_pair_serially, run_branches_serially
+from vllm_fl.patches.deepseek_v4_metax.serial import (
+    run_pair_serially,
+    run_branches_serially,
+)
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     DeepseekV4FlashMLASparseBackend,

@@ -10,7 +10,7 @@ from vllm_fl.dispatch.backends.vendor.metax.impl.dsv4.attention.decode import (
     FlashMLASchedMeta,
     flash_mla_with_kvcache,
 )
-from vllm_fl.ops.dsv4_headpack import sparse_prefill as _framework_sparse_prefill
+from .headpack import sparse_prefill as _framework_sparse_prefill
 
 
 def decode_attention(

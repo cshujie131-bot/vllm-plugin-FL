@@ -24,7 +24,7 @@ def validate_hash_tables_after_load(fn):
         loaded = fn(self, *args, **kwargs)
         if _expected is None:
             return loaded
-        from .dsv4_embedding import DSV4VocabParallelEmbedding
+        from vllm_fl.ops.dsv4_embedding import DSV4VocabParallelEmbedding
 
         assert isinstance(self.model.embed_tokens, DSV4VocabParallelEmbedding), (
             "Embedding adapter was bypassed"
