@@ -1,5 +1,28 @@
 # Validation of the K3 integration
 
+## TP32 residual removal
+
+The follow-up cleanup removes four historical MLA files for H3/page256,
+the H3 host/PV path in the shared long-context module, and H3-only prefill
+eligibility/launch selection. The current K3 policy already requires TP8;
+96 attention heads therefore yield 12 local heads.
+
+The TP8 decode/backend, PP communication, worker/workspace, expert, KDA and
+linear implementations, launch configuration and dependency pins are unchanged.
+The shared QK/merge kernels remain byte-identical function bodies.
+The generic dense fallback retains its physical-stride guard and call arguments.
+
+Validation: 57 installed-package checks pass, including TP8 fallback/layout
+and FGV callback forwarding contracts. All 56 retained local JIT function ASTs
+across the FL tree match the preceding commit (34 are K3-local); 11 unreachable
+H3 JIT functions are removed. H12 prefill launch equivalence was checked after
+folding the old H3-only condition. No dangling import of a deleted module remains.
+
+This cleanup did not run a new model smoke or performance/quality benchmark:
+it removes paths excluded by the existing TP8 contract. The four-node Graph
+smoke below belongs to the preceding structural-refactor commit.
+
+
 ## Current structural refactor
 
 The runtime arithmetic, explicit launch settings and tuning candidate sets, guards, quantization/rounding and

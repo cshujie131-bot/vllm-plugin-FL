@@ -142,12 +142,12 @@ def can_use(q, k, v, cq, ck, maxq, scale):
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3 or cq.ndim != 1 or ck.ndim != 1:
         return False
     if (
-        q.shape[1] not in (3, 12)
+        q.shape[1] != 12
         or q.shape[2] != 192
         or k.shape[1:] != q.shape[1:]
         or v.shape[1:] != (q.shape[1], 128)
         or k.shape[0] != v.shape[0]
-        or k.shape[0] > (66048 if q.shape[1] == 12 else 65536)
+        or k.shape[0] > 66048
     ):
         return False
     if not isinstance(maxq, int) or not (1 <= q.shape[0] <= 4096 and 1 <= maxq <= 4096):

@@ -1,7 +1,6 @@
 """FP32 diagnostic attention with independent QK and value dimensions."""
 
 import torch
-from flag_gems import runtime
 import triton
 import triton.language as tl
 import vllm_fl.dispatch.backends.vendor.metax.impl.kimi_k3.attention.prefill_mma as prefill_mma
@@ -75,16 +74,10 @@ def attention(q, k, v, cq, ck, max_q, scale, causal=True):
     if prefill_mma.can_use(q, k, v, cq, ck, max_q, scale):
         return prefill_mma.run(q, k, v, cq, ck, max_q, scale, causal)
     if q.shape[-1] != 192 or k.shape[-1] != 192 or v.shape[-1] != 128:
-        raise ValueError("This diagnostic targets K3 QK192/V128")
+        raise ValueError("K3 prefill requires QK192/V128")
     h = q.shape[1]
     out = torch.empty((q.shape[0], h, 128), dtype=torch.float32, device=q.device)
     lse = torch.empty((q.shape[0], h), dtype=torch.float32, device=q.device)
-    tuned = (
-        runtime.device.vendor_name == "metax"
-        and h == 3
-        and all(t.dtype == torch.bfloat16 and t.is_contiguous() for t in (q, k, v))
-        and cq.dtype == ck.dtype == torch.int32
-    )
     _attention[(max_q, h, cq.numel() - 1)](
         q,
         k,
@@ -98,10 +91,10 @@ def attention(q, k, v, cq, ck, max_q, scale, causal=True):
         128,
         scale,
         causal,
-        32 if tuned else 16,
+        16,
         256,
         128,
-        num_warps=2 if tuned else 4,
+        num_warps=4,
         num_stages=1,
         enable_fp_fusion=False,
     )

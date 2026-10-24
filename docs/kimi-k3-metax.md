@@ -64,7 +64,7 @@ Paths are repository-relative. Empty package `__init__.py` files establish names
 | File | Responsibility | Source / nature |
 |---|---|---|
 | `vllm_fl/attention/kimi_k3/backend.py` | Native MLA metadata, output buffers and prefill/decode orchestration. | vLLM inheritance + custom FL differences |
-| `vllm_fl/attention/kimi_k3/decode.py` | Short/long MLA selection with the explicit FGV fallback callback. | Custom FL configuration, interface or lifecycle |
+| `vllm_fl/attention/kimi_k3/decode.py` | FGV callback and physical-stride-safe dense fallback for TP8. | Custom FL configuration, interface or lifecycle |
 | `vllm_fl/attention/kimi_k3/kda.py` | Native KDA interface with the selected local implementation. | vLLM inheritance + custom FL differences |
 | `vllm_fl/attention/kimi_k3/mla.py` | Model MLA component and query/gate projection binding. | vLLM inheritance + custom FL differences |
 | `vllm_fl/attention/kimi_k3/vision.py` | Bounded vision attention using registered ATen operations. | vLLM inheritance + custom FL differences |
@@ -94,13 +94,9 @@ Paths are repository-relative. Empty package `__init__.py` files establish names
 | File | Responsibility | Source / nature |
 |---|---|---|
 | `vllm_fl/dispatch/backends/vendor/metax/impl/kimi_k3/attention/cache_gather.py` | Cache gather with the accepted ABI and physical strides. | Custom cache/layout/numeric compatibility or interface contract |
-| `vllm_fl/dispatch/backends/vendor/metax/impl/kimi_k3/attention/mla4k_long.py` | Long-KV QK/PV staging and merge. | Custom TP/head-layout MLA specialization |
+| `vllm_fl/dispatch/backends/vendor/metax/impl/kimi_k3/attention/mla4k_long.py` | Shared staged QK and split merge used by TP8; H3 host/PV paths removed. | Custom TP/head-layout MLA specialization |
 | `vllm_fl/dispatch/backends/vendor/metax/impl/kimi_k3/attention/mla_bmm.py` | TP-local query projection and fallback. | Custom TP/head-layout MLA specialization |
-| `vllm_fl/dispatch/backends/vendor/metax/impl/kimi_k3/attention/mla_decode.py` | Small-batch split decode and merge. | Custom TP/head-layout MLA specialization |
-| `vllm_fl/dispatch/backends/vendor/metax/impl/kimi_k3/attention/mla_decode_b2.py` | Qualified B2 score, partition and PV-fold path. | Custom TP/head-layout MLA specialization |
-| `vllm_fl/dispatch/backends/vendor/metax/impl/kimi_k3/attention/mla_decode_short.py` | Reachable short-KV decode specialization. | Custom TP/head-layout MLA specialization |
 | `vllm_fl/dispatch/backends/vendor/metax/impl/kimi_k3/attention/mla_dense_fallback.py` | Physical page strides, int64 addresses and separate dot/add rounding. | FGV-derived kernel with substantive layout/numeric differences |
-| `vllm_fl/dispatch/backends/vendor/metax/impl/kimi_k3/attention/mla_staged_packing.py` | Staged MLA packing, score/PV workspaces and fallback. | Custom TP/head-layout MLA specialization |
 | `vllm_fl/dispatch/backends/vendor/metax/impl/kimi_k3/attention/mla_tp8.py` | TP8 local-head MLA selection and unchanged kernel launches. | Custom TP/head-layout MLA specialization |
 | `vllm_fl/dispatch/backends/vendor/metax/impl/kimi_k3/attention/prefill_kernel.py` | Qualified prefill attention fallback. | Custom TP/head-layout MLA specialization |
 | `vllm_fl/dispatch/backends/vendor/metax/impl/kimi_k3/attention/prefill_mma.py` | H12 prefill QK/PV kernel and original tile/split choices. | Custom MLA prefill specialization |
