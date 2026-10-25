@@ -261,6 +261,12 @@ def register_model():
 
     register_hy_v4_support()
 
+    from vllm_fl.patches.qwen3_8_flash_next import (
+        apply_qwen3_8_flash_next_patches,
+    )
+    apply_qwen3_8_flash_next_patches()
+
+
     from vllm_fl.models.minimax_m3_registration import register_minimax_m3_support
 
     register_minimax_m3_support()
