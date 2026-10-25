@@ -29,7 +29,7 @@ from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
 )
 
-from vllm_fl.attention.qwen3_8_flash_next.ple_metadata import (
+from vllm_fl.models.qwen3_8_flash_next.ple_metadata import (
     PleShortConvAttentionBackend,
     PleShortConvAttentionMetadata,
 )

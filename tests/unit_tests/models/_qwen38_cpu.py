@@ -83,7 +83,7 @@ ngram = declarations(
 mamba_path = ROOT.parent / "vllm-0.24.0/vllm/v1/attention/backends/mamba_attn.py"
 mamba = declarations(mamba_path, "qwen_cpu_mamba", names={"BaseMambaAttentionMetadata"})
 ple_metadata = declarations(
-    ROOT / "vllm_fl/attention/qwen3_8_flash_next/ple_metadata.py",
+    ROOT / "vllm_fl/models/qwen3_8_flash_next/ple_metadata.py",
     "qwen_cpu_metadata",
     {
         "AttentionBackend": GenericBase,

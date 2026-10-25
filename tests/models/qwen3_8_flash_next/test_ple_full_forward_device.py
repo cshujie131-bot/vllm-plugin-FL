@@ -58,10 +58,10 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers import linear
 
 import vllm_fl
-from vllm_fl.attention.qwen3_8_flash_next.ple_metadata import (
+from vllm_fl.models.qwen3_8_flash_next import ngram, ple
+from vllm_fl.models.qwen3_8_flash_next.ple_metadata import (
     PleShortConvAttentionMetadata,
 )
-from vllm_fl.models.qwen3_8_flash_next import ngram, ple
 
 _RESULTS = []
 

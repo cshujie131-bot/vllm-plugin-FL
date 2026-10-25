@@ -16,7 +16,7 @@ import torch
 from vllm.config import CUDAGraphMode
 from vllm.distributed import graph_capture
 from vllm.forward_context import get_forward_context, set_forward_context
-from vllm_fl.attention.qwen3_8_flash_next.cache import QSAForwardMetadata
+from vllm_fl.models.qwen3_8_flash_next.qsa_cache import QSAForwardMetadata
 
 
 @dataclass

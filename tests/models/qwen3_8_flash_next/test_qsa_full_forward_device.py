@@ -56,8 +56,8 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
 
 import vllm_fl
-from vllm_fl.attention.qwen3_8_flash_next.cache import QSAForwardMetadata
-from vllm_fl.attention.qwen3_8_flash_next.qsa import Qwen3_8FlashNextQSAAttention
+from vllm_fl.models.qwen3_8_flash_next.qsa import Qwen3_8FlashNextQSAAttention
+from vllm_fl.models.qwen3_8_flash_next.qsa_cache import QSAForwardMetadata
 
 
 def rms(x, weight, eps):

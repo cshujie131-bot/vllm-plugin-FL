@@ -111,7 +111,7 @@ except ImportError:  # vLLM 0.24 predates optional AITER shared-expert fusion
 
 from vllm_fl.dispatch import resolve_op
 
-from vllm_fl.attention.qwen3_8_flash_next.qsa import (
+from vllm_fl.models.qwen3_8_flash_next.qsa import (
     Qwen3_8FlashNextQSAAttention,
 )
 

@@ -63,7 +63,7 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_fl.dispatch import resolve_op
 
-from vllm_fl.attention.qwen3_8_flash_next.cache import (
+from vllm_fl.models.qwen3_8_flash_next.qsa_cache import (
     QSACompressedKeyCache,
     QSAForwardMetadata,
     QSAKeyStateCache,

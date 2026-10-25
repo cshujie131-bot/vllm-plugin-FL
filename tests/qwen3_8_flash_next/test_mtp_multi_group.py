@@ -35,7 +35,7 @@ proposer_module = load_file(
     "qwen38_actual_multi_group_cpu", "vllm_fl/spec_decode/qwen3_8_flash_next.py"
 )
 cache_module = load_file(
-    "qwen38_actual_qsa_cache_cpu", "vllm_fl/attention/qwen3_8_flash_next/cache.py"
+    "qwen38_actual_qsa_cache_cpu", "vllm_fl/models/qwen3_8_flash_next/qsa_cache.py"
 )
 
 

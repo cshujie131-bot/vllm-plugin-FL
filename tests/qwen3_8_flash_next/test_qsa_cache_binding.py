@@ -9,7 +9,7 @@ import torch
 
 SOURCE = (
     Path(__file__).resolve().parents[2]
-    / "vllm_fl/attention/qwen3_8_flash_next/cache.py"
+    / "vllm_fl/models/qwen3_8_flash_next/qsa_cache.py"
 )
 
 

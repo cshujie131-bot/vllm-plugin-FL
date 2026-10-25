@@ -51,12 +51,23 @@ are in [platform.py](../../vllm_fl/platform.py) and
 | Responsibility | Repository location |
 |---|---|
 | Model composition, GR, BF16 loader, MTP, PLE/N-gram and local GDN adapters | [models/qwen3_8_flash_next](../../vllm_fl/models/qwen3_8_flash_next/) |
-| QSA cache/metadata and PLE state metadata | [attention/qwen3_8_flash_next](../../vllm_fl/attention/qwen3_8_flash_next/) |
+| QSA layer, indexer and main-cache backend | [models/qwen3_8_flash_next/qsa.py](../../vllm_fl/models/qwen3_8_flash_next/qsa.py) |
+| QSA metadata/slot mapping and raw/compressed cache owners | [models/qwen3_8_flash_next/qsa_cache.py](../../vllm_fl/models/qwen3_8_flash_next/qsa_cache.py) |
+| PLE recurrent-state metadata | [models/qwen3_8_flash_next/ple_metadata.py](../../vllm_fl/models/qwen3_8_flash_next/ple_metadata.py) |
 | Graph-external N-gram preparation and runner integration | [worker/qwen3_8_flash_next.py](../../vllm_fl/worker/qwen3_8_flash_next.py) |
 | Multi-cache-group MTP metadata and native proposer extension | [spec_decode/qwen3_8_flash_next.py](../../vllm_fl/spec_decode/qwen3_8_flash_next.py) |
 | Architecture/config registration and version-scoped MTP compatibility | [patches/qwen3_8_flash_next](../../vllm_fl/patches/qwen3_8_flash_next/) |
 | FGV thin providers and QSA selection composition | [flaggems/impl/qwen3_8_flash_next.py](../../vllm_fl/dispatch/backends/flaggems/impl/qwen3_8_flash_next.py) |
 | MetaX-only contracts | [vendor/metax/impl/qwen3_8_flash_next](../../vllm_fl/dispatch/backends/vendor/metax/impl/qwen3_8_flash_next/) |
+
+Model-specific attention layers, cache owners and metadata builders live together
+under `models/qwen3_8_flash_next/`. Implementing vLLM's `AttentionBackend` or
+metadata interfaces does not make these QSA/PLE definitions shared framework
+components. Like the model ownership in PR #573, they belong with the model;
+separate files retain readable responsibilities without a parallel
+`attention/qwen3_8_flash_next` package or forwarding aliases. Worker,
+speculative-decoding and dispatch extension points remain in their existing
+framework locations.
 
 The N-gram embedding table is vocabulary-sharded across TP ranks and remains
 in pageable CPU memory. Each rank gathers its local rows outside the model
@@ -128,6 +139,36 @@ FlagTree: the pinned FGV recurrent implementation lacks the native
 accepted-token history rotation, which the pinned FGV causal-conv rejects.
 These are explicit local correctness boundaries; other models and the default
 backend are not replaced.
+
+## Model-package ownership refactor and current validation boundary
+
+The QSA layer, its cache/backend/metadata helpers, and PLE state metadata now
+live in the model package, following the model ownership in PR #573 while
+retaining separate files. The three modules were relocated and their imports
+updated; the old empty package was removed without compatibility forwarding
+modules. All 324 retained production Python modules are text-identical to
+the initial baseline after the explicit import-path substitutions. Checkpoint
+prefixes, tensor arithmetic, cache layout, dispatch policy, kernel launch
+parameters and communication ordering were not changed.
+
+The refactor's CPU contracts passed 63/63 and the QSA full-forward device checks
+passed 5/5, including changed-input graph replay. The PLE full-forward suite
+passed 3/4: M=8 failed the exact state comparison in two runs, while its output
+comparison passed. A run of the original baseline passed 4/4; importantly,
+direct calls to the unchanged, pinned FGV `ple_short_conv_`, without model
+code, also reproduced intermittent state mismatches (three failures in six
+calls; a second process reproduced three failures in eighteen calls, with
+no Qwen model modules loaded) with M8/C10240, state stride (102400,1,10240), int64 row indices
+[1,3,4,5], accepted counts [2,1,2,1], dilation 3 and K1 query length 2.
+These stop-after-three-failure diagnostics do not estimate a failure rate.
+The M8 graph check was not reached after its eager state assertion failed.
+This exposes a pre-existing operator-path issue; this structural commit does
+not fix it or relax the test tolerance. Do not read the historical successful
+device runs below as evidence that this issue is absent.
+
+The serving/performance results below remain the initial
+[66fa90a baseline](https://github.com/flagos-ai/vllm-plugin-FL/commit/66fa90a0638863c0bfced736b6fdc53e2a89427e).
+Full-model performance and accuracy were not rerun for the directory move.
 
 ## Reproduce the CPU contracts
 
