@@ -6,3 +6,5 @@ op_backends:
     - impl:vendor.metax.bge_m3
   bge_m3_encoder_attention:
     - flagos
+  bge_m3_linear:
+    - impl:vendor.metax.bge_m3

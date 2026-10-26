@@ -1,6 +1,7 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
 
 import torch
+
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.model_executor.models.bert import BertModel
 from vllm.model_executor.models.roberta import BgeM3EmbeddingModel, RobertaEmbedding
@@ -39,6 +40,12 @@ class BgeM3Embedding(RobertaEmbedding):
 
 class BgeM3EmbeddingModelFL(BgeM3EmbeddingModel):
     """BGE-M3 pooling with Hugging Face PAD position semantics."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        from vllm_fl.models.bge_m3.linear import bind_linear_policy
+
+        bind_linear_policy(self)
 
     def _build_pooler(self, pooler_config):
         from vllm.model_executor.layers.pooler import DispatchPooler

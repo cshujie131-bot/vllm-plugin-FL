@@ -1,5 +1,5 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
-"""FGV provider boundary for BGE-M3 packed encoder attention; kernels stay in FGV."""
+"""BGE-M3 provider boundaries; compute kernels stay in FG/FGV."""
 
 from functools import partial
 from importlib import import_module
@@ -18,7 +18,23 @@ def encoder_attention(query, key, value, **kwargs):
     return _varlen()(query, key, value, **kwargs)
 
 
+def linear(native_apply, layer, x, bias=None):
+    """Default policy keeps the original layer method and active FG dispatch."""
+    return native_apply(layer, x, bias)
+
+
 def register_bge_m3_operators(registry, *, allow):
+    registry.register_many(
+        [
+            OpImpl(
+                "bge_m3_linear",
+                "default.flagos",
+                BackendImplKind.DEFAULT,
+                linear,
+                priority=BackendPriority.DEFAULT,
+            )
+        ]
+    )
     if not allow("bge_m3_encoder_attention"):
         return
 
