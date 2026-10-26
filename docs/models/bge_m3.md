@@ -4,20 +4,46 @@ The FL BGE-M3 model can return the FlagEmbedding encode result in one vLLM reque
 
 ## Launch
 
-Load the platform's validated FL/FG/FGV runtime environment first. Allow both plugins (the vLLM allowlist applies to every plugin group):
+From the repository root, load the platform's validated FL/FG/FGV runtime environment first. Allow both plugins (the vLLM allowlist applies to every plugin group):
 
 ```bash
+python -m pip install -e '.[pooling]' --no-build-isolation
 export VLLM_PLUGINS=fl,bge_m3
 export VLLM_FL_CONFIG=/path/to/vllm-plugin-FL/vllm_fl/dispatch/config/bge_m3_metax.yaml
-vllm serve /models/bge-m3 \
-  --served-model-name bge-m3 --runner pooling \
-  --hf-overrides '{"architectures":["BgeM3EmbeddingModelFL"]}' \
-  --pooler-config '{"task":"embed"}' --io-processor-plugin bge_m3 \
-  --dtype float32 --tensor-parallel-size 1 --enforce-eager \
-  --max-model-len 8192 --max-num-seqs 8 --max-num-batched-tokens 8192
+vllm serve /models/bge-m3 --config examples/bge_m3_joint/serve.yaml
 ```
 
 The default `embed` task keeps `/v1/embeddings` usable. `/pooling` requests with `task=plugin` select any combination in the same loaded model. The internal joint pooler is installed only when `io_processor_plugin=bge_m3` is selected; it is not exposed by ordinary launches.
+
+## HTTP serialization and benchmark
+
+Install the plugin's optional `pooling` extra in the **server environment**.
+vLLM 0.24.0's existing `get_json_response_cls()` then selects
+`fastapi.responses.ORJSONResponse` for the pooling endpoint at startup.
+Restart an existing server after installing the extra. No vLLM patch, custom
+response class or model-specific serializer is required. The model still emits
+the same Python lists/dictionaries and all FP32 vector values; JSON float
+spelling may differ, but decoded values and shapes are preserved.
+
+The [runnable example](../../examples/bge_m3_joint/README.md) includes a shared
+`serve.yaml` with `max_num_seqs=64` and `max_num_batched_tokens=32768`.
+The larger token budget permits up to 32 complete 1K or eight complete 4K
+documents per batch; request concurrency does not guarantee these batch sizes.
+It increases device-memory use and should be validated for the target device.
+
+The example client uses `orjson.loads(response.content)`, avoiding the standard
+JSON decoder and its intermediate text conversion. Its benchmark reads the
+**entire** response and checks every selected vector's shape and finite values
+inside the measured interval. The four modes retain identical output semantics;
+no token vectors, precision or fields are omitted to improve throughput.
+
+Run 1K and 4K separately, each at HTTP C64/N128, one warmup round and one formal
+round per mode. For repeated comparisons, restart independent runs and report
+all formal results. Record the source/runtime, server configuration and cache
+state alongside the client output. FG can tune previously unseen packed shapes
+even after one HTTP warmup: a persistent, prepopulated cache measures steady
+state, not cold-start performance. Additional shape priming must be disclosed
+separately, and tuning during a timed round must not be silently discarded.
 
 ## Request and response
 
@@ -91,6 +117,7 @@ The FGV dependency below includes the existing FP32 attention support and its co
 | Component | Revision |
 |---|---|
 | vLLM | 0.24.0, ee0da84ab9e04ac7610e28580af62c365e898389 |
+| orjson (optional pooling extra) | 3.11.4 validated |
 | FlagGems | 4897cc306cd83390c95b83b50df28f7edb1684c5 |
 | FlagGems-vllm | [#995](https://github.com/flagos-ai/FlagGems-vllm/pull/995), [60f1d386c94d1084f3f5f02f71714b7bc6581e6b](https://github.com/flagos-ai/FlagGems-vllm/commit/60f1d386c94d1084f3f5f02f71714b7bc6581e6b) |
 
@@ -100,6 +127,50 @@ Validation used MetaX C550 64 GiB, MACA 3.8.1.3, Torch 2.10.0+metax3.8.1.0 and F
 python -m pip install --no-deps --no-build-isolation \
   'git+https://github.com/cshujie131-bot/FlagGems-vllm.git@60f1d386c94d1084f3f5f02f71714b7bc6581e6b'
 ```
+
+## Steady-state full-response HTTP performance
+
+Measured 2026-10-27 (Asia/Shanghai) on node 102, MetaX C550 64 GiB,
+with two Intel Xeon Platinum 8460Y+ CPUs. Server and client use same-host
+loopback HTTP. FP32/TP1/eager, max_model_len8192, max_num_seqs64,
+gpu_memory_utilization0.25, prefix caching/chunked prefill disabled.
+The benchmark uses complete official JSON, including all ColBERT token vectors,
+with shape/finite checks inside timing.
+
+1K and 4K are separate tests. Each independent service run has one warmup
+and one formal round per output, in dense/sparse/ColBERT/joint order, C64/N128,
+one document/request. Each fast-JSON MBT has three independent runs; the
+standard-JSON baseline has one. Fast columns are means ± sample standard
+deviations across all three formal runs. The interleaved fast-JSON MBT order is
+32768,8192,8192,32768,32768,8192 for each length.
+
+| Tokens/document | Output | Standard JSON MBT8192 docs/s | Fast JSON MBT8192 docs/s | Fast JSON MBT32768 docs/s | Combined change | MBT-only change |
+|---:|---|---:|---:|---:|---:|---:|
+| 1024 | dense | 33.3858 | 33.4544 ± 0.0091 | 34.5135 ± 0.0159 | +3.38% | +3.17% |
+| 1024 | sparse | 34.0947 | 34.0154 ± 0.0444 | 35.0541 ± 0.0417 | +2.81% | +3.05% |
+| 1024 | colbert | 1.6092 | 4.8383 ± 0.0176 | 4.9362 ± 0.0802 | +206.75% | +2.02% |
+| 1024 | joint | 1.6399 | 4.7459 ± 0.0108 | 4.9067 ± 0.1095 | +199.22% | +3.39% |
+| 4096 | dense | 4.9867 | 4.9891 ± 0.0011 | 5.1420 ± 0.0019 | +3.11% | +3.06% |
+| 4096 | sparse | 5.0006 | 4.9946 ± 0.0108 | 5.1554 ± 0.0009 | +3.10% | +3.22% |
+| 4096 | colbert | 0.3690 | 1.1133 ± 0.0179 | 1.1367 ± 0.0027 | +208.04% | +2.10% |
+| 4096 | joint | 0.3724 | 1.1051 ± 0.0121 | 1.1309 ± 0.0106 | +203.69% | +2.33% |
+
+**Steady-state cache contract:** every run uses an independent copy of the same
+prepopulated cache, including explicit all-shape diagnostic priming and
+correctness validation. There are no new/changed tuning records in any timed
+warmup/formal run. These results do not measure cold-start or replace the
+historical B0 below. One HTTP warmup alone does not ensure coverage of new
+dynamic shapes.
+
+All 7,168 formal and 7,168 warmup requests passed; each round reached an actual
+HTTP in-flight peak of 64, with zero errors/retries. The source passed 105
+targeted tests and full HTTP reference validation, including all eight output
+combinations, mixed concurrency, legacy dense and complete 1K/4K JSON codec
+equivalence. Model, worker and FG/FGV compute source is unchanged by this update.
+
+See [the machine-readable results](bge_m3_http_performance.json) for every
+independent throughput value, per-run latency/response bytes, sampled GPU
+memory, execution-file hashes and fixed runtime/operator provenance.
 
 ## Out-of-box performance: historical unoptimized B0
 
