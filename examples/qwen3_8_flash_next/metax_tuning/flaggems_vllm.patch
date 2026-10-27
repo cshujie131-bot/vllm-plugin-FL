@@ -1,0 +1,357 @@
+--- a/ops/FLA/wy_fast.py
++++ b/ops/FLA/wy_fast.py
+@@ -12,6 +12,8 @@
+ import triton.language as tl
+ 
+ from flaggems_vllm.ops.FLA.index import prepare_chunk_indices
++from flaggems_vllm.runtime import device as runtime_device
++from flaggems_vllm.runtime import get_heuristic_config
+ from flaggems_vllm.utils import libentry, libtuner
+ from flaggems_vllm.utils.triton_version_utils import has_triton_tle_attrs
+ 
+@@ -272,6 +274,22 @@
+     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+     BK = 64
+     BV = block_v or 64
++    if runtime_device.vendor_name == "metax":
++        meta = {
++            "T": T,
++            "H": H,
++            "Hg": Hg,
++            "K": K,
++            "V": V,
++            "BK": BK,
++            "BV": BV,
++            "varlen": cu_seqlens is not None,
++            "dtype": str(k.dtype),
++            "explicit_block_v": block_v is not None,
++        }
++        for key, select in get_heuristic_config("gdn_wy_tiles").items():
++            meta[key] = select(meta)
++        BK, BV = meta["BK"], meta["BV"]
+     u = torch.empty_like(v)
+     w = k.new_empty(B, T, H, K)
+     if _use_tle_recompute_w_u(cu_seqlens):
+--- a/ops/qwen4/ple_conv.py
++++ b/ops/qwen4/ple_conv.py
+@@ -6,6 +6,9 @@
+ import torch
+ import triton
+ import triton.language as tl
++
++from flaggems_vllm.runtime import device as runtime_device
++from flaggems_vllm.runtime import get_heuristic_config
+ 
+ 
+ @triton.jit
+@@ -288,7 +291,31 @@
+     # Absent pointer arguments are compile-time dead. Reuse x as a dummy,
+     # allocating no flags/indices and submitting no initialization kernels.
+     dummy = x
+-    _ple_conv_kernel[(triton.cdiv(x.shape[0], 8), triton.cdiv(x.shape[1], 128))](
++    conv_launch = {"BT": 8, "BC": 128, "num_warps": 4}
++    state_launch = {"BC": 128, "num_warps": 4}
++    if runtime_device.vendor_name == "metax":
++        geometry = {
++            "tokens": x.shape[0],
++            "channels": x.shape[1],
++            "width": width,
++            "dilation": dilation,
++            "dtype": str(x.dtype),
++        }
++        # Preserve the backend's original stage count on geometry misses.
++        for name, launch in (
++            ("ple_conv_launch", conv_launch),
++            ("ple_state_launch", state_launch),
++        ):
++            meta = dict(geometry, **launch, num_stages=3)
++            for key, select in get_heuristic_config(name).items():
++                launch[key] = select(meta)
++                meta[key] = launch[key]
++    _ple_conv_kernel[
++        (
++            triton.cdiv(x.shape[0], conv_launch["BT"]),
++            triton.cdiv(x.shape[1], conv_launch["BC"]),
++        )
++    ](
+         x,
+         output,
+         conv_state,
+@@ -317,13 +344,11 @@
+         MODE=mode,
+         HAS_INITIAL=has_initial_state is not None,
+         SPEC=spec,
+-        BT=8,
+-        BC=128,
+-        num_warps=4,
++        **conv_launch,
+         enable_fp_fusion=False,
+     )
+     if mode and requests and state_len:
+-        _ple_conv_state_kernel[(requests, triton.cdiv(x.shape[1], 128))](
++        _ple_conv_state_kernel[(requests, triton.cdiv(x.shape[1], state_launch["BC"]))](
+             x,
+             conv_state,
+             state_indices,
+@@ -345,8 +370,7 @@
+             HAS_INITIAL=has_initial_state is not None,
+             SPEC=spec,
+             BS=triton.next_power_of_2(capacity),
+-            BC=128,
+-            num_warps=4,
++            **state_launch,
+         )
+ 
+ 
+--- a/ops/qwen4/qsa_attention.py
++++ b/ops/qwen4/qsa_attention.py
+@@ -10,6 +10,7 @@
+ 
+ from flaggems_vllm.ops.qwen4.qsa import _is_triton_device
+ from flaggems_vllm.runtime import device as runtime_device
++from flaggems_vllm.runtime import get_heuristic_config
+ 
+ _QSA_SPLIT_ALLOWED = (1, 2, 4, 8, 16, 32)
+ 
+@@ -683,6 +684,22 @@
+     block_m = max(min_block_m, triton.next_power_of_2(group_size))
+     block_d = max(16, triton.next_power_of_2(q.shape[2]))
+     block_n, num_warps, num_stages = qsa_sparse_triton_launch_config(q.device)
++    if runtime_device.vendor_name == "metax":
++        meta = {
++            "M": q.shape[0],
++            "D": q.shape[2],
++            "GROUP_SIZE": group_size,
++            "dtype": str(q.dtype),
++            "kv_dtype": str(k_cache.dtype),
++            "BLOCK_M": block_m,
++            "BLOCK_N": block_n,
++            "num_warps": num_warps,
++            "num_stages": num_stages,
++        }
++        for key, select in get_heuristic_config("qsa_attention_launch").items():
++            meta[key] = select(meta)
++        block_m, block_n = meta["BLOCK_M"], meta["BLOCK_N"]
++        num_warps, num_stages = meta["num_warps"], meta["num_stages"]
+     num_splits = split_workspace[0].shape[2] if split_workspace is not None else 1
+     if num_splits > 1:
+         return _qsa_sparse_paged_attention_split(
+--- a/runtime/backend/_metax/fused/gdn_chunk.py
++++ b/runtime/backend/_metax/fused/gdn_chunk.py
+@@ -23,6 +23,7 @@
+ from flaggems_vllm.ops.FLA.triton_ops_helper import exp
+ from flaggems_vllm.ops.FLA.utils import SUPPRESS_LEVEL, tensor_cache
+ from flaggems_vllm.ops.FLA.wy_fast import recompute_w_u_fwd
++from flaggems_vllm.runtime import get_tuned_config
+ from flaggems_vllm.utils import libentry, libtuner
+ 
+ _original_compile = backend.metax.translate_llvmir_to_mcfatbin
+@@ -976,14 +977,8 @@
+     }
+ )
+ @libtuner(
+-    configs=[
+-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
+-        for BK in [32, 64]
+-        for BV in [32, 64]
+-        for num_warps in [4]
+-        for num_stages in [1, 2, 3]
+-    ],
+-    key=["H", "K", "V", "BT", "IS_VARLEN", "N_BUCKET"],
++    configs=get_tuned_config("gdn_chunk_o"),
++    key=["H", "K", "V", "BT", "IS_VARLEN", "N_BUCKET", "T_BUCKET"],
+ )
+ @triton.jit(do_not_specialize=["T"])
+ def chunk_fwd_kernel_o(
+@@ -1007,6 +1002,7 @@
+     USE_G: tl.constexpr,
+     IS_VARLEN: tl.constexpr,
+     N_BUCKET: tl.constexpr,
++    T_BUCKET: tl.constexpr = 0,
+ ):
+     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+     i_b, i_h = i_bh // H, i_bh % H
+@@ -1129,6 +1125,7 @@
+         V=V,
+         BT=BT,
+         N_BUCKET=N_BUCKET,
++        T_BUCKET=triton.next_power_of_2(T),
+     )
+     return o
+ 
+--- a/runtime/backend/_metax/heuristics_config_utils.py
++++ b/runtime/backend/_metax/heuristics_config_utils.py
+@@ -39,3 +39,85 @@
+         "num_stages": lambda args: 3,
+     },
+ }
++
++
++# Offline-validated launch profiles. Geometry misses retain the caller defaults.
++def _qsa_attention_profile(a):
++    return (
++        a["D"] == 256
++        and a["GROUP_SIZE"] == 3
++        and a["dtype"] == a["kv_dtype"] == "torch.bfloat16"
++    )
++
++
++def _ple_profile(a):
++    return (
++        a["channels"] == 10240
++        and a["width"] == 4
++        and a["dilation"] == 3
++        and a["dtype"] == "torch.bfloat16"
++    )
++
++
++def _ple_bt(a):
++    if not _ple_profile(a):
++        return a["BT"]
++    return 1 if a["tokens"] <= 2 else (4 if a["tokens"] <= 4 else 8)
++
++
++def _ple_bc(a):
++    if not _ple_profile(a):
++        return a["BC"]
++    if a["tokens"] == 1:
++        return 128
++    if a["tokens"] <= 4:
++        return 64
++    return 256 if a["tokens"] >= 32 else 128
++
++
++def _gdn_wy_profile(a):
++    return (
++        a["T"] >= 512
++        and a["H"] == 6
++        and a["Hg"] == 2
++        and a["K"] == a["V"] == 128
++        and a["varlen"]
++        and a["dtype"] == "torch.bfloat16"
++    )
++
++
++HEURISTICS_CONFIGS.update(
++    {
++        "qsa_attention_launch": {
++            "BLOCK_M": lambda a: (
++                max(a["BLOCK_M"], 16) if _qsa_attention_profile(a) else a["BLOCK_M"]
++            ),
++            "num_warps": lambda a: (
++                (4 if a["M"] <= 64 else 2)
++                if _qsa_attention_profile(a)
++                else a["num_warps"]
++            ),
++            "num_stages": lambda a: 1 if _qsa_attention_profile(a) else a["num_stages"],
++        },
++        "ple_conv_launch": {
++            "BT": _ple_bt,
++            "BC": _ple_bc,
++            "num_warps": lambda a: (
++                (2 if 1 < a["tokens"] <= 4 else 4)
++                if _ple_profile(a)
++                else a["num_warps"]
++            ),
++            "num_stages": lambda a: 1 if _ple_profile(a) else a["num_stages"],
++        },
++        "ple_state_launch": {
++            "num_warps": lambda a: 1 if _ple_profile(a) else a["num_warps"],
++            "num_stages": lambda a: 1 if _ple_profile(a) else a["num_stages"],
++        },
++        "gdn_wy_tiles": {
++            "BK": lambda a: 32 if _gdn_wy_profile(a) else a["BK"],
++            "BV": lambda a: (
++                32 if _gdn_wy_profile(a) and not a["explicit_block_v"] else a["BV"]
++            ),
++        },
++    }
++)
+--- a/runtime/backend/_metax/tune_configs.yaml
++++ b/runtime/backend/_metax/tune_configs.yaml
+@@ -100,3 +100,85 @@
+   - META:
+       num_workers: 4096
+     num_warps: 2
++
++gdn_chunk_o:
++- META:
++    BK: 32
++    BV: 32
++  num_warps: 4
++  num_stages: 1
++- META:
++    BK: 32
++    BV: 32
++  num_warps: 4
++  num_stages: 2
++- META:
++    BK: 32
++    BV: 32
++  num_warps: 4
++  num_stages: 3
++- META:
++    BK: 32
++    BV: 64
++  num_warps: 4
++  num_stages: 1
++- META:
++    BK: 32
++    BV: 64
++  num_warps: 4
++  num_stages: 2
++- META:
++    BK: 32
++    BV: 64
++  num_warps: 4
++  num_stages: 3
++- META:
++    BK: 64
++    BV: 32
++  num_warps: 4
++  num_stages: 1
++- META:
++    BK: 64
++    BV: 32
++  num_warps: 4
++  num_stages: 2
++- META:
++    BK: 64
++    BV: 32
++  num_warps: 4
++  num_stages: 3
++- META:
++    BK: 64
++    BV: 64
++  num_warps: 4
++  num_stages: 1
++- META:
++    BK: 64
++    BV: 64
++  num_warps: 4
++  num_stages: 2
++- META:
++    BK: 64
++    BV: 64
++  num_warps: 4
++  num_stages: 3
++- META:
++    BK: 128
++    BV: 32
++  num_warps: 4
++  num_stages: 2
++- META:
++    BK: 128
++    BV: 64
++  num_warps: 4
++  num_stages: 3
++- META:
++    BK: 128
++    BV: 64
++  num_warps: 2
++  num_stages: 1
++- META:
++    BK: 64
++    BV: 128
++  num_warps: 4
++  num_stages: 1

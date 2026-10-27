@@ -3,6 +3,9 @@
 # Adapted from plugin-FL PR573 at 45b24bc7748720e0022a72e47a983398ddda36d3.
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+
 from dataclasses import dataclass
 
 from typing import ClassVar
@@ -134,6 +137,56 @@ def compressed_qsa_slot_mapping(
 
 
 
+# Width is a graph geometry choice, independent of cache allocation/page size.
+_QSA_CAPTURE_COLUMNS: ContextVar[int | None] = ContextVar(
+    "qwen38_qsa_capture_columns", default=None
+)
+
+
+def qsa_column_buckets(capacity: int) -> tuple[int, ...]:
+    if capacity <= 0:
+        return (0,)
+    return tuple(sorted({min(capacity, n) for n in (512, 2048, 8192, capacity)}))
+
+
+def qsa_score_columns(max_seq_len: int, compress_ratio: int, capacity: int) -> int:
+    """Cover all visible complete groups using a trusted CPU length bound."""
+    if max_seq_len < 0 or compress_ratio <= 0 or capacity < 0:
+        raise ValueError("invalid QSA score geometry")
+    required = max_seq_len // compress_ratio
+    if required > capacity:
+        raise ValueError("QSA visible groups exceed the allocated cache capacity")
+    return next(n for n in qsa_column_buckets(capacity) if n >= required)
+
+
+@contextmanager
+def qsa_capture_columns(columns: int):
+    """Only dummy/capture runs may force a width; zero means full capacity."""
+    token = _QSA_CAPTURE_COLUMNS.set(columns)
+    try:
+        yield
+    finally:
+        _QSA_CAPTURE_COLUMNS.reset(token)
+
+
+def qsa_graph_columns(metadata) -> int:
+    if not isinstance(metadata, dict):
+        return 0
+    columns = {
+        m.score_columns for m in metadata.values()
+        if isinstance(m, QSAForwardMetadata) and m.compress_ratio > 1
+        and m.score_columns is not None
+    }
+    if len(columns) > 1:
+        raise ValueError("QSA layers disagree on the score-width graph key")
+    return next(iter(columns), 0)
+
+
+def qsa_cudagraph_key(batch_descriptor, forward_context):
+    columns = qsa_graph_columns(forward_context.attn_metadata)
+    return (batch_descriptor, columns) if columns else batch_descriptor
+
+
 @dataclass
 class QSAForwardMetadata(AttentionMetadata):
     """Common per-forward metadata for one QSA side cache."""
@@ -147,6 +200,7 @@ class QSAForwardMetadata(AttentionMetadata):
     num_actual_tokens: int
     storage_block_size: int
     compress_ratio: int
+    score_columns: int | None = None
 
 
 
@@ -169,6 +223,9 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             else 1
         )
         self.storage_block_size = kv_cache_spec.storage_block_size
+        self.length_buckets = bool(
+            vllm_config.additional_config.get("qwen38_qsa_length_buckets", False)
+        )
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.token_to_req_buffer = torch.empty(
             max_tokens, dtype=torch.int32, device=device
@@ -240,6 +297,16 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             slot_mapping.masked_fill_(
                 common_attn_metadata.slot_mapping[:num_tokens] < 0, -1
             )
+        columns = None
+        if self.length_buckets and self.compress_ratio > 1:
+            capacity = common_attn_metadata.block_table_tensor.shape[1] * self.storage_block_size
+            forced = _QSA_CAPTURE_COLUMNS.get()
+            if forced is not None:
+                columns = capacity if forced == 0 else min(forced, capacity)
+            else:
+                columns = qsa_score_columns(
+                    int(common_attn_metadata.max_seq_len), self.compress_ratio, capacity
+                )
         return QSAForwardMetadata(
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=slot_mapping,
@@ -250,6 +317,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             num_actual_tokens=num_tokens,
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
+            score_columns=columns,
         )
 
 

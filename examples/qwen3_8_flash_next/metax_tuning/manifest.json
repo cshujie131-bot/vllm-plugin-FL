@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "scope": "Qwen3.8-Flash-Next BF16 TP8 MetaX C550, reviewed launch parameters only",
+  "base_plugin_commit": "7e6a637e290c9059023039d06175496ba1186d1a",
+  "vllm_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
+  "fgv_commit": "0f3df8ecbff9b48b2f8745c7160e0df8cb5486b5",
+  "ple_fix_pr": "https://github.com/flagos-ai/FlagGems-vllm/pull/959",
+  "ple_fix_commit": "22194f0b2ee0cebb51f945a20a157b82c4e19c65",
+  "packages": {
+    "flag_gems": {
+      "patch": "flag_gems.patch",
+      "files": [
+        {
+          "path": "ops/mean.py",
+          "before_sha256": "c968ad14d3ba76ed87c29e5e9346a0e392cdaeaeb01c0774cfd7c5c489394d1c",
+          "after_sha256": "7e4a8c2d1d378982c070e70fc9d46ed9e17e7d0e8ebaffd6df374b84cbd34add"
+        },
+        {
+          "path": "ops/topk.py",
+          "before_sha256": "e6d433c2ab1fd63da45ac2d93d3ebed902453637f6a25aaf983b616b17ed7a65",
+          "after_sha256": "3a1070b98b38c8c820fac895233bb1ed09a02bb22957e0ca8afabdf2753e0ec4"
+        },
+        {
+          "path": "runtime/backend/_metax/heuristics_config_utils.py",
+          "before_sha256": "2e88725d4ce6c27f3847963bdc0c425493be1537ebe53fbc80779ff9ac560aa2",
+          "after_sha256": "f6d08d34f19f34b017b5249df7cd6082b37549fefa0ba8b35bd4a2ffcba90b30"
+        },
+        {
+          "path": "runtime/backend/_metax/tune_configs.yaml",
+          "before_sha256": "65b3090adf0bdbb94b625a380b33cfb02895960b884f0234d0cd040cfb9aec0a",
+          "after_sha256": "b0ce82d36d3b2a1be816738391c3d381c8fccff01ee3b214c0ae0bcf0195ad2a"
+        }
+      ]
+    },
+    "flaggems_vllm": {
+      "patch": "flaggems_vllm.patch",
+      "files": [
+        {
+          "path": "ops/FLA/wy_fast.py",
+          "before_sha256": "dcef959727bc947db23374da466df2829c97846c22999c9aec50be8c420b33e3",
+          "after_sha256": "51a943d1b57dd9d3fba25155e0aa61a7ccb15a37af97a4fae7628c114916c60b"
+        },
+        {
+          "path": "ops/qwen4/ple_conv.py",
+          "before_sha256": "2f273afafdfd1a991dd0138b0d330d001cf0cd17bdcb96b83a22a5f3929140c0",
+          "after_sha256": "1f10ac7a9a387c135f0bcffffedcbb8f2485020dd7a7642990b0b04ea75d3e6e"
+        },
+        {
+          "path": "ops/qwen4/qsa_attention.py",
+          "before_sha256": "89c0bb3e47fedfb7ef73512ceff6fe4d464863a296e874eadb411a54342efb42",
+          "after_sha256": "c28108657b8f03a167c54778fc0d2e5935bbaf23d0046ec4b41a29c41a873e41"
+        },
+        {
+          "path": "runtime/backend/_metax/fused/gdn_chunk.py",
+          "before_sha256": "f4a6bd6cf6db191439fa3bdc1e6b25d432b739c1a0700b85a2da78e427a3d75a",
+          "after_sha256": "f01330083f938019ea3bdec855da6cb452a69e0daab5dcc938eda459bcf1fa88"
+        },
+        {
+          "path": "runtime/backend/_metax/heuristics_config_utils.py",
+          "before_sha256": "65325853d03d9aa436b21ebbfa7fb15d7d0a4d7df3171266461824816ebd008e",
+          "after_sha256": "9edf8d83bc606aa5d8ecd48f35a87e9904a7106dd97e7843006d59f470f37612"
+        },
+        {
+          "path": "runtime/backend/_metax/tune_configs.yaml",
+          "before_sha256": "0d6d1d76f8b3f9f75fc27367a32f2a7435282443e3c275f9f5cfead17f62311d",
+          "after_sha256": "a5b4431570da69e09b29469cd2ffb2605e774f3dc5fa7091b5502dd1e190c94f"
+        },
+        {
+          "path": "runtime/backend/_metax/ops/__init__.py",
+          "before_sha256": "abce69e0d0176d33e155eae001ec257b9516602f8e8fe4d9c212e6360cec6a4a",
+          "after_sha256": "abce69e0d0176d33e155eae001ec257b9516602f8e8fe4d9c212e6360cec6a4a"
+        }
+      ]
+    },
+    "vllm": {
+      "patch": "vllm.patch",
+      "files": [
+        {
+          "path": "model_executor/layers/fla/ops/fused_sigmoid_gating.py",
+          "before_sha256": "000ab8996af9788fdb8843a6a3b91833e7a14c8acc0e1ea073a536330f64cb6f",
+          "after_sha256": "a2c006cb3c07053f5ee758cbcfacceabc8a137a45734a058411a548786083400"
+        }
+      ]
+    }
+  },
+  "moe_fix_pr": "https://github.com/flagos-ai/FlagGems-vllm/pull/1000",
+  "moe_fix_commit": "e04f51c1c7176d7a356838fdfa8b3dc4fbaf6f8a"
+}

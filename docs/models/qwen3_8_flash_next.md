@@ -140,7 +140,7 @@ accepted-token history rotation, which the pinned FGV causal-conv rejects.
 These are explicit local correctness boundaries; other models and the default
 backend are not replaced.
 
-## Model-package ownership refactor and current validation boundary
+## Historical model-package ownership refactor and validation boundary
 
 The QSA layer, its cache/backend/metadata helpers, and PLE state metadata now
 live in the model package, following the model ownership in PR #573 while
@@ -171,6 +171,10 @@ The serving/performance results below remain the initial
 Full-model performance and accuracy were not rerun for the directory move.
 
 ## Reproduce the CPU contracts
+
+The current runner includes the QSA-width regressions: **76 CPU contracts**
+(56 model/MTP and 20 dispatch). Historical 63-case results below retain their
+original scope.
 
 In the matching Python 3.12 / vLLM 0.24 validation environment, from the
 repository root:
@@ -438,7 +442,7 @@ all corrected cases passed. This is an address-width correction, not a reduced
 cache-size workaround or a kernel-library change.
 
 
-## Shared lookup / draft graph performance configuration and results
+## Historical shared lookup / draft graph performance results
 
 The current performance configuration changes the original basic-acceptance
 settings to `max_num_seqs=64`, `gpu_memory_utilization=0.93`, target capture
@@ -504,3 +508,86 @@ The production model and formal benchmark results were unchanged. Profiling
 and export overhead is excluded from the formal performance table; the test
 container's CPU quota was 32 cores. The profiler and phase-audit extensions
 are private test instrumentation, not production model dependencies.
+
+
+## MetaX parameters and QSA score-width buckets (2026-10-27)
+
+The opt-in [MetaX tuning profile](../../examples/qwen3_8_flash_next/metax_tuning/)
+packages the validated linear/MV, MoE, QSA attention, PLE, mean and GDN launch
+choices. Small fingerprint-checked patches expose existing launch parameters;
+no computation kernel is copied into this repository. Dense/MV use FG's
+ConfigCache API and MoE uses VLLM_TUNED_CONFIG_FOLDER. Unlisted shapes retain
+the existing fallback/autotuning behavior.
+
+The fixed FGV base requires the PLE file from
+[FGV #959](https://github.com/flagos-ai/FlagGems-vllm/pull/959) at
+22194f0b2ee0cebb51f945a20a157b82c4e19c65 and the MetaX inplace-MoE export from
+[FGV #1000](https://github.com/flagos-ai/FlagGems-vllm/pull/1000) at
+e04f51c1c7176d7a356838fdfa8b3dc4fbaf6f8a before applying the parameter patches.
+Preparation validates both prerequisites and every modified library file.
+The tested composition is the frozen 0f3df8e runtime plus these deltas, not
+the complete latest FGV main. FG and FGV keep separate default caches;
+set FLAGGEMS_CACHE_DIR only for the FG seed command, not the serving process.
+
+Enable qwen38_qsa_length_buckets in additional_config alongside the shared
+N-gram and MTP graph options. The existing CPU sequence-length upper bound
+selects 512/2048/8192/cache-capacity score columns. At maxlen69632, capacity
+is 17600 (eleven compressed pages of 1600 groups). Scores are allocated and
+computed at the selected width, with per-row causal masks and bucket padding.
+Cache allocation is unchanged and no device-to-host length read is added.
+
+Target and MTP graph keys include the width; seven target token shapes become
+28 width/token combinations. Score tile32, fixed K512 and the original
+two-stage TopK are preserved. No new selection algorithm, communication change
+or FG/FGV exclusion is introduced. Model semantics/cache metadata remain in
+models; runner, draft graphs, shared graph-key support and vendor dispatch
+retain their existing directories. Parameters depend on this model's geometry,
+so the profile belongs in this model PR rather than a separate operator PR.
+
+Validation includes 76 CPU contracts; 72 strict index comparisons with three
+changed-input graph replays each; real target cross-bucket graphs; and MTP
+metadata guards. Earlier width validation also covered a 64K input, while
+this measurement round uses P1K/P4K only. Production source matches the tested
+candidate; publication only aligns setup/cache instructions and dependencies
+with the measured environment.
+
+### Serving results with the MoE fix and this profile
+
+BF16 TP8/PP1, 8 C550, MTP K1 graph, shared CPU N-gram, FP32 recurrent state,
+maxlen69632, MBT2048, max sequences64, utilization0.93, prefix off and synchronous
+scheduling. Random completions: P1024/P4096, O1024, C64, N128, seed0, temperature0,
+ignore EOS and infinite arrival rate; one full warmup plus one formal round.
+Container limits are 32 CPU cores and 768 GiB RAM; the paired image is unchanged.
+
+| Input | MoE-fixed baseline tok/s | Tuned output tok/s | Increase | Mean TTFT ms | Mean TPOT ms | MTP acceptance |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 94.5826 | 148.3915 | 56.89% | 34181.01 | 350.85 | 73.87% |
+| 4096 | 55.5916 | 90.3198 | 62.47% | 104095.77 | 546.18 | 73.99% |
+
+Each formal round completed 128/128 requests with exact lengths, no failures
+or preemptions. All eight ranks replayed target and MTP pure-decode graphs
+on every step (1372/1372 and 1312/1312), with zero eager fallback, new captures
+or phase mismatch. Mixed batches remain eager. P1K uses width512 throughout;
+P4K pure decode uses width2048. Warmups completed once each, with output
+82.3156/57.1214 tok/s; warmup MTP captures were 2/8 and were not removed.
+
+P1K moved from node125 to the same-model node102 after a device link error
+before any benchmark requests. P4K remains node126. This is one measured round
+per variant, not an interleaved same-node A/B or a model-accuracy claim.
+
+The full P1K profile contains 744 traces, 1476 worker steps per rank and
+1383 pure-decode target/MTP replays; unknown GPU kernel time is zero.
+Normalized cumulative decode GPU time fell from 290.618 to 118.031 ms per
+rank/step; QSA TopK fell 143.416 to 33.220 ms and sparse attention 45.934 to
+9.597 ms. These overlapping device durations are not request wall time or
+isolated matched-shape kernel speedups.
+
+Remaining issue: mixed linear/MV/clear call counts rose (linear 364000 to
+630219, MV 321048 to 1202412, clear 785500 to 2494746). Dynamic shapes can
+still enter existing autotuning. This release does not claim to have removed
+that overhead or to have attributed every additional clear. Mixed communication
+residency also remains significant; no communication optimization is included.
+
+All test GPU workers were released. Existing resource-tracker shutdown
+warnings remain documented; the full accuracy and repository-wide suites
+were not rerun for this parameter/profile change.

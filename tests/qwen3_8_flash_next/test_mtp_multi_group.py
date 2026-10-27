@@ -65,6 +65,7 @@ def make_proposer():
         proposer_module.Qwen38MTPProposer
     )
     proposer.vllm_config = NS(
+        additional_config={},
         scheduler_config=NS(max_num_batched_tokens=64),
         model_config=NS(uses_mrope=False),
     )

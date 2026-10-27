@@ -1,0 +1,419 @@
+--- a/ops/mean.py
++++ b/ops/mean.py
+@@ -203,7 +203,11 @@
+ 
+ 
+ @libentry()
+-@triton.heuristics(runtime.get_heuristic_config("softmax_inner"))
++@triton.heuristics(
++    runtime.get_heuristic_config(
++        "mean_inner" if runtime.device.vendor_name == "metax" else "softmax_inner"
++    )
++)
+ @triton.jit
+ def mean_dim_kernel_inner(
+     output_ptr,
+@@ -344,21 +348,25 @@
+                 else:
+                     VEC_SIZE = 1
+                     BLOCK_SIZE_K = min(triton.next_power_of_2(K), 512)
+-                grid = (M, triton.cdiv(K, BLOCK_SIZE_K * VEC_SIZE))
+-                mean_dim_kernel_non_inner_vec[grid](
+-                    out,
+-                    inp,
+-                    M,
+-                    N,
+-                    K,
+-                    BLOCK_SIZE_K=BLOCK_SIZE_K,
+-                    VEC_SIZE=VEC_SIZE,
+-                    num_warps=(
+-                        8
+-                        if BLOCK_SIZE_K <= 128
+-                        else min(16, get_codegen_config().max_num_warps_per_cta)
+-                    ),
+-                )
++                launch = {
++                    "BLOCK_SIZE_K": BLOCK_SIZE_K,
++                    "VEC_SIZE": VEC_SIZE,
++                    "num_warps": 8
++                    if BLOCK_SIZE_K <= 128
++                    else min(16, get_codegen_config().max_num_warps_per_cta),
++                }
++                if runtime.device.vendor_name == "metax":
++                    geometry = dict(M=M, N=N, K=K, dtype=input_dtype, **launch)
++                    launch.update(
++                        {
++                            name: fn(geometry)
++                            for name, fn in runtime.get_heuristic_config(
++                                "mean_vec_launch"
++                            ).items()
++                        }
++                    )
++                grid = (M, triton.cdiv(K, launch["BLOCK_SIZE_K"] * launch["VEC_SIZE"]))
++                mean_dim_kernel_non_inner_vec[grid](out, inp, M, N, K, **launch)
+             elif K > 1:
+                 grid = lambda meta: (M, triton.cdiv(K, meta["TILE_K"]), 1)
+                 mean_dim_kernel_non_inner[grid](
+--- a/ops/topk.py
++++ b/ops/topk.py
+@@ -27,6 +27,7 @@
+ except ImportError:
+     pass
+ 
++from flag_gems import runtime
+ from flag_gems.runtime import torch_device_fn
+ from flag_gems.utils import libentry
+ from flag_gems.utils import triton_lang_extension as tle
+@@ -621,7 +622,14 @@
+             )
+         return (y_vals, y_idx)
+ 
+-    if topk_elem_cnt < 4096:
++    keep_two_stage = False
++    if runtime.device.vendor_name == "metax":
++        geometry = {"M": batch_size, "N": topk_elem_cnt, "K": k, "dtype": x.dtype}
++        keep_two_stage = runtime.get_heuristic_config("topk_launch")[
++            "FORCE_TWO_STAGE"
++        ](geometry)
++
++    if topk_elem_cnt < 4096 and not keep_two_stage:
+         out_shape = x.shape[:-1] + (k,)
+ 
+         y_vals = torch.empty(out_shape, device=x.device, dtype=x.dtype)
+@@ -650,6 +658,23 @@
+     # Note(Zhengzekang): We should promise chunk_size is larger than k.
+     if chunk_size < k:
+         chunk_size = triton.next_power_of_2(k)
++
++    stage1_launch, stage2_launch = {}, {}
++    if runtime.device.vendor_name == "metax":
++        geometry = {
++            "M": batch_size,
++            "N": topk_elem_cnt,
++            "K": k,
++            "dtype": x.dtype,
++            "CHUNK": chunk_size,
++        }
++        launch = {
++            name: fn(geometry)
++            for name, fn in runtime.get_heuristic_config("topk_launch").items()
++        }
++        chunk_size = launch["CHUNK"]
++        stage1_launch = {"num_warps": launch["W1"], "num_stages": launch["S1"]}
++        stage2_launch = {"num_warps": launch["W2"], "num_stages": launch["S2"]}
+ 
+     chunk_num = triton.cdiv(topk_elem_cnt, chunk_size)
+ 
+@@ -674,6 +699,7 @@
+             topk_elem_cnt,
+             chunk_size,
+             descending,
++            **stage1_launch,
+         )
+     stage2_elem_cnt = chunk_num * k
+     BLOCK_SIZE = triton.next_power_of_2(stage2_elem_cnt)
+@@ -689,6 +715,7 @@
+             stage2_elem_cnt,
+             BLOCK_SIZE,
+             descending,
++            **stage2_launch,
+         )
+ 
+     return (stage2_out, stage2_out_idx)
+--- a/runtime/backend/_metax/heuristics_config_utils.py
++++ b/runtime/backend/_metax/heuristics_config_utils.py
+@@ -539,3 +539,59 @@
+         "num_warps": lambda args: 8,
+     },
+ }
++
++
++# Offline scan profiles. Only measured geometries opt in; other shapes keep defaults.
++def _topk_profile(a):
++    return a["N"] in (512, 2048, 8192, 17408, 17600) and a["K"] == 512 and a["dtype"] == torch.float32
++
++
++def _mean_profile(a):
++    return a["input_ptr"].dtype == torch.float32 and a["N"] in (128, 256, 2560)
++
++
++def _mean_tile(a):
++    if not _mean_profile(a):
++        return softmax_heur_tile_n_inner(a)
++    n, m = a["N"], a["M"]
++    if n <= 256:
++        return n
++    return 4096 if m <= 128 else (1024 if m <= 512 else 512)
++
++
++def _mean_warps(a):
++    if not _mean_profile(a):
++        return softmax_heur_num_warps_inner(a)
++    return 1
++
++
++def _mean_vec_profile(a):
++    return a["N"] == 4 and a["K"] == 2560 and a["dtype"] == torch.bfloat16
++
++
++HEURISTICS_CONFIGS["topk_launch"] = {
++    "FORCE_TWO_STAGE": _topk_profile,
++    "CHUNK": lambda a: (
++        min(a["N"], 2048 if 32 < a["M"] <= 128 else 4096) if _topk_profile(a) else a["CHUNK"]
++    ),
++    "W1": lambda a: (2 if 32 < a["M"] <= 128 else 4) if _topk_profile(a) else 4,
++    "W2": lambda a: 4,
++    "S1": lambda a: (1 if a["M"] > 128 else 3) if _topk_profile(a) else 3,
++    "S2": lambda a: (1 if a["M"] > 128 else 3) if _topk_profile(a) else 3,
++}
++HEURISTICS_CONFIGS["mean_inner"] = {
++    "TILE_N": _mean_tile,
++    "ONE_TILE_PER_CTA": softmax_heur_one_tile_per_cta,
++    "num_warps": _mean_warps,
++    "num_stages": lambda a: 1 if _mean_profile(a) else 3,
++}
++HEURISTICS_CONFIGS["mean_vec_launch"] = {
++    "BLOCK_SIZE_K": lambda a: 128 if _mean_vec_profile(a) else a["BLOCK_SIZE_K"],
++    "VEC_SIZE": lambda a: (
++        (1 if a["M"] < 32 else 4) if _mean_vec_profile(a) else a["VEC_SIZE"]
++    ),
++    "num_warps": lambda a: (
++        (2 if a["M"] < 32 else 1) if _mean_vec_profile(a) else a["num_warps"]
++    ),
++    "num_stages": lambda a: 1 if _mean_vec_profile(a) else 3,
++}
+--- a/runtime/backend/_metax/tune_configs.yaml
++++ b/runtime/backend/_metax/tune_configs.yaml
+@@ -990,6 +990,32 @@
+   stages:
+   - 3
+   - 4
++- num_warps: 4
++  num_stages: 2
++  META:
++    BLOCK_N: 1
++    BLOCK_M: 1024
++- num_warps: 1
++  num_stages: 1
++  META:
++    BLOCK_N: 1
++    BLOCK_M: 1024
++- num_warps: 1
++  num_stages: 1
++  META:
++    BLOCK_N: 2
++    BLOCK_M: 512
++- num_warps: 1
++  num_stages: 1
++  META:
++    BLOCK_N: 4
++    BLOCK_M: 512
++- num_warps: 2
++  num_stages: 1
++  META:
++    BLOCK_N: 1
++    BLOCK_M: 1024
++
+ nonzero:
+ - gen: true
+   param_map:
+@@ -1683,3 +1709,199 @@
+       BLOCK_SIZE: 2048
+     num_warps: 8
+     num_stages: 3
++
++# Additional MetaX launch candidates; selected by the existing LibTuner.
++linear:
++- META:
++    BLOCK_SIZE_M: 128
++    BLOCK_SIZE_N: 256
++    BLOCK_SIZE_K: 64
++  num_stages: 3
++  num_warps: 8
++- META:
++    BLOCK_SIZE_M: 64
++    BLOCK_SIZE_N: 256
++    BLOCK_SIZE_K: 32
++  num_stages: 4
++  num_warps: 4
++- META:
++    BLOCK_SIZE_M: 128
++    BLOCK_SIZE_N: 128
++    BLOCK_SIZE_K: 32
++  num_stages: 4
++  num_warps: 4
++- META:
++    BLOCK_SIZE_M: 128
++    BLOCK_SIZE_N: 64
++    BLOCK_SIZE_K: 32
++  num_stages: 4
++  num_warps: 4
++- META:
++    BLOCK_SIZE_M: 64
++    BLOCK_SIZE_N: 128
++    BLOCK_SIZE_K: 32
++  num_stages: 4
++  num_warps: 4
++- META:
++    BLOCK_SIZE_M: 128
++    BLOCK_SIZE_N: 32
++    BLOCK_SIZE_K: 32
++  num_stages: 4
++  num_warps: 4
++- META:
++    BLOCK_SIZE_M: 64
++    BLOCK_SIZE_N: 32
++    BLOCK_SIZE_K: 32
++  num_stages: 5
++  num_warps: 2
++- META:
++    BLOCK_SIZE_M: 32
++    BLOCK_SIZE_N: 64
++    BLOCK_SIZE_K: 32
++  num_stages: 5
++  num_warps: 2
++- num_warps: 4
++  num_stages: 3
++  META:
++    BLOCK_SIZE_M: 16
++    BLOCK_SIZE_N: 64
++    BLOCK_SIZE_K: 64
++- num_warps: 4
++  num_stages: 3
++  META:
++    BLOCK_SIZE_M: 64
++    BLOCK_SIZE_N: 64
++    BLOCK_SIZE_K: 64
++- num_warps: 4
++  num_stages: 3
++  META:
++    BLOCK_SIZE_M: 32
++    BLOCK_SIZE_N: 64
++    BLOCK_SIZE_K: 64
++- num_warps: 4
++  num_stages: 2
++  META:
++    BLOCK_SIZE_M: 64
++    BLOCK_SIZE_N: 64
++    BLOCK_SIZE_K: 64
++- num_warps: 4
++  num_stages: 3
++  META:
++    BLOCK_SIZE_M: 16
++    BLOCK_SIZE_N: 32
++    BLOCK_SIZE_K: 32
++- num_warps: 4
++  num_stages: 3
++  META:
++    BLOCK_SIZE_M: 16
++    BLOCK_SIZE_N: 64
++    BLOCK_SIZE_K: 32
++- num_warps: 4
++  num_stages: 2
++  META:
++    BLOCK_SIZE_M: 32
++    BLOCK_SIZE_N: 32
++    BLOCK_SIZE_K: 32
++- num_warps: 4
++  num_stages: 2
++  META:
++    BLOCK_SIZE_M: 32
++    BLOCK_SIZE_N: 64
++    BLOCK_SIZE_K: 64
++- num_warps: 4
++  num_stages: 2
++  META:
++    BLOCK_SIZE_M: 64
++    BLOCK_SIZE_N: 32
++    BLOCK_SIZE_K: 32
++- num_warps: 2
++  num_stages: 1
++  META:
++    BLOCK_SIZE_M: 64
++    BLOCK_SIZE_N: 128
++    BLOCK_SIZE_K: 32
++
++- META:
++    BLOCK_SIZE_M: 1
++    BLOCK_SIZE_N: 32
++    BLOCK_SIZE_K: 32
++  num_warps: 2
++  num_stages: 5
++- META:
++    BLOCK_SIZE_M: 2
++    BLOCK_SIZE_N: 32
++    BLOCK_SIZE_K: 32
++  num_warps: 2
++  num_stages: 5
++- META:
++    BLOCK_SIZE_M: 4
++    BLOCK_SIZE_N: 32
++    BLOCK_SIZE_K: 32
++  num_warps: 2
++  num_stages: 5
++- META:
++    BLOCK_SIZE_M: 8
++    BLOCK_SIZE_N: 32
++    BLOCK_SIZE_K: 32
++  num_warps: 2
++  num_stages: 5
++- META:
++    BLOCK_SIZE_M: 16
++    BLOCK_SIZE_N: 32
++    BLOCK_SIZE_K: 32
++  num_warps: 2
++  num_stages: 5
++- META:
++    BLOCK_SIZE_M: 16
++    BLOCK_SIZE_N: 32
++    BLOCK_SIZE_K: 32
++  num_warps: 4
++  num_stages: 4
++- META:
++    BLOCK_SIZE_M: 32
++    BLOCK_SIZE_N: 32
++    BLOCK_SIZE_K: 32
++  num_warps: 4
++  num_stages: 4
++- META:
++    BLOCK_SIZE_M: 4
++    BLOCK_SIZE_N: 64
++    BLOCK_SIZE_K: 32
++  num_warps: 2
++  num_stages: 5
++- META:
++    BLOCK_SIZE_M: 1
++    BLOCK_SIZE_N: 16
++    BLOCK_SIZE_K: 32
++  num_warps: 2
++  num_stages: 5
++- META:
++    BLOCK_SIZE_M: 2
++    BLOCK_SIZE_N: 16
++    BLOCK_SIZE_K: 32
++  num_warps: 2
++  num_stages: 5
++- META:
++    BLOCK_SIZE_M: 4
++    BLOCK_SIZE_N: 16
++    BLOCK_SIZE_K: 32
++  num_warps: 2
++  num_stages: 5
++- META:
++    BLOCK_SIZE_M: 8
++    BLOCK_SIZE_N: 16
++    BLOCK_SIZE_K: 32
++  num_warps: 2
++  num_stages: 5
++- META:
++    BLOCK_SIZE_M: 16
++    BLOCK_SIZE_N: 16
++    BLOCK_SIZE_K: 32
++  num_warps: 2
++  num_stages: 5
++- META:
++    BLOCK_SIZE_M: 32
++    BLOCK_SIZE_N: 16
++    BLOCK_SIZE_K: 32
++  num_warps: 2
++  num_stages: 5
