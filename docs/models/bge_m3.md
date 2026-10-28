@@ -15,6 +15,43 @@ vllm serve /models/bge-m3 --config examples/bge_m3_joint/serve.yaml
 
 The default `embed` task keeps `/v1/embeddings` usable. `/pooling` requests with `task=plugin` select any combination in the same loaded model. The internal joint pooler is installed only when `io_processor_plugin=bge_m3` is selected; it is not exposed by ordinary launches.
 
+## FP16 dense on MetaX
+
+The [FP16 dense example](../../examples/bge_m3_dense/README.md) adds an explicit
+native `/v1/embeddings` profile for MetaX C550. It uses an FP16 encoder, the
+existing vendor FlashAttention backend and the default FG Linear path;
+pooling heads retain vLLM's FP32 default. The existing FP32 joint-output
+launch remains the default example.
+
+The [launch script](../../examples/bge_m3_dense/serve.sh) applies all model
+environment settings to the server process, without container ENV or manual
+exports. It appends `attention_backend` to
+`VLLM_FL_FLAGOS_BLACKLIST_APPEND`, excluding the default FlagOS attention
+provider for performance, and selects `impl:vendor.metax` in
+`dispatch/config/bge_m3_metax_fp16_dense.yaml`. This replaces FGV
+`flash_attn_varlen_func` with the matched vendor implementation for this
+profile while retaining other FG operators. No new attention or Linear
+kernel is introduced.
+
+Measured 2026-10-28 on C550, TP1/eager, MBT32768, max_num_seqs64,
+OMP/MKL16: native CLI C64/N256, one full warmup and one formal round per
+length. All four formal rounds completed without request errors or new
+tuning/compiler cache entries.
+
+| Input tokens | Total tokens/s |
+|---:|---:|
+| 1024 | 121,435.85 |
+| 2048 | 121,840.69 |
+| 4096 | 106,101.43 |
+| 8192 | 80,400.07 |
+
+See [the complete performance metrics](bge_m3_fp16_dense_performance.json).
+These are hot-cache results with additional untimed worker shape priming.
+The earlier FP32 joint-client measurements use different request counts,
+inputs and timing boundaries; their historical ratio is not a controlled
+FP32-to-FP16 speedup. MBT32768 and fast JSON were already present in
+`b9269d2c`.
+
 ## HTTP serialization and benchmark
 
 Install the plugin's optional `pooling` extra in the **server environment**.
